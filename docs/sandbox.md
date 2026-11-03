@@ -30,7 +30,7 @@ bubblewrap makes these mounts parent first, so a path bound back under a cover g
 - an empty tmpfs over each covered directory, made read-only once the binds inside it are in place, and `/dev/null` over any other covered path, such as a file or a socket, which nothing can read from or connect to;
 - the sandbox's own home and `write` paths, read-write;
 - its `read` paths, and the regular files that links in the host's `/etc` lead to under a default cover, such as Ubuntu's `/etc/resolv.conf`, read-only;
-- a fresh `/proc`, bubblewrap's own `/dev` with a new `devpts` instance, and a writable tmpfs `/tmp`, `/var/tmp`, and `/dev/shm` of its own;
+- a fresh `/proc`, bubblewrap's own `/dev` with a new `devpts` instance, and a writable tmpfs `/tmp`, `/var/tmp`, and `/dev/shm` of its own, each holding at most 1 GiB, set with bubblewrap's `--size`;
 - a `passwd` and `group` with one entry for the sandbox's uid and gid, whose home is its own directory;
 - `legwork` itself, read-only at `/dev/legwork-sandbox`, for the first stage.
 
@@ -114,6 +114,8 @@ Two reviews by Fable, each given only the design and the code, and re-checks of 
 - **Every IP protocol and socket-pair family was open.** The filter checked only the socket family, so SCTP, DCCP, L2TP, MPTCP, and SMC were reachable, and a socket pair in any family loaded and ran that family's code. `TestSeccompFilter` checks the protocols and pairs.
 - **Protocol 0 picked SCTP.** Protocol 0 means whichever protocol registered the type first, so an IP sequenced-packet socket was SCTP with the module loaded. Only stream and datagram IP sockets are allowed. `TestSeccompFilter` checks `SOCK_SEQPACKET` and `SOCK_DCCP`.
 
+- **Temporary space had no limit.** A tmpfs is as large as the host's memory allows, 47 GB on the spike's host, so a sandbox could fill memory through `/tmp`, `/var/tmp`, or `/dev/shm`. That is a denial of service, not a leak. Each now holds at most 1 GiB, with bubblewrap's `--size`, from 0.7.0. `TestIsolation` checks each size from inside, and a write past it stops at the limit.
+
 ### Files Legwork handles for a turn
 
 - **The bridge sent any file a placeholder named.** An absolute path outside the scratch directory went to a tool, past a CLI confined by `--restricted`. The bridge sends only files in the scratch directory, through `os.Root`. `TestPlaceholderFileRefusedByTheBridge` tries an absolute path, `..`, and a link.
@@ -152,7 +154,6 @@ These were found in [one-binary.md](one-binary.md)'s plan, which was changed to 
 - **The mount table.** `/proc/self/mountinfo` shows where each cover and bind is, so a cover hides what is under a path, not that the path exists. Legwork covers its config and state by directory, so the table names those directories, not the files in them.
 - **What the mount table cannot show.** A btrfs snapshot directory other than `/.snapshots`, or a home neither `/etc/passwd` nor a prefix of two homes reveals, has to be covered by name. `legwork doctor` will warn when Legwork's state is on a filesystem with snapshots.
 - **Links the operator made.** A home or `write` path through any link is refused, so on an ostree host the caller passes `/var/home/...`, not `/home/...`.
-- **Temporary space.** `/tmp`, `/var/tmp`, and `/dev/shm` can grow as large as the host's memory allows, bounded only by a delegated cgroup's `memory.max`. That is a denial of service, not a leak.
 - **pid reuse before kernel 6.5.** Without `SO_PEERPIDFD`, the planned pid-namespace check on `mcp.sock` looks the peer up in `/proc` by pid, so a process that takes that pid in between would be judged instead.
 - **A router's address.** `guard.Client` refuses the host's interface addresses, not a router's public address that forwards back to the host.
 - **Other architectures.** With no system call list, only `kernel: open` starts, with no filter and so no `TIOCSTI` refusal.

@@ -309,6 +309,11 @@ type mountOp struct {
 // shared memory.
 var scratchDirs = []string{"/tmp", "/var/tmp", "/dev/shm"}
 
+// scratchSize is the most each of scratchDirs holds. A tmpfs is otherwise as
+// large as the host's memory, so one sandbox could fill it, and only a
+// delegated cgroup's memory limit would stop it.
+const scratchSize = 1 << 30
+
 // newLaunch builds bubblewrap's options for spec. Each bind source is opened
 // here without following links and passed as a descriptor, so nothing
 // changed between prepare and bubblewrap's setup can redirect it. Mounts go
@@ -364,7 +369,7 @@ func newLaunch(spec Spec, acct account) (*launch, error) {
 	}
 	for _, d := range scratchDirs {
 		if fi, err := os.Stat(filepath.Dir(d)); err == nil && fi.IsDir() {
-			ops = append(ops, mountOp{d, scratchMount, []string{"--perms", "01777", "--tmpfs", d}})
+			ops = append(ops, mountOp{d, scratchMount, []string{"--perms", "01777", "--size", strconv.Itoa(scratchSize), "--tmpfs", d}})
 		}
 	}
 	self, err := unix.Open("/proc/self/exe", unix.O_PATH|unix.O_CLOEXEC, 0)

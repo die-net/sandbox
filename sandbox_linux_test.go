@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"os"
 	"os/exec"
@@ -435,6 +436,22 @@ func isolationChecks(body string) int {
 			// Let the process outside run on, so the failure is reported
 			// rather than hanging the test.
 			return unix.PtraceDetach(tg.Pid)
+		}},
+		{"find a temporary directory larger than its limit", nil, func() error {
+			for _, d := range scratchDirs {
+				var st unix.Statfs_t
+				if err := unix.Statfs(d, &st); err != nil {
+					return err
+				}
+				bsize := st.Bsize
+				if bsize <= 0 || bsize > math.MaxInt32 {
+					return fmt.Errorf("%s has a block size of %d", d, bsize)
+				}
+				if size := st.Blocks * uint64(bsize); size > scratchSize {
+					return fmt.Errorf("%s holds %d bytes, more than %d", d, size, scratchSize)
+				}
+			}
+			return nil
 		}},
 		// pid 1 is the reaper, which any process in the sandbox can read
 		// through /proc, so neither its command line, its environment, nor
