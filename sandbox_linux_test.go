@@ -52,7 +52,10 @@ const (
 	// lateMount is where TestLateMounts binds legworkDir once a sandbox is
 	// running, and lateDone is the file it writes when it has.
 	lateMount = "/srv/late"
-	lateDone  = "/srv/late-done"
+	// coveredSock is a socket withFakeHost listens on outside every
+	// default cover, which TestIsolation covers.
+	coveredSock = "/srv/covered.sock"
+	lateDone    = "/srv/late-done"
 )
 
 // iptSoSetReplace is IPT_SO_SET_REPLACE from linux/netfilter_ipv4/ip_tables.h,
@@ -164,6 +167,10 @@ func withFakeHost() error {
 		return fmt.Errorf("share /srv: %w", err)
 	}
 	if err := os.Mkdir(lateMount, 0o750); err != nil {
+		return err
+	}
+	var lc net.ListenConfig
+	if _, err := lc.Listen(context.Background(), "unix", coveredSock); err != nil {
 		return err
 	}
 	for _, p := range append(slices.Clone(fakeHomes), legworkDB) {
@@ -407,6 +414,10 @@ func isolationChecks(body string) int {
 		}},
 		{"connect to a socket not in write", unix.ENOENT, func() error {
 			return connectUnix(tg.Socket)
+		}},
+		// /dev/null covers it, which is no socket to connect to.
+		{"connect to a covered socket", unix.ECONNREFUSED, func() error {
+			return connectUnix(coveredSock)
 		}},
 		// Abstract sockets belong to a network namespace, and the sandbox
 		// shares the host's until the egress proxy brings one of its own,
@@ -794,7 +805,7 @@ func TestIsolation(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			spec := Spec{Home: t.TempDir(), Cover: []string{legworkDir}, Kernel: level}
+			spec := Spec{Home: t.TempDir(), Cover: []string{legworkDir, coveredSock}, Kernel: level}
 			if code, out := runSandbox(t, spec, true, "isolation", string(body)); code != 0 {
 				t.Fatalf("a way out of the sandbox, exit %d: %s", code, out)
 			}

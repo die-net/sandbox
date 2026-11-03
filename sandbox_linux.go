@@ -348,11 +348,17 @@ func newLaunch(spec Spec, acct account) (*launch, error) {
 		if err != nil {
 			return nil, fmt.Errorf("cover %s: %w", c, err)
 		}
+		// A directory gets an empty tmpfs. Anything else, a socket or a
+		// pipe as much as a file, gets /dev/null, which nothing can connect
+		// to or read anything from. A link here was made since prepare
+		// resolved the path, and bubblewrap would follow it.
 		switch {
+		case fi.Mode()&fs.ModeSymlink != 0:
+			return nil, fmt.Errorf("cover %s: it has become a link since it was resolved", c)
 		case fi.IsDir():
 			ops = append(ops, mountOp{c, coverMount, []string{"--perms", "0755", "--tmpfs", c}})
 			readOnly = append(readOnly, c)
-		case fi.Mode().IsRegular():
+		default:
 			ops = append(ops, mountOp{c, coverMount, []string{"--ro-bind", "/dev/null", c}})
 		}
 	}
