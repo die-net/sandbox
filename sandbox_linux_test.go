@@ -339,11 +339,17 @@ func lateMountHidden() int {
 			return 1
 		}
 	}
+	code := 0
 	if _, err := os.ReadFile(filepath.Join(lateMount, filepath.Base(legworkDB))); !errors.Is(err, unix.ENOENT) {
 		fmt.Fprintf(os.Stderr, "read the late bind: %v, want %v\n", err, unix.ENOENT)
-		return 1
+		code = 1
 	}
-	return 0
+	// pid 1's view of the files, which every process inside can try.
+	if _, err := os.ReadFile("/proc/1/root" + lateMount + "/" + filepath.Base(legworkDB)); err == nil {
+		fmt.Fprintln(os.Stderr, "read the late bind through pid 1's root")
+		code = 1
+	}
+	return code
 }
 
 // isolationTargets are what isolationChecks tries to reach from inside a
@@ -427,14 +433,19 @@ func isolationChecks(body string) int {
 			if err != nil {
 				return err
 			}
+			// pid 1 is undumpable, so its environment and descriptors may
+			// be closed to the command altogether.
 			environ, err := os.ReadFile("/proc/1/environ")
-			if err != nil {
+			if err != nil && !errors.Is(err, unix.EACCES) {
 				return err
 			}
 			if strings.Contains(string(cmdline)+string(environ), legworkDir) {
 				return fmt.Errorf("pid 1's command line or environment names %s", legworkDir)
 			}
 			fds, err := os.ReadDir("/proc/1/fd")
+			if errors.Is(err, unix.EACCES) {
+				return nil
+			}
 			if err != nil {
 				return err
 			}

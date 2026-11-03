@@ -20,48 +20,54 @@ import (
 )
 
 // stageArg is the first argument of the run of this binary that bubblewrap
-// starts inside the sandbox ahead of the command, and stagePath is where it
-// is bound in. /dev is a tmpfs bubblewrap makes, so the bind lands in no
-// directory a sandbox writes.
+// starts inside the sandbox ahead of the command, and reaperArg that of the
+// run the first stage execs. stagePath is where the binary is bound in. /dev
+// is a tmpfs bubblewrap makes, so the bind lands in no directory a sandbox
+// writes.
 const (
 	stageArg  = "--legwork-sandbox-stage"
+	reaperArg = "--legwork-sandbox-reaper"
 	stagePath = "/dev/legwork-sandbox"
 )
 
-// failed is the exit status of a sandbox whose first stage could not set up,
-// as distinct from the command's own.
+// failed is the exit status of a sandbox whose stages could not set up, as
+// distinct from the command's own.
 const failed = 125
 
-// Stage runs the sandbox's first stage if this process was started as it,
+// Stage runs one of the sandbox's stages if this process was started as it,
 // and reports false otherwise. A program that uses this package calls it
 // first in main, before it reads its arguments.
 func Stage() (int, bool) {
-	if len(os.Args) < 5 || os.Args[1] != stageArg || os.Args[3] != "--" {
+	if len(os.Args) < 5 || (os.Args[1] != stageArg && os.Args[1] != reaperArg) || os.Args[3] != "--" {
 		return 0, false
 	}
 	var level Kernel
 	err := level.Set(os.Args[2])
-	if err == nil {
-		err = firstStage(level, os.Args[4:])
+	code := failed
+	if err == nil && os.Args[1] == stageArg {
+		err = firstStage()
+	} else if err == nil {
+		code, err = reaperStage(level, os.Args[4:])
 	}
-	fmt.Fprintf(os.Stderr, "sandbox: %v\n", err)
-	return failed, true
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "sandbox: %v\n", err)
+		return failed, true
+	}
+	return code, true
 }
 
-// firstStage runs inside the sandbox as the command bubblewrap starts, with
-// CAP_SYS_ADMIN and CAP_SETPCAP in the sandbox's user namespace, before
-// anything untrusted runs. bubblewrap leaves the view a slave of the host's
-// mounts, so a mount made on the host later, such as a bind of a covered
-// path, would appear inside. Run unprivileged, bubblewrap puts the command
-// in a user namespace nested in the one that owns the view's mounts, so the
-// capabilities cannot change those. This copies the view into a mount
-// namespace of the stage's own and makes every mount in it private, then
-// gives up the capabilities, installs the filter, and execs the command.
-// The filter goes on here rather than through bubblewrap, since it refuses
-// the calls this makes.
-func firstStage(level Kernel, command []string) error {
-	// Capabilities, no_new_privs, and seccomp filters belong to a thread,
-	// and execve takes the calling thread's.
+// firstStage runs inside the sandbox as pid 1, which bubblewrap starts with
+// --as-pid-1, holding CAP_SYS_ADMIN and CAP_SETPCAP in the sandbox's user
+// namespace, before anything untrusted runs. bubblewrap leaves the view a
+// slave of the host's mounts, so a mount made on the host later, such as a
+// bind of a covered path, would appear inside. Run unprivileged, bubblewrap
+// puts pid 1 in a user namespace nested in the one that owns the view's
+// mounts, so the capabilities cannot change those. This copies the view
+// into a mount namespace of its own and makes every mount in it private.
+// unshare moves only the calling thread, so it then execs this binary again
+// as the reaper, which leaves the whole of pid 1 in the new namespace and
+// none in bubblewrap's.
+func firstStage() error {
 	runtime.LockOSThread()
 	if err := unix.Unshare(unix.CLONE_NEWNS); err != nil {
 		return fmt.Errorf("copy the view into a mount namespace of its own: %w", err)
@@ -69,28 +75,67 @@ func firstStage(level Kernel, command []string) error {
 	if err := unix.Mount("", "/", "", unix.MS_REC|unix.MS_PRIVATE, ""); err != nil {
 		return fmt.Errorf("make mounts private: %w", err)
 	}
+	args := slices.Concat([]string{os.Args[0], reaperArg}, os.Args[2:])
+	return syscall.Exec("/proc/self/exe", args, os.Environ()) //nolint:gosec // This is the sandbox's own binary, not a shell.
+}
+
+// reaperStage runs as pid 1 in the sandbox's own mount namespace. It gives
+// up every capability, makes itself undumpable, so the command cannot read
+// its memory or descriptors through /proc, installs the filter on all its
+// threads, and starts the command. Then it relays signals to the command,
+// reaps every orphan in the namespace, and exits with the command's status,
+// which also kills whatever is left. The filter goes on here rather than
+// through bubblewrap, since it refuses the calls the first stage makes.
+func reaperStage(level Kernel, command []string) (int, error) {
 	if err := dropCapabilities(); err != nil {
-		return err
+		return 0, err
 	}
 	if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
-		return fmt.Errorf("set no_new_privs: %w", err)
+		return 0, fmt.Errorf("set no_new_privs: %w", err)
 	}
-	// bubblewrap gave this stage the command's environment, so its PATH is
+	if err := unix.Prctl(unix.PR_SET_DUMPABLE, 0, 0, 0, 0); err != nil {
+		return 0, fmt.Errorf("make pid 1 undumpable: %w", err)
+	}
+	// bubblewrap gave the stages the command's environment, so its PATH is
 	// the one to look the command up on.
 	path, err := exec.LookPath(command[0])
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if err := installSeccomp(level); err != nil {
-		return err
+		return 0, err
 	}
-	return syscall.Exec(path, command, os.Environ()) //nolint:gosec // Running the configured command is the sandbox's job, and it is not a shell.
+	child, err := os.StartProcess(path, command, &os.ProcAttr{ //nolint:gosec // Running the configured command is the sandbox's job, and it is not a shell.
+		Env:   os.Environ(),
+		Files: []*os.File{os.Stdin, os.Stdout, os.Stderr},
+	})
+	if err != nil {
+		return 0, fmt.Errorf("start command: %w", err)
+	}
+	stop := relaySignals(child)
+	defer stop()
+	for {
+		var ws unix.WaitStatus
+		pid, err := unix.Wait4(-1, &ws, 0, nil)
+		if errors.Is(err, unix.EINTR) {
+			continue
+		}
+		if err != nil {
+			return 0, fmt.Errorf("wait: %w", err)
+		}
+		if pid != child.Pid {
+			continue
+		}
+		if ws.Signaled() {
+			return 128 + int(ws.Signal()), nil
+		}
+		return ws.ExitStatus(), nil
+	}
 }
 
-// dropCapabilities empties the calling thread's bounding set and clears its
-// ambient and inheritable sets. The command then holds none after execve,
-// even as uid 0 inside, and the empty bounding set is inherited by
-// everything it starts.
+// dropCapabilities empties the calling thread's bounding set and clears all
+// its other sets. The command then holds none after execve, even as uid 0
+// inside, and the empty bounding set is inherited by everything it starts.
 func dropCapabilities() error {
 	for c := 0; ; c++ {
 		err := unix.Prctl(unix.PR_CAPBSET_DROP, uintptr(c), 0, 0, 0)
@@ -106,14 +151,8 @@ func dropCapabilities() error {
 	}
 	hdr := unix.CapUserHeader{Version: unix.LINUX_CAPABILITY_VERSION_3}
 	var data [2]unix.CapUserData
-	if err := unix.Capget(&hdr, &data[0]); err != nil {
-		return fmt.Errorf("read capabilities: %w", err)
-	}
-	for i := range data {
-		data[i].Inheritable = 0
-	}
 	if err := unix.Capset(&hdr, &data[0]); err != nil {
-		return fmt.Errorf("clear inheritable capabilities: %w", err)
+		return fmt.Errorf("clear capabilities: %w", err)
 	}
 	return nil
 }
@@ -289,6 +328,9 @@ func newLaunch(spec Spec, acct account) (*launch, error) {
 	args := []string{
 		"--unshare-user", "--unshare-pid", "--unshare-ipc", "--unshare-uts",
 		"--die-with-parent", "--hostname", "legwork",
+		// The first stage is pid 1 and the reaper, so bubblewrap's own
+		// does not stay in the mount namespace the stage leaves.
+		"--as-pid-1",
 		// For the first stage alone, which drops them before the command.
 		"--cap-add", "CAP_SYS_ADMIN", "--cap-add", "CAP_SETPCAP",
 		// No --new-session: the hub checks that a bridge is in the session

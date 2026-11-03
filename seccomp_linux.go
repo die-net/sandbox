@@ -229,9 +229,9 @@ func syscallIf(nr uint32, body ...bpf.Instruction) []bpf.Instruction {
 	return append([]bpf.Instruction{bpf.JumpIf{Cond: bpf.JumpEqual, Val: nr, SkipFalse: uint8(n)}}, body...)
 }
 
-// installSeccomp applies level's filter to the calling thread, which must
-// be locked to its OS thread and exec next, since a filter belongs to a
-// thread and execve takes the calling thread's. It needs no_new_privs.
+// installSeccomp applies level's filter to every thread of this process, so
+// that whichever thread starts the command passes it on. It needs
+// no_new_privs.
 func installSeccomp(level Kernel) error {
 	insts, err := seccompFilter(level)
 	if err != nil || insts == nil {
@@ -252,7 +252,7 @@ func installSeccomp(level Kernel) error {
 	prog := unix.SockFprog{Len: uint16(n), Filter: &filter[0]}
 	// x/sys/unix has no seccomp call, and the kernel takes the program by
 	// address. It reads it during the call, and KeepAlive holds it until then.
-	_, _, errno := unix.Syscall(unix.SYS_SECCOMP, unix.SECCOMP_SET_MODE_FILTER, 0, uintptr(unsafe.Pointer(&prog))) //nolint:gosec // G103: passing a pointer to the kernel needs unsafe, and the call does not keep it.
+	_, _, errno := unix.Syscall(unix.SYS_SECCOMP, unix.SECCOMP_SET_MODE_FILTER, unix.SECCOMP_FILTER_FLAG_TSYNC, uintptr(unsafe.Pointer(&prog))) //nolint:gosec // G103: passing a pointer to the kernel needs unsafe, and the call does not keep it.
 	runtime.KeepAlive(filter)
 	if errno != 0 {
 		return fmt.Errorf("install system call filter: %w", errno)
