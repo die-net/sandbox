@@ -23,6 +23,11 @@ func TestCovers(t *testing.T) {
 			[]string{"/home/agent", "/home/agent/.claude/projects/a"},
 			[]string{"/home", "/home/agent/.claude/projects"},
 		},
+		// A home outside every default cover that is also a person's home,
+		// as the account's own is when it is the sandbox's. Covering it
+		// would make the bind on top of it read-only.
+		{"a cover that is the home", []string{"/srv/legwork", "/tmp"}, []string{"/srv/legwork"}, []string{"/tmp"}},
+		{"a cover inside a read path that is a cover", []string{"/opt/tool", "/opt/tool/secret"}, []string{"/opt/tool"}, []string{"/opt/tool/secret"}},
 	} {
 		if got := covers(tc.paths, tc.binds); !slices.Equal(got, tc.want) {
 			t.Errorf("%s: covers = %q, want %q", tc.name, got, tc.want)

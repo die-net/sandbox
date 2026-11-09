@@ -467,12 +467,22 @@ func mountCovers(covered, writable []string, mounts []mount) []string {
 // the outer cover's empty tmpfs already hides it and holds nothing to mount
 // it on. One inside a bind that is itself inside a cover stays, such as a
 // secret inside a tool's directory that is bound back read-only.
+//
+// A cover at the same path as a bind is left out too. The bind shows that
+// path whole, so the cover would hide nothing, and bubblewrap's remount of
+// the cover read-only would land on the bind on top of it instead, making a
+// writable home or write path read-only. Refusing the overlap instead would
+// refuse a deployment whose sandbox home is the account's own home, which
+// Run covers as one of people's homes.
 func covers(paths, binds []string) []string {
 	sorted := slices.Clone(paths)
 	slices.Sort(sorted)
 	sorted = slices.Compact(sorted)
 	var out []string
 	for _, c := range sorted {
+		if slices.Contains(binds, c) {
+			continue
+		}
 		// The nearest path above c that the view mounts something on
 		// decides: a cover hides c already, and a bind shows it.
 		var nearest string
@@ -480,7 +490,7 @@ func covers(paths, binds []string) []string {
 		for _, p := range slices.Concat(out, binds) {
 			if p != c && within(c, p) && len(p) > len(nearest) {
 				nearest = p
-				covered = slices.Contains(out, p) && !slices.Contains(binds, p)
+				covered = slices.Contains(out, p)
 			}
 		}
 		if !covered {

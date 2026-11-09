@@ -58,6 +58,9 @@ const (
 	// default cover, which TestIsolation covers.
 	coveredSock = "/srv/covered.sock"
 	lateDone    = "/srv/late-done"
+	// ownHome is a sandbox home withFakeHost makes outside every default
+	// cover, as a deployment's own home may be.
+	ownHome = "/srv/own"
 )
 
 // iptSoSetReplace is IPT_SO_SET_REPLACE from linux/netfilter_ipv4/ip_tables.h,
@@ -122,6 +125,12 @@ func runFromEnv(body string) int {
 			fmt.Fprintln(os.Stderr, err)
 			return failed
 		}
+		// The home may be one withFakeHost made, so the sandbox starts
+		// there only now, rather than from sandboxCmd's directory.
+		if err := os.Chdir(spec.Home); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return failed
+		}
 		go bindWhenStarted(spec.Home)
 		// bubblewrap refuses to run with capabilities unless it is setuid,
 		// as it would get them here through the ambient set. Capabilities
@@ -168,8 +177,10 @@ func withFakeHost() error {
 	if err := unix.Mount("", "/srv", "", unix.MS_SHARED, ""); err != nil {
 		return fmt.Errorf("share /srv: %w", err)
 	}
-	if err := os.Mkdir(lateMount, 0o750); err != nil {
-		return err
+	for _, d := range []string{lateMount, ownHome} {
+		if err := os.Mkdir(d, 0o750); err != nil {
+			return err
+		}
 	}
 	var lc net.ListenConfig
 	if _, err := lc.Listen(context.Background(), "unix", coveredSock); err != nil {
@@ -486,6 +497,12 @@ func isolationChecks(body string) int {
 			return nil
 		}},
 		{"replace an iptables table", unix.EPERM, replaceIPTable},
+		// Capabilities belong to a thread, and bubblewrap gives the first
+		// stage its own as ambient ones on every thread, so each thread of
+		// pid 1 is checked as well as the command's.
+		{"find a capability in the command or pid 1", nil, func() error {
+			return errors.Join(threadsHoldNoCapabilities("self"), threadsHoldNoCapabilities("1"))
+		}},
 	}
 	code := 0
 	for _, c := range checks {
@@ -710,7 +727,8 @@ func runSandbox(t *testing.T, spec Spec, fakeHost bool, args ...string) (int, st
 
 // sandboxCmd returns the command runSandbox runs. It starts in spec's home,
 // which the sandbox keeps as the command's working directory, as the runner
-// starts the CLI in its scratch directory.
+// starts the CLI in its scratch directory. With fakeHost, runFromEnv moves
+// there once the fake host is made, since the home may be part of it.
 func sandboxCmd(t *testing.T, spec Spec, fakeHost bool, args ...string) *exec.Cmd {
 	t.Helper()
 	exe, err := os.Executable()
@@ -725,9 +743,10 @@ func sandboxCmd(t *testing.T, spec Spec, fakeHost bool, args ...string) *exec.Cm
 		t.Fatal(err)
 	}
 	cmd := exec.CommandContext(t.Context(), "/proc/self/exe")
-	cmd.Dir = spec.Home
 	cmd.Env = append(os.Environ(), testSpecVar+"="+string(body))
-	if fakeHost {
+	if !fakeHost {
+		cmd.Dir = spec.Home
+	} else {
 		cmd.Env = append(cmd.Env, fakeHostVar+"=1")
 		cmd.SysProcAttr = &syscall.SysProcAttr{
 			Cloneflags:  unix.CLONE_NEWUSER | unix.CLONE_NEWNS,
@@ -943,6 +962,30 @@ func TestRefusedLayouts(t *testing.T) {
 			code, out := runSandbox(t, spec, false, "rename")
 			if code != failed {
 				t.Fatalf("the sandbox started, exit %d: %s", code, out)
+			}
+		})
+	}
+}
+
+// TestHomeCovered checks that a home outside every default cover stays
+// writable when it is also covered, by name or as the account's own home,
+// as a deployment's is when the sandbox's home is the account's.
+func TestHomeCovered(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		cover []string
+		env   string
+	}{
+		{"named as a cover", []string{ownHome}, ""},
+		{"the account's own home", nil, "HOME=" + ownHome},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := sandboxCmd(t, Spec{Home: ownHome, Cover: tc.cover}, true, "rename")
+			if tc.env != "" {
+				cmd.Env = append(cmd.Env, tc.env)
+			}
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("rename in a covered home: %v: %s", err, out)
 			}
 		})
 	}
