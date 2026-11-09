@@ -348,7 +348,7 @@ func newLaunch(spec Spec, acct account) (*launch, error) {
 			l.close()
 		}
 	}()
-	argsPipe, err := l.pipe()
+	argsPipe, _, err := l.pipe()
 	if err != nil {
 		return nil, err
 	}
@@ -478,26 +478,27 @@ func (l *launch) fd(f *os.File) string {
 	return strconv.Itoa(2 + len(l.inherit))
 }
 
-// pipe adds a pipe for bubblewrap to read, and returns its index in writes.
-func (l *launch) pipe() (int, error) {
+// pipe adds a pipe for bubblewrap to read, and returns its index in writes
+// and the number of its descriptor in bubblewrap.
+func (l *launch) pipe() (int, string, error) {
 	r, w, err := os.Pipe()
 	if err != nil {
-		return 0, fmt.Errorf("make pipe for bubblewrap: %w", err)
+		return 0, "", fmt.Errorf("make pipe for bubblewrap: %w", err)
 	}
-	l.fd(r)
+	fd := l.fd(r)
 	l.writes = append(l.writes, pendingWrite{w: w})
-	return len(l.writes) - 1, nil
+	return len(l.writes) - 1, fd, nil
 }
 
 // data adds a pipe that will carry body, and returns its descriptor's
 // number in bubblewrap.
 func (l *launch) data(body []byte) (string, error) {
-	i, err := l.pipe()
+	i, fd, err := l.pipe()
 	if err != nil {
 		return "", err
 	}
 	l.writes[i].body = body
-	return strconv.Itoa(2 + len(l.inherit)), nil
+	return fd, nil
 }
 
 // send closes this process's copies of bubblewrap's descriptors, which
