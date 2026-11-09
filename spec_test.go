@@ -128,6 +128,19 @@ func TestPrepare(t *testing.T) {
 		t.Errorf("Read = %q, want %q", spec.Read, want)
 	}
 
+	for _, tc := range []struct{ dir, want string }{
+		{"/srv/legwork/state/servers/a", "/srv/legwork/state/servers/a"},
+		{"/srv/agent", "/srv/agent"},
+		{"/state/servers/a", "/srv/legwork/state/servers/a"},
+	} {
+		spec, err := prepare(Spec{Command: []string{"true"}, Home: "/srv/legwork/state/servers/a", Dir: tc.dir}, nil, host, nil)
+		if err != nil {
+			t.Errorf("dir %s: %v", tc.dir, err)
+		} else if spec.Dir != tc.want {
+			t.Errorf("dir %s: Dir = %q, want %q", tc.dir, spec.Dir, tc.want)
+		}
+	}
+
 	planted := fakeHost(
 		[]string{"/home", "/srv/agent/.claude/projects", "/srv/legwork/state"},
 		nil,
@@ -144,6 +157,10 @@ func TestPrepare(t *testing.T) {
 		{"missing home", host, Spec{Command: []string{"true"}, Home: "/gone"}},
 		{"relative write", host, Spec{Command: []string{"true"}, Home: "/home", Write: []string{"x"}}},
 		{"relative dir", host, Spec{Command: []string{"true"}, Home: "/home", Dir: "x"}},
+		{"a dir under a cover", host, Spec{Command: []string{"true"}, Home: "/srv/agent", Dir: "/var"}},
+		{"a dir under a cover inside a read path", host, Spec{Command: []string{"true"}, Home: "/home", Read: []string{"/srv/agent"}, Cover: []string{"/srv/agent/.claude"}, Dir: "/srv/agent/.claude/projects"}},
+		{"a missing dir", host, Spec{Command: []string{"true"}, Home: "/srv/agent", Dir: "/srv/gone"}},
+		{"a dir through a link the sandbox planted", planted, Spec{Command: []string{"true"}, Home: "/srv/agent", Dir: "/srv/agent/.claude/projects/a"}},
 		{"unknown kernel", host, Spec{Command: []string{"true"}, Home: "/home", Kernel: "none"}},
 		{
 			"a write path through a link the sandbox planted", planted,

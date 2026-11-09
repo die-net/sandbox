@@ -24,7 +24,10 @@ type Spec struct {
 	// Dir is the command's working directory. Empty means the directory
 	// Run is called from, so a caller that starts each command in a
 	// directory of its own, as the runner does a turn's scratch directory,
-	// needs no flag naming it. Either way it must be inside the sandbox.
+	// needs no flag naming it. Either way it must be a directory the
+	// sandbox shows from the host: its home, a Write or Read path, or a path
+	// no cover hides. It is followed through a link only where the link
+	// lies outside every directory a sandbox can write.
 	Dir string `json:"dir,omitempty"`
 	// Write lists more host paths the command may write. A socket listed
 	// here is one the command may connect to, such as mcp.sock.
@@ -168,7 +171,36 @@ func prepare(spec Spec, homes []string, host fs.FS, mounts []mount) (Spec, error
 			}
 		}
 	}
+	if spec.Dir != "" {
+		dir, err := resolve(host, spec.Dir, writable)
+		if err != nil {
+			return Spec{}, fmt.Errorf("working directory: %w", err)
+		}
+		if !shown(dir, binds, spec.Cover) {
+			return Spec{}, fmt.Errorf("working directory %s lies under a covered path", spec.Dir)
+		}
+		spec.Dir = dir
+	}
 	return spec, nil
+}
+
+// shown reports whether the view shows p from the host: the nearest path at
+// or above p that the view mounts something on is one of binds, or there is
+// none and the host's root shows it.
+func shown(p string, binds, covered []string) bool {
+	var nearest string
+	ok := true
+	for _, b := range binds {
+		if within(p, b) && len(b) > len(nearest) {
+			nearest, ok = b, true
+		}
+	}
+	for _, c := range covered {
+		if within(p, c) && len(c) > len(nearest) {
+			nearest, ok = c, false
+		}
+	}
+	return ok
 }
 
 // realPath returns p, absolute and clean, and refuses it if a link lies

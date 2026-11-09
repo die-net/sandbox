@@ -51,6 +51,7 @@ A sandbox's home and `write` paths are untrusted: an earlier run, or another san
 
 - A home or `write` path must have no link in it at all, since a sandbox that can write a directory on the way could have planted it. That refuses a link the operator made too, such as an ostree host's `/home`, so the caller has to pass the real path, and must not resolve the path itself either.
 - Any other path is followed through a link only where the link lies outside every directory the sandbox can write.
+- The working directory is resolved the same way, and must be the home, a `write` or `read` path, or a path no cover hides, so a sandbox never starts in an empty cover.
 - A covered path inside a writable directory that has gone missing stops the sandbox from starting, since a sandbox could have moved it away to uncover what it hid.
 - No mount may lie inside the home or a `write` path at all, so every mount point is inside a tmpfs bubblewrap made or a read-only host path, never content a sandbox wrote.
 - Each bind source is opened with `openat2` and `RESOLVE_NO_SYMLINKS` and passed as a descriptor, and a cover that has become a link since it was resolved stops the sandbox, so nothing swapped in between the check and the mount can redirect it.
@@ -62,7 +63,7 @@ bubblewrap does not start the command itself. With `--as-pid-1`, it starts `legw
 1. bubblewrap leaves the view a slave of the host's mounts, so a mount made on the host later would appear inside. Run unprivileged, bubblewrap puts pid 1 in a user namespace nested inside the one that owns the view's mounts, so its capabilities cannot change the view. The stage copies the view into a mount namespace of its own and makes every mount in it private.
 2. It drops every capability, its bounding set included, and sets `no_new_privs`. Both belong to a thread, so it does this on the one thread it has locked, the one that execs next.
 3. `unshare` moves only the calling thread, so the stage execs itself again, which leaves the whole of pid 1 in the new namespace and no process inside in bubblewrap's. The new image starts with that one thread's empty sets, so no thread of pid 1 holds a capability, nor does the command, even as uid 0 inside. pid 1 makes itself undumpable, so the command cannot open its memory, descriptors, or root through `/proc`.
-4. It installs the seccomp filter on all its threads and starts the command. It then relays signals to it, reaps orphans, and exits with its status, which ends everything left inside.
+4. It installs the seccomp filter on all its threads and starts the command. It then passes on to it any SIGTERM or SIGHUP it gets, reaps orphans, and exits with the command's status, which ends everything left inside.
 
 The stage holds `CAP_SYS_ADMIN` in its nested user namespace while the binary starts, so whatever runs before `Stage`, such as its libraries' `init` functions, runs with it. That is Legwork's own code and what it links, not anything the sandbox runs, and `legwork-sandbox` links less of it.
 
@@ -157,6 +158,7 @@ These were found in [one-binary.md](one-binary.md)'s plan, which was changed to 
 - **The mount table.** `/proc/self/mountinfo` shows where each cover and bind is, so a cover hides what is under a path, not that the path exists. Legwork covers its config and state by directory, so the table names those directories, not the files in them.
 - **What the mount table cannot show.** A btrfs snapshot directory other than `/.snapshots`, or a home neither `/etc/passwd` nor a prefix of two homes reveals, has to be covered by name. `legwork doctor` will warn when Legwork's state is on a filesystem with snapshots.
 - **Links the operator made.** A home or `write` path through any link is refused, so on an ostree host the caller passes `/var/home/...`, not `/home/...`.
+- **Stopping a sandbox.** A SIGTERM or SIGHUP to `legwork sandbox` reaches only bubblewrap, whose outer process does not pass signals on, so it ends, and `--die-with-parent` kills everything inside with SIGKILL. The command gets no chance to save its state. Passing the signal to pid 1 instead would need its host pid from bubblewrap's `--info-fd`, and pid 1 would have to hold the signals blocked through both execs, since the kernel drops a signal sent to a namespace's init that has no handler.
 - **pid reuse before kernel 6.5.** Without `SO_PEERPIDFD`, the planned pid-namespace check on `mcp.sock` looks the peer up in `/proc` by pid, so a process that takes that pid in between would be judged instead.
 - **A router's address.** `guard.Client` refuses the host's interface addresses, not a router's public address that forwards back to the host.
 - **Other architectures.** With no system call list, only `kernel: open` starts, with no filter and so no `TIOCSTI` refusal. `legwork sandbox` refuses the other levels before it starts bubblewrap.

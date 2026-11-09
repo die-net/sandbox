@@ -226,6 +226,10 @@ func Run(ctx context.Context, spec Spec) (int, error) {
 		return 0, fmt.Errorf("start bubblewrap: %w", err)
 	}
 	sent := l.send()
+	// bubblewrap's outer process does not pass signals on, so a SIGTERM
+	// or SIGHUP relayed to it ends it, and --die-with-parent then kills
+	// everything inside with SIGKILL. Relaying rather than dying lets Run
+	// still wait for it and return its status.
 	stop := relaySignals(cmd.Process)
 	defer stop()
 	code, err := exitStatus(cmd.Wait())
