@@ -222,40 +222,69 @@ func seccompFilter(level Kernel) ([]bpf.Instruction, error) {
 // a return, since the call is decided there, and must be short enough for a
 // conditional jump to skip, which the filter's own checks are.
 func syscallIf(nr uint32, body ...bpf.Instruction) []bpf.Instruction {
-	n := len(body)
-	if n < 0 || n > math.MaxUint8 {
-		panic("system call check too long to jump over")
+	// The skip is counted in the type the jump takes, so it cannot wrap.
+	var skip uint8
+	for range body {
+		if skip == math.MaxUint8 {
+			panic("system call check too long to jump over")
+		}
+		skip++
 	}
-	return append([]bpf.Instruction{bpf.JumpIf{Cond: bpf.JumpEqual, Val: nr, SkipFalse: uint8(n)}}, body...)
+	return append([]bpf.Instruction{bpf.JumpIf{Cond: bpf.JumpEqual, Val: nr, SkipFalse: skip}}, body...)
+}
+
+// filterProgram returns level's filter as the kernel takes it, or nil for no
+// filter. Run calls it before it starts bubblewrap, so a filter that cannot
+// be built, as on an architecture with no system call list, is refused
+// there rather than by pid 1 once the sandbox is up.
+func filterProgram(level Kernel) (*unix.SockFprog, error) {
+	insts, err := seccompFilter(level)
+	if err != nil || insts == nil {
+		return nil, err
+	}
+	raw, err := bpf.Assemble(insts)
+	if err != nil {
+		return nil, fmt.Errorf("assemble system call filter: %w", err)
+	}
+	// The length is counted in the type the kernel takes, so it cannot
+	// wrap.
+	prog := &unix.SockFprog{}
+	filter := make([]unix.SockFilter, 0, len(raw))
+	for _, r := range raw {
+		if prog.Len == unix.BPF_MAXINSNS {
+			return nil, errors.New("system call filter is too long")
+		}
+		filter = append(filter, unix.SockFilter{Code: r.Op, Jt: r.Jt, Jf: r.Jf, K: r.K})
+		prog.Len++
+	}
+	prog.Filter = &filter[0]
+	return prog, nil
 }
 
 // installSeccomp applies level's filter to every thread of this process, so
 // that whichever thread starts the command passes it on. It needs
 // no_new_privs.
 func installSeccomp(level Kernel) error {
-	insts, err := seccompFilter(level)
-	if err != nil || insts == nil {
+	prog, err := filterProgram(level)
+	if err != nil || prog == nil {
 		return err
 	}
-	raw, err := bpf.Assemble(insts)
-	if err != nil {
-		return fmt.Errorf("assemble system call filter: %w", err)
-	}
-	filter := make([]unix.SockFilter, len(raw))
-	for i, r := range raw {
-		filter[i] = unix.SockFilter{Code: r.Op, Jt: r.Jt, Jf: r.Jf, K: r.K}
-	}
-	n := len(filter)
-	if n < 0 || n > unix.BPF_MAXINSNS {
-		return errors.New("system call filter is too long")
-	}
-	prog := unix.SockFprog{Len: uint16(n), Filter: &filter[0]}
 	// x/sys/unix has no seccomp call, and the kernel takes the program by
 	// address. It reads it during the call, and KeepAlive holds it until then.
-	_, _, errno := unix.Syscall(unix.SYS_SECCOMP, unix.SECCOMP_SET_MODE_FILTER, unix.SECCOMP_FILTER_FLAG_TSYNC, uintptr(unsafe.Pointer(&prog))) //nolint:gosec // G103: passing a pointer to the kernel needs unsafe, and the call does not keep it.
-	runtime.KeepAlive(filter)
+	//
+	// With TSYNC, a thread the kernel cannot move to the filter, because it
+	// already has one this filter does not descend from, fails the call
+	// with that thread's id as its result and no errno, and no thread gets
+	// the filter. So any result but 0 is an error. SECCOMP_FILTER_FLAG_TSYNC_ESRCH
+	// would turn that into ESRCH, but it needs Linux 5.7, and checking the
+	// result works on every kernel that has TSYNC, from 3.17.
+	tid, _, errno := unix.Syscall(unix.SYS_SECCOMP, unix.SECCOMP_SET_MODE_FILTER, unix.SECCOMP_FILTER_FLAG_TSYNC, uintptr(unsafe.Pointer(prog))) //nolint:gosec // G103: passing a pointer to the kernel needs unsafe, and the call does not keep it.
+	runtime.KeepAlive(prog)
 	if errno != 0 {
 		return fmt.Errorf("install system call filter: %w", errno)
+	}
+	if tid != 0 {
+		return fmt.Errorf("install system call filter: thread %d could not take it", tid)
 	}
 	return nil
 }

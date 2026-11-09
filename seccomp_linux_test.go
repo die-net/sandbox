@@ -2,8 +2,13 @@ package sandbox
 
 import (
 	"encoding/binary"
+	"fmt"
 	"math"
+	"os"
+	"os/exec"
+	"runtime"
 	"testing"
+	"unsafe"
 
 	"golang.org/x/net/bpf"
 	"golang.org/x/sys/unix"
@@ -146,4 +151,61 @@ func TestSeccompFilter(t *testing.T) {
 			}
 		}
 	}
+}
+
+// TestSeccompUnsyncedThread checks that installSeccomp fails when a thread
+// of the process cannot take the filter, which the kernel reports as that
+// thread's id with no errno.
+func TestSeccompUnsyncedThread(t *testing.T) {
+	// The filter would stay on the test binary if it went on, so it runs
+	// in a process of its own.
+	out, err := exec.CommandContext(t.Context(), "/proc/self/exe", "tsync").CombinedOutput()
+	if err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+}
+
+// unsyncedThreadRefused gives one thread a filter of its own, which the
+// sandbox's filter does not descend from, so TSYNC cannot move that thread
+// to it. It then installs the sandbox's filter from another thread, and
+// reports, as its exit status, whether that did not fail.
+func unsyncedThreadRefused() int {
+	ready := make(chan error)
+	go func() {
+		// The goroutine never unlocks or returns, so its thread, and the
+		// filter on it, last until the process exits.
+		runtime.LockOSThread()
+		ready <- allowAllOnThisThread()
+		select {}
+	}()
+	if err := <-ready; err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	runtime.LockOSThread()
+	if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	if err := installSeccomp(KernelStrict); err == nil {
+		fmt.Fprintln(os.Stderr, "the filter installed although a thread could not take it")
+		return 1
+	}
+	return 0
+}
+
+// allowAllOnThisThread installs a filter that allows everything on the
+// calling thread alone.
+func allowAllOnThisThread() error {
+	if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
+		return err
+	}
+	filter := []unix.SockFilter{{Code: unix.BPF_RET | unix.BPF_K, K: unix.SECCOMP_RET_ALLOW}}
+	prog := unix.SockFprog{Len: 1, Filter: &filter[0]}
+	_, _, errno := unix.Syscall(unix.SYS_SECCOMP, unix.SECCOMP_SET_MODE_FILTER, 0, uintptr(unsafe.Pointer(&prog))) //nolint:gosec // G103: passing a pointer to the kernel needs unsafe, and the call does not keep it.
+	runtime.KeepAlive(filter)
+	if errno != 0 {
+		return errno
+	}
+	return nil
 }

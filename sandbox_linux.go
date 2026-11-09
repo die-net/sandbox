@@ -200,6 +200,11 @@ func Run(ctx context.Context, spec Spec) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	// pid 1 builds the filter again to install it, but a filter that
+	// cannot be built is refused here, before bubblewrap builds the view.
+	if _, err := filterProgram(spec.Kernel); err != nil {
+		return 0, err
+	}
 	l, err := newLaunch(spec, lookupAccount())
 	if err != nil {
 		return 0, err
