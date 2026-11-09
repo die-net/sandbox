@@ -67,6 +67,15 @@ func Stage() (int, bool) {
 // unshare moves only the calling thread, so it then execs this binary again
 // as the reaper, which leaves the whole of pid 1 in the new namespace and
 // none in bubblewrap's.
+//
+// It also gives up every capability and sets no_new_privs before that exec.
+// Both belong to a thread, not a process, and bubblewrap raised the
+// capabilities as ambient ones before it started this binary, so every
+// thread the Go runtime made holds them. Dropping them on any thread but the
+// one that execs would leave the others holding them, and the command could
+// be forked from one of those. execve carries only this locked thread's
+// empty sets into the new image, which starts with that one thread, so every
+// thread of the reaper, and the command, starts with none.
 func firstStage() error {
 	runtime.LockOSThread()
 	if err := unix.Unshare(unix.CLONE_NEWNS); err != nil {
@@ -75,24 +84,27 @@ func firstStage() error {
 	if err := unix.Mount("", "/", "", unix.MS_REC|unix.MS_PRIVATE, ""); err != nil {
 		return fmt.Errorf("make mounts private: %w", err)
 	}
+	if err := dropCapabilities(); err != nil {
+		return err
+	}
+	if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
+		return fmt.Errorf("set no_new_privs: %w", err)
+	}
 	args := slices.Concat([]string{os.Args[0], reaperArg}, os.Args[2:])
 	return syscall.Exec("/proc/self/exe", args, os.Environ()) //nolint:gosec // This is the sandbox's own binary, not a shell.
 }
 
-// reaperStage runs as pid 1 in the sandbox's own mount namespace. It gives
-// up every capability, makes itself undumpable, so the command cannot read
-// its memory or descriptors through /proc, installs the filter on all its
-// threads, and starts the command. Then it relays signals to the command,
+// reaperStage runs as pid 1 in the sandbox's own mount namespace, with no
+// capabilities and no_new_privs set, which the first stage left it. It makes
+// itself undumpable, so the command cannot read its memory or descriptors
+// through /proc, installs the filter on all its threads, and starts the
+// command. Then it relays signals to the command,
 // reaps every orphan in the namespace, and exits with the command's status,
 // which also kills whatever is left. The filter goes on here rather than
 // through bubblewrap, since it refuses the calls the first stage makes.
 func reaperStage(level Kernel, command []string) (int, error) {
-	if err := dropCapabilities(); err != nil {
-		return 0, err
-	}
-	if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
-		return 0, fmt.Errorf("set no_new_privs: %w", err)
-	}
+	// Undumpable belongs to the process, and execve resets it, so it is
+	// set here rather than in the first stage.
 	if err := unix.Prctl(unix.PR_SET_DUMPABLE, 0, 0, 0, 0); err != nil {
 		return 0, fmt.Errorf("make pid 1 undumpable: %w", err)
 	}
@@ -134,8 +146,9 @@ func reaperStage(level Kernel, command []string) (int, error) {
 }
 
 // dropCapabilities empties the calling thread's bounding set and clears all
-// its other sets. The command then holds none after execve, even as uid 0
-// inside, and the empty bounding set is inherited by everything it starts.
+// its other sets. The calls act on that thread alone, so the caller must be
+// locked to it and exec from it. What it then runs holds none, even as uid 0
+// inside, and the empty bounding set is inherited by everything that starts.
 func dropCapabilities() error {
 	for c := 0; ; c++ {
 		err := unix.Prctl(unix.PR_CAPBSET_DROP, uintptr(c), 0, 0, 0)

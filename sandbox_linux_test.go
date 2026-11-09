@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"math"
 	"net"
 	"os"
@@ -494,6 +495,44 @@ func isolationChecks(body string) int {
 		}
 	}
 	return code
+}
+
+// threadsHoldNoCapabilities returns an error naming each thread of the
+// process at /proc/pid whose status shows any capability, in any set.
+func threadsHoldNoCapabilities(pid string) error {
+	dir := "/proc/" + pid + "/task"
+	tasks := os.DirFS(dir)
+	entries, err := fs.ReadDir(tasks, ".")
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, task := range entries {
+		path := dir + "/" + task.Name() + "/status"
+		status, err := fs.ReadFile(tasks, task.Name()+"/status")
+		if err != nil {
+			// A thread that exited since the directory was read.
+			if errors.Is(err, unix.ENOENT) || errors.Is(err, unix.ESRCH) {
+				continue
+			}
+			return err
+		}
+		sets := 0
+		for line := range strings.Lines(string(status)) {
+			name, value, ok := strings.Cut(strings.TrimSpace(line), ":")
+			if !ok || !slices.Contains([]string{"CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"}, name) {
+				continue
+			}
+			sets++
+			if value = strings.TrimSpace(value); strings.Trim(value, "0") != "" {
+				errs = append(errs, fmt.Errorf("%s shows %s %s", path, name, value))
+			}
+		}
+		if sets != 5 {
+			errs = append(errs, fmt.Errorf("%s shows %d of the 5 capability sets", path, sets))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // nestedTargets are the paths nestedMounts tries to reach.
