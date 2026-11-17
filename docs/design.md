@@ -46,7 +46,7 @@ For trmnl, the parent brokers egress: each build gets a proxy listener and no ot
 | bwrap discovery with setuid refusal; options on an `--args` fd; `--bind-fd` from `openat2(RESOLVE_NO_SYMLINKS)`; passwd/group via `--ro-bind-data`; scratch tmpfs with `--size`; mount ordering | `sandbox_linux.go` `newLaunch` | Generic (Linux backend) |
 | First stage and reaper: private mounts, caps dropped on the locked thread, no_new_privs, re-exec as pid 1, undumpable, TSYNC filter with result check, signal relay, reaping | `sandbox_linux.go` | Generic (Linux backend) |
 | Seccomp filter, three levels, per-arch lists | `seccomp_linux.go`, `syscalls_*.go` | Generic (Linux backend) |
-| HOME, TMPDIR, XDG_* set to the sandbox's own | `commandEnv` | Generic and portable. Always set by `Start` over `Cmd.Env`, as `commandEnv` does today (read), plus `XDG_RUNTIME_DIR`, which it misses. An inherited `HOME` would point into a covered tmpfs. The caller sets anything else on `Cmd.Env` (trmnl's `PATH`, `GEM_HOME`, `GEM_PATH`). |
+| HOME, TMPDIR, XDG_* set to the sandbox's own | `commandEnv` | Generic and portable. Always set by `Start` over `Cmd.Env`, as `commandEnv` does today (read), plus `XDG_RUNTIME_DIR`, which it misses, and on macOS `CFFIXED_USER_HOME`, since Cocoa resolves `~/Library` from that and not from `$HOME` (spikes.md M2). An inherited `HOME` would point into a covered tmpfs. The caller sets anything else on `Cmd.Env` (trmnl's `PATH`, `GEM_HOME`, `GEM_PATH`). |
 | `--legwork-sandbox-stage`, `--legwork-sandbox-reaper`, `/dev/legwork-sandbox` | `sandbox_linux.go:28-30` | Rename |
 | `--hostname legwork`, fallback account `legwork` | `sandbox_linux.go:357, 547` | `Spec.Hostname` (Linux only); fallback becomes `sandbox` |
 | No `--new-session` | `sandbox_linux.go` | Driven by legwork's hub check, but a correct default: the filter refuses `TIOCSTI`. `Cmd` has no session option, and trmnl uses `Setpgid`. |
@@ -82,7 +82,7 @@ For trmnl, the parent brokers egress: each build gets a proxy listener and no ot
 | Network namespace, proxy listener handed out | ✓ mechanism (new) | ✓ proxy, allowlist, logging | parent-bound port allowed by number. `BroadLoopback` only by opt-in (4.3). Test that other ports refuse. |
 | Bridge check by pid namespace (`--info-fd`), by session on macOS | ✓ exposes the pid, taken only from `--info-fd` (4.4) | ✓ the check | session check through `LOCAL_PEERPID` and `getsid`, legwork's. Test a sandboxed process calling `setsid` and connecting. |
 | Root launcher, uid per child, nftables for `direct`, cgroups | ✓ refuses euid 0 and a uid change. The caller must already run as the sandbox's uid, because `Command` resolves paths, opens bind sources, reads homes and writes the passwd entry in the caller. | ✓ the launcher switches uid in its own child before calling the library, as one-binary's Root describes | LaunchDaemon as root, uid switched before the library. Test the euid-0 refusal. |
-| Seatbelt profile: deny default, covers as denies after the broad allow, `mcp.sock` by path, proxy port, mach services, no LaunchServices | ✓ (new backend) | ✓ which paths | it is the profile. `mcp.sock` in `Write` needs a `(remote unix-socket (path-literal ...))` connect rule as well as the `subpath` allow, since a file allow doesn't grant a connect. Test that it connects, and that another socket under `Write` doesn't. |
+| Seatbelt profile: deny default, covers as denies after the broad allow, `mcp.sock` by path, proxy port, mach services, never `lsopen` (spikes.md M3) | ✓ (new backend) | ✓ which paths | it is the profile. `mcp.sock` in `Write` needs a `(remote unix-socket (path-literal ...))` connect rule as well as the `subpath` allow, since a file allow doesn't grant a connect. Test that it connects, and that another socket under `Write` doesn't. |
 | Startup probe and refusal when there's no sandbox (one-binary "Floor") | ✓ `Probe()`, naming the blocking setting (6.3) | ✓ the refusal, the log, `--no-sandbox` | `sandbox-exec` with a trivial profile |
 | Escape tests (one-binary "Checks"), run in CI and in `doctor` | ✓ `Check()`, the generic checks (6.2) | ✓ its `Expect` values, the rerun per relaxation, the rendering | same suite, with macOS rows (6.2) |
 | `os.Root` for files in sandbox-writable dirs; `guard` refusing host addresses | | ✓ (not sandbox code) | same |
@@ -102,7 +102,7 @@ This section is the in-place mode. Compose stays a supported deployment in opera
 | proxy (`renderproxy`, TCP forward to the renderer) | `renderproxy` inside `serve`, one listener per build | same |
 | renderer (shim, Xvfb, separate uid) | a sandbox per build. The shim becomes a `render-child` subcommand run inside it. Firefox runs headless. | same, via Seatbelt |
 | network with no route but the proxy | loopback-only network namespace with the listener inside | profile allows only the build's proxy port and its declared loopback ports |
-| dropped capabilities, no-new-privileges | first stage drops caps, no_new_privs, seccomp | deny-default profile, no LaunchServices |
+| dropped capabilities, no-new-privileges | first stage drops caps, no_new_privs, seccomp | deny-default profile, never `lsopen` |
 | separate uid hides server files | covers hide the data dir, config, homes | profile denies the same |
 | memory cap, no pids cap | cgroup if delegated, else rlimits plus a watchdog (3.5) | rlimits plus a watchdog (3.5) |
 | init process, group kill | pid 1 reaps; the whole tree dies with it | process group kill; `setsid` escapes |
@@ -197,10 +197,23 @@ Use what the host gives, and log once what's missing.
     - netlink sockets. Firefox still reports `navigator.onLine=true`, so the `network.manage-offline-status` pref isn't needed.
   - `nested` gains trmnl nothing, since a recipe already runs arbitrary code outside any Firefox content process. trmnl uses `strict`.
   - Not run: geckodriver talking to Marionette inside the sandbox. That's TCP on loopback, which `strict` allows (inferred).
-- **macOS, Seatbelt.** Not yet run. The spike (spikes.md M2) was blocked: headless Firefox 152 hung even with no sandbox, from an agent session. The points below are still from sources.
-  - A process inside a profile can't apply another one, so Firefox's child processes fail when they call `sandbox_init` (bug 1417005). On release builds the pref `security.sandbox.content.level=0` is raised back to 1. But `MOZ_DISABLE_CONTENT_SANDBOX` returns level 0 before that clamp, with no platform guard (read: `SandboxSettings.cpp`). `MOZ_DISABLE_GPU_SANDBOX` is in the same file. The GMP, RDD, socket and utility processes are sandboxed elsewhere, and their switches are unverified. Headless with no media may never start some of them.
-  - The cost compared with Linux: Firefox has no inner layer, so our profile is the only one. Seatbelt filters operations (files, network, Mach services, IOKit), not system calls. For trmnl's assets that changes nothing. For defense in depth, the profile should deny `iokit-open` beyond what headless Firefox needs and keep Mach services minimal.
-  - The services list comes from the deny log (`log stream --predicate 'sender == "Sandbox"'`) on a real build. Likely: fonts (CoreText), Directory Services, SystemConfiguration (inferred).
+- **macOS, Seatbelt (ran: spikes.md M2, Firefox 160 on macOS 27.0.1).**
+  - Headless `--screenshot` works under a deny-default profile through `sandbox-exec`, in 2-4 s. The PNG is byte-identical to the unsandboxed render.
+  - `CFFIXED_USER_HOME` must point at the sandbox home (4.1). Without it, Firefox 152-157 hangs on the TCC-protected real `~/Library`.
+  - A process inside a profile can't apply another one (bug 1417005), so Firefox's children fail `sandbox_init`.
+    - The content process then crash-loops with no output.
+    - The socket and RDD processes crash, but the render still completes.
+    - `MOZ_DISABLE_CONTENT_SANDBOX`, `MOZ_DISABLE_SOCKET_PROCESS_SANDBOX` and `MOZ_DISABLE_RDD_SANDBOX` fix all three. The content switch returns level 0 before the release-build clamp (read: `SandboxSettings.cpp`). The GPU, utility and GMP processes didn't start for a plain page. Media in a recipe may start them.
+  - The minimal profile needs:
+    - the app bundle, `/System`, `/usr/lib` and `/`
+    - `sysctl-read`
+    - Mach lookups for `launchservicesd`, `configd` and Firefox's own `org.mozilla.machname.*`, which it registers too. The `launchservicesd` lookup doesn't let it open apps or URLs: Seatbelt's separate `lsopen` operation gates that, and the profile never allows it (spikes.md M3).
+    - no `iokit-open`. Headless falls back to software rendering.
+
+    About 25 other services Firefox asks for are refused with no effect. The shipped profile adds read-only fonts, `/usr/share` and `/dev` basics for real recipes, and keeps the services list that short.
+  - Without the `mach-register` rule, Firefox exits 0 with no PNG, so trmnl checks that the output exists.
+  - The cost compared with Linux: Firefox has no inner layer, so our profile is the only one. Seatbelt filters operations (files, network, Mach services, IOKit), not system calls. For trmnl's assets that changes nothing.
+  - Not run: geckodriver and Marionette under the profile, trmnlp's runtimes, web fonts and media.
 
 ## 4. Proposed API
 
@@ -244,7 +257,7 @@ type Cmd struct {
     Stdin     io.Reader
     Stdout    io.Writer
     Stderr    io.Writer
-    Env       []string      // nil means empty, never os.Environ(); Start sets HOME, TMPDIR, XDG_* (XDG_RUNTIME_DIR included) over it
+    Env       []string      // nil means empty, never os.Environ(); Start sets HOME, TMPDIR, XDG_* (XDG_RUNTIME_DIR included) and, on macOS, CFFIXED_USER_HOME over it
     WaitDelay time.Duration // as exec.Cmd's
     Setpgid   bool          // new process group (macOS teardown)
     CgroupFD  int           // Linux: start in this cgroup; -1 none
@@ -267,6 +280,7 @@ const SelfPath = ... // this binary as the command names it: /dev/sandbox-stage 
 - **Kernel levels.** A level is only ever raised. On macOS every level gets the one profile, which is at least as strict as the request, and `Report.Kernel` shows it. A level the host can't meet is an error from `Command`, and it's missing from `Report.Kernel`, never a silent fall to a weaker level. For example, linux/arm (GOARM=7) has no syscall list. legwork refuses `strict` and `nested` there today (read: `syscalls_linux_other.go`), and the library keeps that.
 - **`Env` lives only on `Cmd`**, as on `exec.Cmd`.
   - It starts empty. The caller sets it after reading `ListenAddrs()`, which on macOS isn't known until `Command` has bound the port. `Start` then always sets the sandbox's `HOME`, `TMPDIR` and `XDG_*` over it, including `XDG_RUNTIME_DIR`. legwork's `commandEnv` misses that one, and the host's `/run/user/<uid>` leaked into Firefox (spikes.md L2).
+  - On macOS it also sets `CFFIXED_USER_HOME` to the sandbox home. `$HOME` alone doesn't redirect where Cocoa looks for `~/Library` (Application Support, Caches). Without it, Firefox 152-157 hangs on the TCC-protected real `~/Library/Application Support/Firefox`, and later versions write into the real `~/Library` (spikes.md M2). CFPreferences still reads the real `~/Library/Preferences`, and the profile refuses that at no cost.
   - A server that forgets to set it passes on nothing, so none of its tokens leak. `Run`, the standalone form, passes `os.Environ()` explicitly.
   - Rejected: making every listener address known before `Command`. Linux listeners are bound inside the namespace, so the backends would diverge. Also rejected: a `SANDBOX_LISTEN_n` variable for the command to translate, since legwork execs its CLI directly and nothing would translate it.
 - **The uid.** `Command` and `Start` run as the sandbox's uid. They resolve paths, open bind sources by fd, read homes and write the passwd entry in the calling process, and switching uid at exec would leave all of that done as root. So `Command` refuses euid 0. There's no `Credential` option at all. legwork's root launcher switches uid in its own child, then calls the library, which matches one-binary's Root.
@@ -281,8 +295,9 @@ const SelfPath = ... // this binary as the command names it: /dev/sandbox-stage 
 | `Cover` and default covers | tmpfs or `/dev/null` | denies after the broad allow (last match wins) |
 | `/etc` link targets under covers | rebound read-only | allowed read-only |
 | `Kernel` | strict, nested and open are different filters | all strict |
-| `Services` | ignored | extra `mach-lookup` groups |
-| `Network: NetworkNone` (zero value) | bubblewrap's `--unshare-net`: a namespace with only loopback, no new code. Abstract sockets become private too. | deny network, except the `Listen`/`Loopback` ports and the unix sockets the `Spec` names |
+| Environment | `Start` sets `HOME`, `TMPDIR`, `XDG_*` | the same, plus `CFFIXED_USER_HOME` (4.1) |
+| `Services` | ignored | extra `mach-lookup` groups. Firefox's needs only `launchservicesd`, `configd` and its own `org.mozilla.machname.*` register and lookup, with no `iokit-open` (spikes.md M2). |
+| `Network: NetworkNone` (zero value) | bubblewrap's `--unshare-net`: a namespace with only loopback, no new code. Abstract sockets become private too. | deny network, except the `Listen`/`Loopback` ports and the unix sockets the `Spec` names. Firefox renders a `file://` page with none, and one allowed port works (spikes.md M2). |
 | `Network: NetworkHost` (asked for explicitly) | host network | allow outbound, deny `localhost` |
 | `BroadLoopback` (opt-in) | ignored, since loopback is private | allow `localhost:*`, which also reaches the host's LAN address. No reliable per-port deny exists (4.3). |
 | `Listen` | bound inside the namespace by the stage, handed to the parent | bound by the parent on `127.0.0.1:0`; the profile allows that port |
@@ -558,7 +573,7 @@ The container fixes relax the outer layer just enough for the inner one, which t
      - `Network: NetworkNone` (the zero value), `Listen: 1`, `Loopback: 2`, and `BroadLoopback` on macOS until trmnlp takes fixed WebDriver ports (4.3)
      - `Services: [fonts, ...]`
      - `Rlimits`: `CPU`, `NOFILE`, `FSIZE`
-   - On the returned `Cmd` it sets `Env`: `buildEnv` plus `HTTP(S)_PROXY` from `ListenAddrs()`, the resolved `PATH`/`GEM_HOME`/`GEM_PATH`, `MOZ_HEADLESS=1`, `MOZ_CRASHREPORTER_DISABLE=1`, `MOZ_ASSUME_USER_NS=0` on Linux, `MOZ_DISABLE_CONTENT_SANDBOX=1` on macOS, and the `FIELD_*` values.
+   - On the returned `Cmd` it sets `Env`: `buildEnv` plus `HTTP(S)_PROXY` from `ListenAddrs()`, the resolved `PATH`/`GEM_HOME`/`GEM_PATH`, `MOZ_HEADLESS=1`, `MOZ_CRASHREPORTER_DISABLE=1`, `MOZ_ASSUME_USER_NS=0` on Linux, `MOZ_DISABLE_CONTENT_SANDBOX=1`, `MOZ_DISABLE_SOCKET_PROCESS_SANDBOX=1` and `MOZ_DISABLE_RDD_SANDBOX=1` on macOS, and the `FIELD_*` values.
    - It also sets `Stdout`/`Stderr`, `WaitDelay`, and `CgroupFD` when a cgroup is delegated, or `Setpgid` and the watchdog otherwise. Then it serves `renderproxy` on the listener, waits, and reads the outputs through `os.Root`.
 5. Ship a systemd unit with `Delegate=yes`, a launchd plist, and install docs per platform (3.3).
 6. Keep `compose.yaml` as the operator-mode reference (5.1). Add a `--isolation=operator` flag (name to pick) to the render side. Then it runs `Check(ctx, nil, want)` at startup, reports the results to the server, and refuses only on the no-boundary findings in 5.1.
@@ -574,7 +589,7 @@ Settle the API against both backends now. Build Linux first.
 3. **Listener handoff** (`Listen`, `Loopback`), with legwork's phase 4.
 4. **trmnlp's fixed WebDriver ports**, proposed upstream early, since macOS needs it to drop `BroadLoopback`.
 5. **trmnl on Linux:** one binary, `renderer check`, headless, cgroup or watchdog. Firefox under `strict` is settled (spikes.md L2).
-6. **Seatbelt backend** (legwork's phase 6, built here): profile generation, the stage, `Services` groups, the deny-log runs with both legwork CLIs and trmnl's Firefox from a normal GUI session (spikes.md M2), and a hole-finding review of the profile.
+6. **Seatbelt backend** (legwork's phase 6, built here): profile generation, the stage, `Services` groups, the deny-log runs with both legwork CLIs and with trmnlp, geckodriver and the recipe runtimes (headless Firefox alone is done: spikes.md M2), and a hole-finding review of the profile.
 7. **trmnl on macOS.**
 
 Why this order: the Linux backend has a review record and tests behind it, and it's mostly a move. Seatbelt is new code in an undocumented profile language, and its findings will come from running it. trmnl's macOS users can run the server meanwhile.
@@ -583,7 +598,7 @@ Why this order: the Linux backend has a review record and tests behind it, and i
 
 1. **The network namespace and listener handoff aren't built** in the library. They're trmnl's one hard prerequisite on Linux. The mechanism works (spikes.md L1), so what's left is library code and its tests.
 2. **`BroadLoopback` on macOS opens every TCP listener on the host's own addresses**, `serve`'s included, because a per-port deny is unreliable and `localhost` matches the LAN address (spikes.md M1). It's acceptable only while `serve` trusts no source address. trmnlp's fixed WebDriver ports remove it, so propose that change early.
-3. **Firefox under Seatbelt is unrun.** The spike was blocked: headless Firefox hung even unsandboxed from an agent session (spikes.md M2). Still open: the switches for its child processes, and the `mach-lookup` and `iokit-open` lists. Rerun from a normal GUI session.
+3. **Seatbelt profiles come from deny logs on one macOS version.** Firefox's minimal set (spikes.md M2) is small, but Apple renames and adds services between releases, and a missing one can fail silently (Firefox exits 0 with no PNG). Still open: trmnlp, geckodriver and the runtimes under the profile, and recipes with media that start the utility or GMP process. `renderer check` should run a known page and compare the PNG on each macOS release.
 4. **Install friction that pushes users to `--no-sandbox`.** Ubuntu's AppArmor step; Ruby 4 and geckodriver outside the Debian/Ubuntu archives; the snap Firefox on Ubuntu. `renderer check` should name the exact fix for each, and the docs should lead with the shortest path per platform.
 5. **Operator mode set up wrong**, such as the data volume or `TRMNL_SECRET_KEY` on the render side, or a shared container with the sandbox off. The as-is checks catch the common cases. A pass is still only a failed attempt, not proof.
 6. **The outer-runtime fixes in 6.3 are partly inferred**: the AppArmor and masked-`/proc` rows, and which `docker`/`podman` options apply. Run bubblewrap in default Docker, rootless Podman and a hardened systemd unit before writing the messages.
@@ -597,6 +612,6 @@ Why this order: the Linux backend has a review record and tests behind it, and i
 14. **Fix coordination.** Tag releases, since legwork pins a version as an exception to its stdlib-then-`x` rule. Keep the moby profile pin, the Seatbelt service groups and the findings list in the library only.
 15. **Older bubblewrap.** Descriptor passthrough, `--info-fd` and the lifeline were confirmed on 0.12.0 only (spikes.md L1). legwork's floor is 0.8, so CI should run the oldest version it accepts.
 
-Retired by the spikes: Firefox headless under `strict` on Linux (spikes.md L2), and descriptor passthrough on bubblewrap 0.12.0 (L1).
+Retired by the spikes: Firefox headless under `strict` on Linux (spikes.md L2), headless Firefox under a deny-default Seatbelt profile (M2), and descriptor passthrough on bubblewrap 0.12.0 (L1).
 
 Sources: [Mozilla bug 1756236](https://bugzilla.mozilla.org/show_bug.cgi?id=1756236), [Mozilla bug 1884347](https://bugzilla.mozilla.org/show_bug.cgi?id=1884347), [Mozilla bug 1417005](https://bugzilla.mozilla.org/show_bug.cgi?id=1417005), [SUMO 1451388](https://support.mozilla.com/fa/questions/1451388), [Firefox SandboxInfo.cpp](https://sources.debian.org/src/firefox/148.0-1/security/sandbox/linux/SandboxInfo.cpp), [Firefox SandboxSettings.cpp](https://raw.githubusercontent.com/mozilla-firefox/firefox/main/security/sandbox/common/SandboxSettings.cpp), [Mozilla wiki: OS X sandbox rule set](https://wiki.mozilla.org/Sandbox/OS_X_Rule_Set), [Apple forums: RLIMIT_AS](https://developer.apple.com/forums/thread/856401), [Apple forums: RLIMIT_DATA](https://developer.apple.com/forums/thread/702803), [XNU proc_rlimit.c](https://git.saurik.com/apple/xnu.git/blame/refs/heads/master:/tests/proc_rlimit.c), [darwin-kernel on maxproc](https://lists.apple.com/archives/darwin-kernel/2005/Sep/msg00065.html), [trmnl_preview 0.34.1 dependencies](https://rubygems.org/gems/trmnl_preview/versions/0.34.1/dependencies), [Debian ruby versions](https://packages.debian.org/search?keywords=ruby&searchon=names&exact=1&suite=all&section=all), [Ubuntu ruby versions](https://packages.ubuntu.com/search?keywords=ruby&searchon=names&exact=1&suite=all&section=all), [Fedora Ruby 4.0 change](https://fedoraproject.org/wiki/Changes/Ruby_4.0), [Baeldung: installing geckodriver](https://www.baeldung.com/linux/geckodriver-installation).
