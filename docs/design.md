@@ -19,7 +19,7 @@ Sources. **Read** means I read the code or doc. **Inferred** means I reasoned it
 Principles, which are the same as legwork's "Relaxing a sandbox" section:
 
 1. **The real alternative is no sandbox.** When a sandbox is cumbersome, people turn it off. So every platform gets the strongest isolation it can give, with no setup beyond installing the packages.
-2. **Backends differ, and that's fine.** macOS has no pid namespace, no cgroups and coarser kernel filtering than Linux. It still gets a deny-by-default file and network view, which is most of what protects trmnl's assets. The library reports what each backend gives (`Probe`), and the caller logs it once at startup. Missing pieces are reported, not refused.
+2. **Backends differ, and that's fine.** macOS has no pid namespace, no cgroups and coarser kernel filtering than Linux. It still gets a deny-by-default file and network view, which is most of what protects trmnl's assets. The library reports what each backend gives (`Probe`), and the caller logs it once at startup. Missing pieces are reported, not refused. That covers features outside the kernel filter (memory limits, private loopback, tree kill). The kernel level is the exception: a requested level can be raised but never lowered, and one the host can't meet is an error (4.1).
 3. **Zero config.** trmnl finds its tools at startup and works out from where they're installed what the sandbox needs to show (section 3.4). A brew, rbenv or apt user configures nothing.
 4. **Refuse only when there's no sandbox at all**, as legwork's floor does. On macOS `sandbox-exec` is always present. On Linux the fix is `apt install bubblewrap`, plus one AppArmor command on Ubuntu, and trmnl's message prints it. `--no-sandbox` stays for development. It never refuses, and it logs what the checks find (section 5).
 5. **The operator's own boundary is a sandbox too.** Containers or systemd units set up as section 5 describes do the same job, and the project then runs untrusted code without the library's sandbox. The library's part is to report honestly what that boundary enforces (section 6).
@@ -27,7 +27,7 @@ Principles, which are the same as legwork's "Relaxing a sandbox" section:
 What the library needs, beyond what legwork has:
 - `Command`, an entry point a server can call
 - `Probe`, which reports what the backend gives
-- a network namespace with listeners handed to the parent
+- `Network` (none or host) in the first release, then listeners handed to the parent
 - caller file descriptors passed through
 - rlimits applied inside the sandbox
 - the sandbox's pid exposed
@@ -46,48 +46,49 @@ For trmnl, the parent brokers egress: each build gets a proxy listener and no ot
 | bwrap discovery with setuid refusal; options on an `--args` fd; `--bind-fd` from `openat2(RESOLVE_NO_SYMLINKS)`; passwd/group via `--ro-bind-data`; scratch tmpfs with `--size`; mount ordering | `sandbox_linux.go` `newLaunch` | Generic (Linux backend) |
 | First stage and reaper: private mounts, caps dropped on the locked thread, no_new_privs, re-exec as pid 1, undumpable, TSYNC filter with result check, signal relay, reaping | `sandbox_linux.go` | Generic (Linux backend) |
 | Seccomp filter, three levels, per-arch lists | `seccomp_linux.go`, `syscalls_*.go` | Generic (Linux backend) |
-| HOME, TMPDIR, XDG_* set to the sandbox's own | `commandEnv` | Generic and portable. Make these defaults the caller can override. |
+| HOME, TMPDIR, XDG_* set to the sandbox's own | `commandEnv` | Generic and portable. Always set by `Start` over `Cmd.Env`, as `commandEnv` does today (read). An inherited `HOME` would point into a covered tmpfs. The caller sets anything else on `Cmd.Env` (trmnl's `PATH`, `GEM_HOME`, `GEM_PATH`). |
 | `--legwork-sandbox-stage`, `--legwork-sandbox-reaper`, `/dev/legwork-sandbox` | `sandbox_linux.go:28-30` | Rename |
 | `--hostname legwork`, fallback account `legwork` | `sandbox_linux.go:357, 547` | `Spec.Hostname` (Linux only); fallback becomes `sandbox` |
-| No `--new-session` | `sandbox_linux.go` | Driven by legwork's hub check, but a correct default: the filter refuses `TIOCSTI`, and a caller that wants a session sets `Setsid`. |
-| `Run`: own stdio, `os.Environ()`, `os.Getwd()`, process-wide `signal.Notify`, `Pdeathsig` | `Run` | Fine in a dedicated process. Wrong inside a server. Hence `Command`. |
+| No `--new-session` | `sandbox_linux.go` | Driven by legwork's hub check, but a correct default: the filter refuses `TIOCSTI`. `Cmd` has no session option, and trmnl uses `Setpgid`. |
+| `Run`: own stdio, `os.Environ()`, `os.Getwd()`, process-wide `signal.Notify`, `Pdeathsig` on bwrap (read: `sandbox_linux.go:224`) | `Run` | Fine in a dedicated process. Wrong inside a server, where `Pdeathsig` fires when the forking OS thread exits, not the process. Hence `Command` (4.1, 4.4). |
 | Reaper starts the command with only fds 0-2 | `reaperStage` | Gap. one-binary's children receive their job on an inherited socketpair. |
 | `Run`/`Stage` return `ErrUnsupported` off Linux | `sandbox_other.go` | Replaced by the Seatbelt backend |
 | `RegisterFlags` (Go `flag`) | `flags.go` | Generic. legwork's pflag wrapper stays in legwork. |
-| `TestBridgePeer` (uses `internal/peer`) | test | Stays in legwork. The library keeps a version without `peer`. |
+| `TestBridgePeer` (uses `internal/peer`) | test | Stays in legwork, rewritten against the public `Command` with its own `TestMain` calling `Stage()`. The library keeps a version without `peer`. |
+| `cmd/legwork-sandbox` | imports `internal/cli` and pflag | Stays in legwork |
 | All other tests | tests | Move. They hold up the findings. |
 
 ### Where each sandbox.md guarantee lives after the split
 
-| Guarantee | Library | legwork config/code |
-|---|---|---|
-| bwrap from the distro, setuid refused | ✓ | |
-| Options on a descriptor, not in pid 1's argv | ✓ | |
-| Bind sources by fd with `RESOLVE_NO_SYMLINKS`; a cover that became a link aborts | ✓ | |
-| User/pid/ipc/uts namespaces, uid mapped to itself, `--die-with-parent`, `--as-pid-1` | ✓ | |
-| Read-only root; covers (tmpfs, or `/dev/null` for non-dirs); default covers; people's homes; the account's own home | ✓ | |
-| Legwork's config, state, and other sandboxes' directories covered | | ✓ (`Spec.Cover` from config) |
-| Mount-table covers (`.zfs`, other mounts of a covered fs) | ✓ | |
-| `/etc` links into covered dirs rebound | ✓ | |
-| Path and link rules: no link in home or `write`; a link followed only outside writable dirs; a missing cover inside a writable dir aborts; no mount inside a writable dir; cwd must be shown | ✓ | passes real paths |
-| A home per thread; `work` beside the CLI home; `read`/`write` refused if they overlap state | | ✓ |
-| Scratch tmpfs 1 GiB | ✓ default, `ScratchSize` | |
-| One-entry passwd/group | ✓ | |
-| First stage: private mounts, caps dropped on the exec'ing thread, no_new_privs, pid 1 re-exec, undumpable | ✓ | |
-| Filter: allowlist, arg checks, ENOSYS default, foreign ABIs refused, low-32-bit checks, TSYNC result check | ✓ | |
-| Kernel level per child | | ✓ (`kernel:`) |
-| Caller's session kept, `TIOCSTI`/`TIOCLINUX` refused | ✓ | relies on it |
-| Stage runs the caller binary's `init` with `CAP_SYS_ADMIN` (nested userns) | documented | ✓ "no `init`" rule from one-binary's Code layout |
-| Network namespace, proxy listener handed out | ✓ mechanism (new) | ✓ proxy, allowlist, logging |
-| Bridge check by pid namespace (`--info-fd`), by session on macOS | ✓ exposes the pid (new) | ✓ the check |
-| Root launcher, uid per child, nftables for `direct`, cgroups | caller (`Cmd.SysProcAttr`) | ✓ |
-| Seatbelt profile: deny default, covers as denies after the broad allow, `mcp.sock` by path, proxy port, mach services, no LaunchServices | ✓ (new backend) | ✓ which paths |
-| Startup probe and refusal when there's no sandbox (one-binary "Floor") | ✓ `Probe()`, naming the blocking setting (6.3) | ✓ the refusal, the log, `--no-sandbox` |
-| Escape tests (one-binary "Checks"), run in CI and in `doctor` | ✓ `Check()`, the generic checks (6.2) | ✓ its `Expect` values, the rerun per relaxation, the rendering |
-| `os.Root` for files in sandbox-writable dirs; `guard` refusing host addresses | | ✓ (not sandbox code) |
-| Supplementary groups, host secrets readable by mode, snapshot dirs | ✓ generic checks in `Check()` | ✓ `legwork doctor` shows them |
+| Guarantee | Library | legwork config/code | macOS, to test before the macOS phase |
+|---|---|---|---|
+| bwrap from the distro, setuid refused | ✓ | | `/usr/bin/sandbox-exec` by absolute path, never from `PATH` |
+| Options on a descriptor, not in pid 1's argv | ✓ | | profile on `/dev/fd/N`, never in argv. Test that it doesn't appear in `ps`. |
+| Bind sources by fd with `RESOLVE_NO_SYMLINKS`; a cover that became a link aborts | ✓ | | no fds: Seatbelt matches paths when they're opened. Test a write dir whose component is swapped for a link after the profile is written, and a link inside it pointing out. |
+| User/pid/ipc/uts namespaces, uid mapped to itself, `--die-with-parent`, `--as-pid-1` | ✓ | | none. Same-uid processes are visible. Deny `process-info*` and `signal` outside the sandbox, and test `KERN_PROCARGS2` and `kill` on the parent. |
+| Read-only root; covers (tmpfs, or `/dev/null` for non-dirs); default covers; people's homes; the account's own home | ✓ | | `file-read*` allow, then cover denies. Test each default cover, including through the `/System/Volumes/Data` firmlink paths (inferred risk: `/Users` is reachable both ways). |
+| Legwork's config, state, and other sandboxes' directories covered | | ✓ (`Spec.Cover` from config) | same denies. Test each. |
+| Mount-table covers (`.zfs`, other mounts of a covered fs) | ✓ | | no `.zfs`. Other volumes are under `/Volumes`, which is covered. Test an APFS snapshot mount, such as Time Machine's local ones. |
+| `/etc` links into covered dirs rebound | ✓ | | `/etc` is itself a link to `/private/etc`. Test reads of `/etc/localtime` and `/etc/hosts`. |
+| Path and link rules: no link in home or `write`; a link followed only outside writable dirs; a missing cover inside a writable dir aborts; no mount inside a writable dir; cwd must be shown | ✓ | passes real paths | the same checks in the library before the profile is written. Test that `subpath` on the real path holds. |
+| A home per thread; `work` beside the CLI home; `read`/`write` refused if they overlap state | | ✓ | same, in legwork |
+| Scratch tmpfs 1 GiB | ✓ default, `ScratchSize` | | none. `TMPDIR` is in `Home`, with no size cap beyond `RLIMIT_FSIZE` per file. Report. |
+| One-entry passwd/group | ✓ | | none. Directory Services lists every account through `opendirectoryd`. Report, and test what `getpwnam` needs. |
+| First stage: private mounts, caps dropped on the exec'ing thread, no_new_privs, pid 1 re-exec, undumpable | ✓ | | no capabilities to drop. Test that a setuid binary can't escape the profile, such as `sudo` with a cached ticket from the admin's terminal. |
+| Filter: allowlist, arg checks, ENOSYS default, foreign ABIs refused, low-32-bit checks, TSYNC result check | ✓ | | none at the syscall level. Seatbelt filters operations. Whether `syscall-unix` rules work under `sandbox-exec` is untested. |
+| Kernel level per child | | ✓ (`kernel:`) | one profile for every level, never weaker than asked |
+| Caller's session kept, `TIOCSTI`/`TIOCLINUX` refused | ✓ | relies on it | `TIOCSTI` is open, and the admin's ptys share the uid. Deny opening `/dev/ttys*` and `/dev/ptmx` beyond inherited descriptors, and deny `file-ioctl` on ttys where the profile language allows it. Test injecting into another terminal of the same user. |
+| Stage runs the caller binary's `init` with `CAP_SYS_ADMIN` (nested userns) | documented | ✓ "no `init`" rule from one-binary's Code layout | n/a: the stage runs outside the profile, as the caller |
+| Network namespace, proxy listener handed out | ✓ mechanism (new) | ✓ proxy, allowlist, logging | parent-bound port allowed by number. `BroadLoopback` only by opt-in (4.3). Test that other ports refuse. |
+| Bridge check by pid namespace (`--info-fd`), by session on macOS | ✓ exposes the pid, taken only from `--info-fd` (4.4) | ✓ the check | session check through `LOCAL_PEERPID` and `getsid`, legwork's. Test a sandboxed process calling `setsid` and connecting. |
+| Root launcher, uid per child, nftables for `direct`, cgroups | ✓ refuses euid 0 and a uid change. The caller must already run as the sandbox's uid, because `Command` resolves paths, opens bind sources, reads homes and writes the passwd entry in the caller. | ✓ the launcher switches uid in its own child before calling the library, as one-binary's Root describes | LaunchDaemon as root, uid switched before the library. Test the euid-0 refusal. |
+| Seatbelt profile: deny default, covers as denies after the broad allow, `mcp.sock` by path, proxy port, mach services, no LaunchServices | ✓ (new backend) | ✓ which paths | it is the profile. `mcp.sock` in `Write` needs a `(remote unix-socket (path-literal ...))` connect rule as well as the `subpath` allow, since a file allow doesn't grant a connect. Test that it connects, and that another socket under `Write` doesn't. |
+| Startup probe and refusal when there's no sandbox (one-binary "Floor") | ✓ `Probe()`, naming the blocking setting (6.3) | ✓ the refusal, the log, `--no-sandbox` | `sandbox-exec` with a trivial profile |
+| Escape tests (one-binary "Checks"), run in CI and in `doctor` | ✓ `Check()`, the generic checks (6.2) | ✓ its `Expect` values, the rerun per relaxation, the rendering | same suite, with macOS rows (6.2) |
+| `os.Root` for files in sandbox-writable dirs; `guard` refusing host addresses | | ✓ (not sandbox code) | same |
+| Supplementary groups, host secrets readable by mode, snapshot dirs | ✓ generic checks in `Check()` | ✓ `legwork doctor` shows them | the user's groups usually include `staff` and maybe `admin`. Report, and test what `admin` can write, such as `/Library` and `/usr/local`. |
 
-No guarantee is lost. Everything enforced in `internal/sandbox` moves unchanged.
+No guarantee is lost. Everything enforced in `internal/sandbox` moves unchanged. The macOS column is the Seatbelt phase's test list. Each item either holds when it runs, or is reported as a known gap.
 
 ## 3. trmnl-byos-go as one binary
 
@@ -174,7 +175,7 @@ Use what the host gives, and log once what's missing.
 - **Linux.**
   - With a delegated cgroup (the shipped systemd unit sets `Delegate=yes`; `user@` delegates `memory` and `pids` by default on current distros, inferred):
     - `serve` makes `build-<id>/` with `memory.max` (about 1.5 GB), `memory.swap.max`, `pids.max` (around 1024, since Firefox's threads count) and `memory.oom.group=1`.
-    - It starts bubblewrap there with `SysProcAttr.UseCgroupFD`. tmpfs pages are charged to it.
+    - It starts bubblewrap there with `Cmd.CgroupFD`, which the library turns into `SysProcAttr.UseCgroupFD`. tmpfs pages are charged to it.
     - Afterwards: `cgroup.kill`, then `rmdir`.
   - Without one, rlimits (`CPU`, `NOFILE`, `FSIZE`) and the footprint watchdog below. Don't use `RLIMIT_NPROC`, which counts every task of the uid, or `RLIMIT_AS`, which breaks SpiderMonkey's reservations (inferred).
   - Teardown is complete either way: the sandbox's pid 1 dying kills the whole tree.
@@ -198,22 +199,22 @@ Use what the host gives, and log once what's missing.
 
 ## 4. Proposed API
 
-One package, `github.com/die-net/sandbox`. Backends: Linux (bubblewrap) and darwin (Seatbelt via `/usr/bin/sandbox-exec`, since legwork builds with `CGO_ENABLED=0`). Other platforms return `ErrUnsupported`. Dependencies stay `x/sys` and `x/net/bpf`.
+One package, `github.com/die-net/sandbox`. Backends: Linux (bubblewrap) and darwin (Seatbelt via `/usr/bin/sandbox-exec`, since legwork builds with `CGO_ENABLED=0`). Other platforms return `ErrUnsupported`. Dependencies stay `x/sys` and `x/net/bpf`, and the module builds and passes its tests with and without CGO.
 
 ### 4.1 Types
 
 ```go
 type Spec struct {
     Command []string
-    Env     []string     // nil: os.Environ(). HOME, TMPDIR, XDG_* default to the sandbox's own where unset
     Home    string       // writable; real path, no links
     Dir     string       // "" means Home
     Write, Read, Cover []string
-    Kernel   Kernel      // KernelStrict (default), KernelNested, KernelOpen
+    Kernel   Kernel      // KernelStrict (default), KernelNested, KernelOpen; raised, never lowered
     Services []Service   // reviewed macOS Mach-service groups, e.g. ServiceFonts; no-op on Linux
-    Network  Network     // NetworkNone (default for trmnl), NetworkHost
-    Listen   int         // proxy listeners the parent serves (4.3)
-    Loopback int         // loopback ports the sandbox may bind and dial itself (4.3)
+    Network  Network     // zero value NetworkNone; NetworkHost must be asked for. In the first release.
+    BroadLoopback bool   // macOS only, opt-in: allow all of localhost (4.3); Linux ignores it
+    Listen   int         // proxy listeners the parent serves (4.3); added with legwork's phase 4
+    Loopback int         // loopback ports the sandbox may bind and dial itself (4.3); same
     Files    []*os.File  // fds 3, 4, ... in the command
     Rlimits  []Rlimit
     Hostname    string   // Linux only
@@ -223,23 +224,33 @@ type Spec struct {
 func Probe() (Report, error) // tries the backend; an error means no sandbox at all
 type Report struct {
     Backend         string             // "bubblewrap" or "seatbelt"
-    Kernel          map[Kernel]Kernel  // effective level per requested one (macOS: all strict)
+    Kernel          map[Kernel]Kernel  // level given per requested one, never lower; a level this host can't meet is absent
     TreeKill        bool               // killing the sandbox kills every descendant
-    PrivateLoopback bool               // loopback and abstract sockets private to the sandbox
+    PrivateLoopback bool               // loopback and abstract sockets private to the sandbox (macOS: true unless BroadLoopback)
     Ignored         []string           // Spec fields this backend ignores, e.g. "Hostname"
     Container       string             // best effort: "docker", "podman", "lxc", "kubernetes", "systemd-unit", ""
     Checks          []Result           // each prerequisite, and what blocks it (6.3)
 }
 
 func Stage() (code int, ok bool) // first in main of any binary that starts sandboxes
-func Command(ctx context.Context, spec Spec) (*Cmd, error)
-type Cmd struct{ *exec.Cmd } // caller may set Stdin/Stdout/Stderr, SysProcAttr, Cancel, append to Env
+func Command(ctx context.Context, spec Spec) (*Cmd, error) // ctx cancels: kills the sandbox
+type Cmd struct {
+    // The only settable parts, checked at Start:
+    Stdin     io.Reader
+    Stdout    io.Writer
+    Stderr    io.Writer
+    Env       []string      // nil means empty, never os.Environ(); Start sets HOME, TMPDIR, XDG_* over it
+    WaitDelay time.Duration // as exec.Cmd's
+    Setpgid   bool          // new process group (macOS teardown)
+    CgroupFD  int           // Linux: start in this cgroup; -1 none
+    // unexported: the exec.Cmd, ExtraFiles, SysProcAttr, Path
+}
 func (c *Cmd) ListenAddrs() []string     // known after Command, so Env can carry HTTP_PROXY
 func (c *Cmd) LoopbackPorts() []int      // likewise, for geckodriver and Marionette
-func (c *Cmd) Start() error
+func (c *Cmd) Start() error              // resolves paths, opens bind sources, builds --args, then execs
 func (c *Cmd) Wait() error
 func (c *Cmd) Listeners() []net.Listener // after Start, in order; the caller serves them
-func (c *Cmd) Pid() int                  // Linux: host pid of pid 1. macOS: the top process
+func (c *Cmd) Pid() int                  // Linux: host pid of pid 1, from --info-fd only. macOS: the top process
 func (c *Cmd) Footprint() (bytes int64, err error) // for a watchdog when there's no cgroup
 
 func Run(ctx context.Context, spec Spec) (int, error) // dedicated-process form, as legwork sandbox uses
@@ -247,8 +258,14 @@ func (s *Spec) RegisterFlags(fs *flag.FlagSet)
 const SelfPath = ... // this binary as the command names it: /dev/sandbox-stage on Linux, its real path on macOS
 ```
 
-- Every field is honored or harmlessly ignored on both backends. Ignored fields are listed in `Report`, and a stricter mapping (`nested` to `strict` on macOS) shows in `Report.Kernel`. The caller logs the report once at startup, and the library never logs.
-- `Command` returns an `exec.Cmd`, so process groups, sessions, cgroups and cancellation stay with the caller.
+- **Fields across backends.** Every field is honored or harmlessly ignored on both backends, and ignored fields are listed in `Report`. The caller logs the report once at startup, and the library never logs.
+- **Kernel levels.** A level is only ever raised. On macOS every level gets the one profile, which is at least as strict as the request, and `Report.Kernel` shows it. A level the host can't meet is an error from `Command`, and it's missing from `Report.Kernel`, never a silent fall to a weaker level. For example, linux/arm (GOARM=7) has no syscall list. legwork refuses `strict` and `nested` there today (read: `syscalls_linux_other.go`), and the library keeps that.
+- **`Env` lives only on `Cmd`**, as on `exec.Cmd`.
+  - It starts empty. The caller sets it after reading `ListenAddrs()`, which on macOS isn't known until `Command` has bound the port. `Start` then always sets the sandbox's `HOME`, `TMPDIR` and `XDG_*` over it.
+  - A server that forgets to set it passes on nothing, so none of its tokens leak. `Run`, the standalone form, passes `os.Environ()` explicitly.
+  - Rejected: making every listener address known before `Command`. Linux listeners are bound inside the namespace, so the backends would diverge. Also rejected: a `SANDBOX_LISTEN_n` variable for the command to translate, since legwork execs its CLI directly and nothing would translate it.
+- **The uid.** `Command` and `Start` run as the sandbox's uid. They resolve paths, open bind sources by fd, read homes and write the passwd entry in the calling process, and switching uid at exec would leave all of that done as root. So `Command` refuses euid 0. There's no `Credential` option at all. legwork's root launcher switches uid in its own child, then calls the library, which matches one-binary's Root.
+- **`Cmd` wraps `exec.Cmd` instead of embedding it.** The `--args` body bakes in descriptor numbers, so a caller changing `ExtraFiles`, `SysProcAttr` or `Path` would break the sandbox or drop its parent-death handling. The fields above are trmnl's and legwork's whole need: stdio, `Env`, cancellation through `ctx` plus `WaitDelay`, a process group, and a cgroup. `Start` checks them, then does the path work. Sessions stay unset (2, "No `--new-session`").
 - `Services` is the one knob that only means something on one backend. A browser needs Mach services legwork's CLIs don't, so it's a list of library-defined, reviewed groups, not free-form names. Adding a group is a reviewed library change, as sandbox.md requires for a system call.
 
 ### 4.2 How `Spec` maps onto each backend
@@ -260,14 +277,15 @@ const SelfPath = ... // this binary as the command names it: /dev/sandbox-stage 
 | `/etc` link targets under covers | rebound read-only | allowed read-only |
 | `Kernel` | strict, nested and open are different filters | all strict |
 | `Services` | ignored | extra `mach-lookup` groups |
-| `Network: NetworkNone` | network namespace, loopback only | deny network except the ports below |
-| `Network: NetworkHost` | host network | allow outbound, deny `localhost` |
+| `Network: NetworkNone` (zero value) | bubblewrap's `--unshare-net`: a namespace with only loopback, no new code. Abstract sockets become private too. | deny network, except the `Listen`/`Loopback` ports and the unix sockets the `Spec` names |
+| `Network: NetworkHost` (asked for explicitly) | host network | allow outbound, deny `localhost` |
+| `BroadLoopback` (opt-in) | ignored, since loopback is private | allow all of `localhost`, then deny the caller's own ports (4.3) |
 | `Listen` | bound inside the namespace by the stage, handed to the parent | bound by the parent on `127.0.0.1:0`; the profile allows that port |
 | `Loopback` | private loopback; fixed ports returned | allocated by the parent; the profile allows bind and connect on exactly those |
 | `Files`, `Rlimits` | through bubblewrap; set by pid 1 | through `sandbox-exec`; set by the stage before it execs |
 | Memory, tasks | caller's cgroup, or `Footprint` | `Footprint` |
 | Teardown | pid 1 dies, all die | process group; `setsid` escapes |
-| `TIOCSTI` | filter refuses | open (trmnl runs with no terminal; it matters to legwork) |
+| `TIOCSTI` | filter refuses | not refusable. The profile denies opening other ttys, and the macOS column of section 2 tests injection. |
 | `Hostname`, `ScratchSize` | supported | ignored; `TMPDIR` is in `Home` |
 
 ### 4.3 Egress brokered by the parent
@@ -279,32 +297,45 @@ Programs read `HTTP_PROXY` as a TCP `host:port`, so the proxy needs a TCP addres
 
 `Loopback` is for WebDriver. On Linux any port works, since loopback is private. On macOS a profile that allowed all of `localhost` would expose `serve`'s listeners and other local services. So the parent allocates two ports, and trmnlp starts geckodriver on `LoopbackPorts()[0]` with `--marionette-port LoopbackPorts()[1]`. That's a small trmnlp change, needed on macOS only.
 
-Until trmnlp has that change, the profile falls back to allowing `localhost` broadly. That alone would let a recipe reach `serve`'s API on loopback, which 5.1 counts as no boundary. So the fallback uses both options:
+Until trmnlp has that change, the caller can set `Spec.BroadLoopback`, and the profile then allows all of `localhost`.
+- It's an explicit opt-in, never automatic. For legwork it would reach `serve`'s listeners and loopback upstreams, past tool policy and the audit log, so legwork never sets it.
+- trmnl sets it on macOS until trmnlp takes fixed WebDriver ports, then drops it.
+- Alone it would let a recipe reach `serve`'s API on loopback, which 5.1 counts as no boundary. So when it's on, both mitigations apply:
 
 - **(a) Deny `serve`'s ports after the broad allow.**
   - The profile writes `(allow network-outbound (remote ip "localhost:*"))`, then one `(deny network-outbound (remote ip "localhost:<port>"))` for each port `serve` listens on. Seatbelt applies the last match, and `serve` knows its ports before any build starts.
   - one-binary.md:81 confirms only that a bare `localhost` deny overrides a plain `(allow network-outbound)`, and that a deny after `(remote ip "*:*")` is ignored. A port deny after a `localhost:*` allow is untried.
   - So it's the default only if the Seatbelt phase shows macOS honors it, for both `127.0.0.1` and `::1`.
 - **(b) Nothing of `serve`'s on loopback.**
-  - Under the fallback, `serve` binds its HTTP listener to its non-loopback addresses instead of the wildcard, or to a unix socket for local admin, as legwork's `web.sock`. The profile allows only `localhost`, so those addresses are denied by default.
+  - With `BroadLoopback` on, `serve` binds its HTTP listener to its non-loopback addresses instead of the wildcard, or to a unix socket for local admin, as legwork's `web.sock`. The profile allows only `localhost`, so those addresses are denied by default.
   - It needs no untested Seatbelt form, but it changes where the admin UI is reached, so it's the backstop for when (a) doesn't hold.
-- **The check either way.** Each start runs `Check` inside a build sandbox with `serve`'s API addresses in `Unreachable` (6.2). If one is reachable, that's the no-boundary floor: renders refuse, and the message names the fix.
+- **The check.** While `BroadLoopback` is on, each start runs `Check` inside a build sandbox with `serve`'s API addresses in `Unreachable` (6.2). If one is reachable, that's the no-boundary floor: renders refuse, and the message names the fix.
 
-What the fallback still leaves open, reported as `PrivateLoopback: false` with a startup warning:
+What `BroadLoopback` still leaves open, which trmnl reports in a startup warning because it opted in:
 - the user's other local services on loopback (databases, dev servers, other apps' local APIs)
 - with concurrency above 1 (trmnl's default is 1, read: `cmd/trmnl-render`), other builds' proxy and WebDriver ports, since a running profile can't name ports allocated after it.
 
 That's weaker than Linux, but working, in line with principle 1.
 
-The proxy is the caller's: `renderproxy` with the `guard` dialer. legwork's planned proxy has the same shape. A shared egress package is the likely next extraction, separate from this module. `Network`, `Listen` and `Loopback` stay a sketch until the Linux namespace is built. Go fields are additive, so nothing breaks when they're added.
+The proxy is the caller's: `renderproxy` with the `guard` dialer. legwork's planned proxy has the same shape. A shared egress package is the likely next extraction, separate from this module. `Network` ships in the first release with both values. Its zero value is `NetworkNone`, so adding it later would silently take host network away from every `Spec` written before it, and legwork sets `NetworkHost` at extraction. Only `Listen` and `Loopback`, the listener handoff, wait for legwork's phase 4. Those really are additive: a zero count means no listeners, which is what a `Spec` without them meant anyway.
 
 ### 4.4 Re-running its own binary, and passing descriptors
 
 - **Linux.**
   - bubblewrap execs the caller's binary, bound at `/dev/sandbox-stage`, as pid 1. Every binary that starts sandboxes calls `sandbox.Stage()` first in `main`. The stage runs the binary's package `init` code with `CAP_SYS_ADMIN` in a nested userns. one-binary's "no `init` function" rule keeps that acceptable, and trmnl-byos adopts it.
-  - A control socketpair, passed through bubblewrap, carries settings in, and listeners, the pid and setup errors out. That replaces argv and ends the exit-125 ambiguity. It depends on bubblewrap passing unnamed inherited descriptors through, which I inferred from Flatpak (risk 1).
+  - A control socketpair, passed through bubblewrap, carries settings in, and listeners and setup errors out. That replaces argv and ends the exit-125 ambiguity. It depends on bubblewrap passing unnamed inherited descriptors through, which I inferred from Flatpak (risk 1).
+  - The socket is only trusted during setup. Pid 1 sends the listeners, stops reading, and closes its end before the command starts, so no untrusted code ever holds it. The parent then ignores anything more that arrives on it.
+  - `Pid()` comes only from bubblewrap's `--info-fd` (`child-pid`), never from the control socket. A sandboxed process that could write the socket could otherwise lie about the pid that legwork's bridge check keys on. TestIsolation's descriptor check grows to assert that the command holds neither the control socket nor the info fd.
   - `Files` are numbered from 3, and the stage `close_range`s above them.
-- **macOS.** The same `Stage()` call runs outside the profile. It sets rlimits and the process group, closes stray descriptors, and execs `/usr/bin/sandbox-exec -f /dev/fd/N -- command`, so the profile isn't in argv. The parent binds the listeners, so there's no control socket.
+  - **Parent death.** There's no `Pdeathsig` on the server's side, since it fires when the forking OS thread exits, and a Go server's threads come and go.
+    - The parent passes the read end of a lifeline pipe and keeps the only write end (close-on-exec).
+    - Pid 1 waits on it alongside its children. On EOF, which comes when the server dies however it dies, pid 1 exits, and the namespace's other processes die with it.
+    - bubblewrap's `--die-with-parent` kills pid 1 if bubblewrap dies, and bubblewrap exits once pid 1 does. bubblewrap is single-threaded, so its own `PR_SET_PDEATHSIG` doesn't have the thread problem.
+    - This is inferred and unbuilt. The alternative is one locked OS thread that does every start for the server's lifetime, which keeps `Pdeathsig` usable.
+- **macOS.**
+  - The same `Stage()` call runs outside the profile. It sets rlimits and the process group, closes stray descriptors, and starts `/usr/bin/sandbox-exec -f /dev/fd/N -- command`, so the profile isn't in argv.
+  - The stage stays alive outside the profile as a small supervisor instead of exec'ing. It holds the lifeline, kills the process group on EOF, and relays the exit status (inferred).
+  - The parent binds the listeners, so there's no control socket. `Pid()` is the parent's own child, so it's taken from no message at all.
 - **On both,** the command can be the same binary (`[SelfPath, "render-child", ...]`), as one-binary's `turn` and `stdio` children are.
 
 ## 5. Isolation modes
@@ -450,7 +481,7 @@ legwork reruns the suite under each relaxation and decides which checks a relaxa
 
 trmnl's `Expect`:
 - `Unreadable`: the data dir, the config, other builds' dirs
-- `Unreachable`: every address `serve` listens on, plus `tcp:127.0.0.1:<port>` and `tcp:[::1]:<port>` for each of its ports. In-place mode runs this inside a build sandbox at each start, which is what catches a macOS loopback fallback that doesn't hold (4.3).
+- `Unreachable`: every address `serve` listens on, plus `tcp:127.0.0.1:<port>` and `tcp:[::1]:<port>` for each of its ports. In-place mode runs this inside a build sandbox at each start, which is what catches a `BroadLoopback` mitigation that doesn't hold on macOS (4.3).
 - `Proxy`: the build's proxy, with one public host allowed and `10.0.0.1:80` refused.
 
 In operator mode the render side runs `Check(ctx, nil, want)` at startup and on `doctor`, and returns the results to the server through its existing API, so the server can show them.
@@ -491,11 +522,16 @@ The container fixes relax the outer layer just enough for the inner one, which t
 
 **legwork** (no behavior change):
 
-1. Seed this repo from legwork's history (`git filter-repo --path internal/sandbox --path cmd/legwork-sandbox --path docs/sandbox.md`, 10 commits).
-2. Library: rename the markers and constants. Add `Command`, `Probe`, the control socket, `Files`, `Rlimits` and `Pid`, and make `Run` a wrapper. Move the tests and the CI job (Ubuntu 24.04, apt bubblewrap, `apparmor_restrict_unprivileged_userns=0`).
-3. Split the docs. The library gets the threat model, mechanism, kernel findings, "Tried and dropped", "Limits", and "How it is tested". legwork's `sandbox.md` keeps its policy and its own findings.
-4. legwork imports the module. `cli.SandboxSpec` sets `Hostname: "legwork"` and `Dir` from `os.Getwd()`. `TestBridgePeer` stays. Delete `internal/sandbox`.
-5. legwork's phase 4 builds `Network`/`Listen`. Phase 5 uses `Files`, `Pid` and `Command`. Phase 6 (Seatbelt) is built in the library.
+1. Seed this repo from legwork's history (`git filter-repo --path internal/sandbox --path docs/sandbox.md`). `cmd/legwork-sandbox` stays in legwork, since it imports `internal/cli` and pflag.
+2. Library: rename the markers and constants. Add `Command`, `Probe`, `Check`, the control socket, the lifeline, `Files`, `Rlimits` and `Pid`, and make `Run` a wrapper. Move the tests and the CI job (Ubuntu 24.04, apt bubblewrap, `apparmor_restrict_unprivileged_userns=0`). CI runs with `CGO_ENABLED=0` and `=1`. Tag releases from the first one.
+3. Split the docs. The library gets the threat model, mechanism, "Tried and dropped", "Limits", "How it is tested", and the one findings list, kernel and Seatbelt alike. legwork's `sandbox.md` keeps only its policy, and its CLAUDE.md points at the library's findings, so there's never a second copy to drift.
+4. legwork imports the module at a pinned, tagged version. That's a deliberate exception to its stdlib-then-`x` dependency rule, so say so where the rule is written.
+   - `cli.SandboxSpec` sets `Hostname: "legwork"`, `Dir` from `os.Getwd()` and `Network: NetworkHost`, and legwork sets `Cmd.Env` to the environment `serve` builds for each child (one-binary, Processes). `NetworkHost` keeps today's behavior until phase 4, since the zero value is now `NetworkNone`.
+   - `TestBridgePeer` moves onto the public `Command`, with its own `TestMain` that calls `Stage()`.
+   - Delete `internal/sandbox`.
+5. legwork's phase 4 switches to `NetworkNone` and builds `Listen`. Phase 5 uses `Files`, `Pid` and `Command`. Phase 6 (Seatbelt) is built in the library.
+
+**Both projects** test the `Spec` they actually build, end to end, with `Check(ctx, &spec, want)` in their own tests (a `TestMain` that calls `Stage()`), not only the library's generic suite. `Check` is public for that.
 
 **trmnl-byos-go** (one binary plus host packages):
 
@@ -508,11 +544,11 @@ The container fixes relax the outer layer just enough for the inner one, which t
      - `Home`: the build dir
      - `Read`: derived
      - `Kernel: strict`
-     - `Network: NetworkNone`, `Listen: 1`, `Loopback: 2`
+     - `Network: NetworkNone` (the zero value), `Listen: 1`, `Loopback: 2`, and `BroadLoopback` on macOS until trmnlp takes fixed WebDriver ports (4.3)
      - `Services: [fonts, ...]`
-     - `Env`: `buildEnv` plus `HTTP(S)_PROXY`, the resolved `PATH`/`GEM_HOME`/`GEM_PATH`, `MOZ_HEADLESS=1`, `MOZ_CRASHREPORTER_DISABLE=1`, `MOZ_ASSUME_USER_NS=0` on Linux, `MOZ_DISABLE_CONTENT_SANDBOX=1` on macOS, and the `FIELD_*` values
      - `Rlimits`: `CPU`, `NOFILE`, `FSIZE`
-   - It sets `CgroupFD` when a cgroup is delegated, or `Setpgid` and the watchdog otherwise. Then it serves `renderproxy` on the listener, waits, and reads the outputs through `os.Root`.
+   - On the returned `Cmd` it sets `Env`: `buildEnv` plus `HTTP(S)_PROXY` from `ListenAddrs()`, the resolved `PATH`/`GEM_HOME`/`GEM_PATH`, `MOZ_HEADLESS=1`, `MOZ_CRASHREPORTER_DISABLE=1`, `MOZ_ASSUME_USER_NS=0` on Linux, `MOZ_DISABLE_CONTENT_SANDBOX=1` on macOS, and the `FIELD_*` values.
+   - It also sets `Stdout`/`Stderr`, `WaitDelay`, and `CgroupFD` when a cgroup is delegated, or `Setpgid` and the watchdog otherwise. Then it serves `renderproxy` on the listener, waits, and reads the outputs through `os.Root`.
 5. Ship a systemd unit with `Delegate=yes`, a launchd plist, and install docs per platform (3.3).
 6. Keep `compose.yaml` as the operator-mode reference (5.1). Add a `--isolation=operator` flag (name to pick) to the render side. Then it runs `Check(ctx, nil, want)` at startup, reports the results to the server, and refuses only on the no-boundary findings in 5.1.
 
@@ -521,9 +557,10 @@ The container fixes relax the outer layer just enough for the inner one, which t
 Settle the API against both backends now. Build Linux first.
 
 1. **Now:** agree on `Spec`, `Report` and the mapping in 4.2, so macOS lands without breaking changes.
-2. **Linux extraction** (mostly moving tested code), plus `Command`, `Probe`, `Files`, `Rlimits`, `Pid`, `Footprint`, and `Check` with its generic checks (most exist as tests in `internal/sandbox`). legwork switches over.
+2. **Linux extraction** (mostly moving tested code), plus `Command`, `Probe`, `Network` (`--unshare-net` for none), `Files`, `Rlimits`, `Pid`, `Footprint`, and `Check` with its generic checks (most exist as tests in `internal/sandbox`). legwork switches over.
+   - Nothing in this step needs egress under `NetworkNone`. legwork uses `NetworkHost`, `Check(ctx, nil, ...)` has no `Spec`, and a `Check` of a `NetworkNone` spec just expects its egress attempts to fail. trmnl needs `Listen`, which comes in step 3.
    - trmnl can use `Check(ctx, nil, want)` in today's compose render container right away, before it has an in-place sandbox, because the as-is checks need no namespace code.
-3. **Linux network** (`Network`, `Listen`, `Loopback`), with legwork's phase 4.
+3. **Listener handoff** (`Listen`, `Loopback`), with legwork's phase 4.
 4. **trmnl on Linux:** one binary, `renderer check`, headless, cgroup or watchdog. One strace comparison run settles Firefox under `strict`.
 5. **Seatbelt backend** (legwork's phase 6, built here): profile generation, the stage, `Services` groups, the deny-log runs with both legwork CLIs and trmnl's Firefox, and a hole-finding review of the profile.
 6. **trmnl on macOS.**
@@ -532,7 +569,7 @@ Why this order: the Linux backend has a review record and tests behind it, and i
 
 ## 9. Risks and open questions, ranked
 
-1. **Descriptor passthrough via bubblewrap** (Linux control socket, listeners, `Files`). Inferred, not checked. Fallback: `--info-fd`/`--sync-fd` plus a socket bound into `/dev`.
+1. **Descriptor passthrough via bubblewrap** (Linux control socket, info fd, lifeline, listeners, `Files`). Inferred, not checked. The lifeline replacing `Pdeathsig` (4.4) is unbuilt too. Fallback: `--info-fd`/`--sync-fd` plus a socket bound into `/dev`.
 2. **The network namespace and listener handoff aren't built.** They're trmnl's one hard prerequisite on Linux.
 3. **Firefox under each backend.** Linux: netlink and other refused calls. macOS: the switches for Firefox's non-content processes, and the Mach and IOKit allowances. One strace run and one deny-log run settle them.
 4. **Install friction that pushes users to `--no-sandbox`.** Ubuntu's AppArmor step; Ruby 4 and geckodriver outside the Debian/Ubuntu archives; the snap Firefox on Ubuntu. `renderer check` should name the exact fix for each, and the docs should lead with the shortest path per platform.
@@ -540,11 +577,11 @@ Why this order: the Linux backend has a review record and tests behind it, and i
 6. **The outer-runtime fixes in 6.3 are partly inferred**: the AppArmor and masked-`/proc` rows, and which `docker`/`podman` options apply. Run bubblewrap in default Docker, rootless Podman and a hardened systemd unit before writing the messages.
 7. **A derived `Read` that's too broad** could show a credential (`~/.gem/credentials`, an npm token in `~/.npmrc`). Rule: narrowest versioned prefix only, plus explicit covers for known secret files when a broader directory can't be avoided.
 8. **Selenium Manager** downloading drivers or browsers per build if trmnl's paths and `SE_OFFLINE` aren't honored. Check in the first Linux run.
-9. **trmnlp changes:** headless, if `MOZ_HEADLESS` isn't enough, and the WebDriver ports on macOS. Headless doesn't block, since the env var covers it. Ports don't block either, but the fallback (4.3) is weaker. It rests on a port deny after a broad `localhost` allow, which is untried, with `serve` moved off loopback as the backstop. It also leaves the user's other local services reachable. The startup check guards `serve`'s API.
+9. **trmnlp changes:** headless, if `MOZ_HEADLESS` isn't enough, and the WebDriver ports on macOS. Headless doesn't block, since the env var covers it. Ports don't block either: trmnl opts in to `BroadLoopback` (4.3) meanwhile, which is weaker. It rests on a port deny after a broad `localhost` allow, which is untried, with `serve` moved off loopback as the backstop. It also leaves the user's other local services reachable. The startup check guards `serve`'s API.
 10. **Render drift** across host versions and fonts. Mitigations in 3.3.
 11. **Memory without a cgroup** is a polling watchdog: soft, but working.
 12. **macOS teardown gap:** an orphaned `setsid` process survives without files or network until `RLIMIT_CPU` ends it. A uid per sandbox (legwork's root launcher) closes it fully.
 13. **Stage runs the caller's `init` with `CAP_SYS_ADMIN`** on Linux. Audit trmnl-byos's dependencies.
-14. **Fix coordination.** Tag releases, and keep the moby profile pin and the Seatbelt service groups in one place.
+14. **Fix coordination.** Tag releases, since legwork pins a version as an exception to its stdlib-then-`x` rule. Keep the moby profile pin, the Seatbelt service groups and the findings list in the library only.
 
 Sources: [Mozilla bug 1756236](https://bugzilla.mozilla.org/show_bug.cgi?id=1756236), [Mozilla bug 1884347](https://bugzilla.mozilla.org/show_bug.cgi?id=1884347), [Mozilla bug 1417005](https://bugzilla.mozilla.org/show_bug.cgi?id=1417005), [SUMO 1451388](https://support.mozilla.com/fa/questions/1451388), [Firefox SandboxInfo.cpp](https://sources.debian.org/src/firefox/148.0-1/security/sandbox/linux/SandboxInfo.cpp), [Firefox SandboxSettings.cpp](https://raw.githubusercontent.com/mozilla-firefox/firefox/main/security/sandbox/common/SandboxSettings.cpp), [Mozilla wiki: OS X sandbox rule set](https://wiki.mozilla.org/Sandbox/OS_X_Rule_Set), [Apple forums: RLIMIT_AS](https://developer.apple.com/forums/thread/856401), [Apple forums: RLIMIT_DATA](https://developer.apple.com/forums/thread/702803), [XNU proc_rlimit.c](https://git.saurik.com/apple/xnu.git/blame/refs/heads/master:/tests/proc_rlimit.c), [darwin-kernel on maxproc](https://lists.apple.com/archives/darwin-kernel/2005/Sep/msg00065.html), [trmnl_preview 0.34.1 dependencies](https://rubygems.org/gems/trmnl_preview/versions/0.34.1/dependencies), [Debian ruby versions](https://packages.debian.org/search?keywords=ruby&searchon=names&exact=1&suite=all&section=all), [Ubuntu ruby versions](https://packages.ubuntu.com/search?keywords=ruby&searchon=names&exact=1&suite=all&section=all), [Fedora Ruby 4.0 change](https://fedoraproject.org/wiki/Changes/Ruby_4.0), [Baeldung: installing geckodriver](https://www.baeldung.com/linux/geckodriver-installation).
