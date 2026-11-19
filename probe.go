@@ -100,14 +100,14 @@ func firstBlock(f probeFacts) Result {
 	container := f.Container != "" && f.Container != "systemd-unit"
 	switch {
 	case f.Sysctl["kernel.apparmor_restrict_unprivileged_userns"] == "1":
-		profile, name, err := apparmorProfile(f.Self, f.Bwrap)
+		profile, name, err := apparmorProfile(f.Self)
 		if err != nil {
 			return fail("probe.apparmor-userns", "AppArmor restricts unprivileged user namespaces (kernel.apparmor_restrict_unprivileged_userns=1), and bubblewrap failed: %s\n"+
 				"No profile can be generated: %v", f.TryErr, err)
 		}
 		return fail("probe.apparmor-userns", "AppArmor restricts unprivileged user namespaces (kernel.apparmor_restrict_unprivileged_userns=1), and bubblewrap failed: %s\n"+
 			"Fix: save this as /etc/apparmor.d/%s, then run: sudo apparmor_parser -r /etc/apparmor.d/%s\n"+
-			"It grants user namespaces to bubblewrap only when %s runs it. It gives no other process any.\n\n%s",
+			"It grants user namespaces to %s and the processes it starts, and to no other program.\n\n%s",
 			f.TryErr, name, name, f.Self, profile)
 	case f.Sysctl["kernel.unprivileged_userns_clone"] == "0":
 		return fail("probe.userns-sysctl", "kernel.unprivileged_userns_clone is 0, which turns user namespaces off for ordinary users. Fix: sudo sysctl -w kernel.unprivileged_userns_clone=1, and put it in /etc/sysctl.d/ to keep it")
@@ -136,22 +136,23 @@ func masked(mounts []mount) bool {
 	return false
 }
 
-// apparmorProfile writes an AppArmor profile for the binary at self, with a
-// child profile for bubblewrap at bwrap that allows user namespaces, and
-// returns it with the name to save it under. Ubuntu 24.04 and later need it.
-// A profile on bwrap itself would give every process on the host user
-// namespaces through it, so bwrap gets them only when self runs it.
+// apparmorProfile writes an AppArmor profile for the binary at self that
+// allows it, and so bubblewrap when it runs it, to create user namespaces,
+// and returns it with the name to save it under. Ubuntu 24.04 and later need
+// it. No other program gets user namespaces. A profile on bubblewrap's own
+// path would give them to every process on the host that runs it.
 //
-// UNVERIFIED on a real Ubuntu: the syntax below, and that a child profile
-// of a flags=(unconfined) parent is entered through the cx rule, come from
-// the design and from reading apparmor.d(5), not from loading it. Run
-// apparmor_parser -r on it and start a sandbox on Ubuntu 24.04 before
-// trusting it.
-func apparmorProfile(self, bwrap string) (profile, name string, err error) {
-	for _, p := range []string{self, bwrap} {
-		if !filepath.IsAbs(p) || strings.ContainsAny(p, "\"\\\n{}[]?*^,;@$ ") {
-			return "", "", fmt.Errorf("the path %q is empty, relative, or has a character a profile would need escaped", p)
-		}
+// The profile is flags=(unconfined), so it confines nothing else: the kernel
+// still lets the program do everything it could without a profile, and
+// mediates only the user namespace. A child profile for bubblewrap, entered
+// by a cx rule, would grant less, but the kernel ignores exec rules in an
+// unconfined-mode profile and leaves bubblewrap in the parent's label, where
+// it is refused (tried on Ubuntu 24.04, kernel 6.8, and an enforcing parent
+// would deny every class of access it did not list). Loaded with
+// apparmor_parser -r and exercised by the full test suite on that system.
+func apparmorProfile(self string) (profile, name string, err error) {
+	if !filepath.IsAbs(self) || strings.ContainsAny(self, "\"\\\n{}[]?*^,;@$ ") {
+		return "", "", fmt.Errorf("the path %q is empty, relative, or has a character a profile would need escaped", self)
 	}
 	name = "sandbox-" + strings.Map(func(r rune) rune {
 		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' {
@@ -163,13 +164,9 @@ func apparmorProfile(self, bwrap string) (profile, name string, err error) {
 include <tunables/global>
 
 profile %[1]s %[2]s flags=(unconfined) {
-  %[3]s cx -> bwrap,
-
-  profile bwrap %[3]s flags=(unconfined) {
-    userns,
-  }
+  userns,
 }
-`, name, self, bwrap), name, nil
+`, name, self), name, nil
 }
 
 // containerFacts is what detectContainer reads.

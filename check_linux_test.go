@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"context"
+	"os"
 	"slices"
 	"strings"
 	"testing"
@@ -108,7 +109,18 @@ func TestCheckVM(t *testing.T) {
 	}
 	m := byName(t, res)
 	// These attempts work on any ordinary Linux user.
+	// proc.trace is refused where Yama restricts ptrace to descendants
+	// (ptrace_scope 1, Ubuntu's and some Proxmox hosts' default), or a
+	// filter on the test process refuses it.
+	traceable := true
+	if b, err := os.ReadFile("/proc/sys/kernel/yama/ptrace_scope"); err == nil && strings.TrimSpace(string(b)) != "0" {
+		traceable = false
+		t.Logf("kernel.yama.ptrace_scope is %s, so proc.trace passes on this host", strings.TrimSpace(string(b)))
+	}
 	for _, name := range []string{"userns.create", "proc.visible", "proc.signal", "proc.trace"} {
+		if name == "proc.trace" && !traceable {
+			continue
+		}
 		if r := m[name]; r.Status != Fail {
 			t.Errorf("%s = %+v, want Fail on a plain host", name, r)
 		}
@@ -116,7 +128,16 @@ func TestCheckVM(t *testing.T) {
 	if r := m["mount.tmpfs"]; r.Status != Fail {
 		t.Errorf("mount.tmpfs = %+v, want Fail on a plain host", r)
 	}
+	// An LXC container's seccomp profile is inherited by every process in it,
+	// which makes proc.seccomp pass without any sandbox.
+	inherited := hasSeccomp(t)
+	if inherited {
+		t.Log("the test process already runs under a seccomp filter (an LXC or systemd one), so proc.seccomp passes on this host")
+	}
 	for _, name := range []string{"proc.no_new_privs", "proc.seccomp"} {
+		if name == "proc.seccomp" && inherited {
+			continue
+		}
 		if r := m[name]; r.Status != Fail {
 			t.Errorf("%s = %+v, want Fail with no sandbox", name, r)
 		}
@@ -142,6 +163,20 @@ func TestCheckVM(t *testing.T) {
 	if len(other) > 0 {
 		t.Errorf("checks skipped elsewhere but missing here: %v", other)
 	}
+}
+
+// hasSeccomp reports whether this process already runs under a seccomp filter.
+func hasSeccomp(t *testing.T) bool {
+	b, err := os.ReadFile("/proc/self/status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		if v, ok := strings.CutPrefix(line, "Seccomp:"); ok {
+			return strings.TrimSpace(v) != "0"
+		}
+	}
+	return false
 }
 
 // osNeutralNames are the names check_other.go reports, so the two files stay

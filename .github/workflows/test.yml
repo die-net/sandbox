@@ -1,0 +1,70 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  vet:
+    name: vet linux/${{ matrix.goarch }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        goarch: [amd64, arm64, arm]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+
+  test:
+    name: test linux/amd64 cgo=${{ matrix.cgo }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        cgo: ["0", "1"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+      - name: Install bubblewrap
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          bwrap --version
+      # Ubuntu 24.04 sets kernel.apparmor_restrict_unprivileged_userns=1, so
+      # bubblewrap can make a user namespace only for a program with an
+      # AppArmor profile that allows it. scripts/apparmor.sh loads the profile
+      # the library prints for the test binary, and removes it after.
+      - name: Show the restriction
+        run: sysctl kernel.apparmor_restrict_unprivileged_userns kernel.unprivileged_userns_clone
+      # SBX_LOCAL runs the tests on this machine, as the runner's own user, in
+      # a directory of their own under /tmp, as the script explains.
+      - name: Test
+        run: scripts/linux-test.sh -test.v -test.timeout=15m
+        env:
+          SBX_LOCAL: "1"
+          SBX_APPARMOR: "1"
+          CGO: ${{ matrix.cgo }}
+
+  macos:
+    name: build and vet macos
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+      - run: go build ./...
+      - run: go vet ./...

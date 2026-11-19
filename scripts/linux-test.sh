@@ -1,26 +1,90 @@
 #!/bin/bash
-# Cross-compile this package's tests for Linux and run them in the sbx-dev
-# Lima VM (Debian 13, arm64, bubblewrap from apt). Extra arguments go to the
-# test binary, e.g. scripts/linux-test.sh -test.run TestIsolation -test.v
+# Build this package's tests for Linux and run them on a Linux machine.
+# Extra arguments go to the test binary, e.g.
+#   scripts/linux-test.sh -test.run TestIsolation -test.v
 #
-# CGO=1 builds with cgo; the default is CGO_ENABLED=0, as releases are.
+# Targets:
+#   default          the sbx-dev Lima VM (Debian 13, arm64, bubblewrap from
+#                    apt). SBX_VM names another Lima VM, such as sbx-ubuntu.
+#   SBX_SSH=u@host   a machine reached by passwordless ssh, whose architecture
+#                    comes from uname -m, e.g. SBX_SSH=user@host.
+#   SBX_LOCAL=1      this machine, which must be Linux. CI uses it.
+#
+# CGO=1 builds with cgo; the default is CGO_ENABLED=0, as releases are. Cgo
+# needs a C compiler for the target, which the host usually lacks, so CGO=1
+# copies the sources to the target and builds there. The target needs go
+# (on PATH, /usr/local/go/bin, or /usr/local/bin) and gcc.
+#
+# SBX_APPARMOR=1 loads the AppArmor profile for the test binary before the
+# tests and removes it after, with scripts/apparmor.sh. Ubuntu 24.04 needs it.
+# Without it the tests fail there, which is the library's behavior.
 set -euo pipefail
 
-vm=${SBX_VM:-sbx-dev}
 root=$(cd "$(dirname "$0")/.." && pwd)
 out=$(mktemp -d)
 trap 'rm -rf "$out"' EXIT
-
 cd "$root"
-GOOS=linux GOARCH=arm64 CGO_ENABLED=${CGO:-0} go test -c -o "$out/sandbox.test" .
-GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go vet ./... >/dev/null
+
+cgo=${CGO:-0}
+args=$(printf " %q" "$@")
+
+# rsh <cmd> runs a shell command on the target, in /tmp. put <file> <dest>
+# copies a file there.
+if [ -n "${SBX_LOCAL:-}" ]; then
+	target=local
+	rsh() { (cd /tmp && sh -c "$1"); }
+	put() { cp "$1" "$2"; }
+	arch=$(uname -m)
+elif [ -n "${SBX_SSH:-}" ]; then
+	target=$SBX_SSH
+	rsh() { ssh "$target" "cd /tmp && $1"; }
+	put() { scp -q "$1" "$target:$2"; }
+	arch=$(rsh 'uname -m')
+else
+	target=${SBX_VM:-sbx-dev}
+	rsh() { limactl shell --workdir /tmp "$target" -- sh -c "$1"; }
+	put() { limactl copy "$1" "$target:$2"; }
+	arch=$(rsh 'uname -m')
+fi
+case $arch in
+x86_64) goarch=amd64 ;;
+aarch64 | arm64) goarch=arm64 ;;
+*) echo "unsupported architecture $arch on $target" >&2; exit 1 ;;
+esac
 
 # The binary goes in its own directory: the tests make that directory
 # readable inside the sandbox, and it must not be /tmp itself, which the
 # sandbox covers.
 rdir=/tmp/sandbox-test-$$
 remote=$rdir/sandbox.test
-limactl shell --workdir /tmp "$vm" -- mkdir "$rdir"
-limactl copy "$out/sandbox.test" "$vm:$remote"
-args=$(printf " %q" "$@")
-limactl shell --workdir /tmp "$vm" -- sh -c "chmod +x $remote && $remote$args ; rc=\$?; rm -rf $rdir; exit \$rc"
+rsh "mkdir $rdir"
+cleanup() { rsh "rm -rf $rdir" || true; rm -rf "$out"; }
+trap cleanup EXIT
+
+if [ -n "${SBX_LOCAL:-}" ]; then
+	CGO_ENABLED=$cgo go test -c -o "$out/sandbox.test" .
+	put "$out/sandbox.test" "$remote"
+elif [ "$cgo" = 1 ]; then
+	tar --no-xattrs -c --exclude=.git --exclude=spikes . >"$out/src.tar"
+	put "$out/src.tar" "$rdir/src.tar"
+	rsh "mkdir $rdir/src && tar -x -C $rdir/src -f $rdir/src.tar && rm $rdir/src.tar && cd $rdir/src && PATH=\$PATH:/usr/local/go/bin:/usr/local/bin CGO_ENABLED=1 go test -c -o $remote ."
+else
+	GOOS=linux GOARCH=$goarch CGO_ENABLED=0 go test -c -o "$out/sandbox.test" .
+	put "$out/sandbox.test" "$remote"
+fi
+if [ -z "${SBX_LOCAL:-}" ]; then
+	for a in amd64 arm64 arm; do
+		GOOS=linux GOARCH=$a CGO_ENABLED=0 go vet ./... >/dev/null
+	done
+fi
+
+rc=0
+if [ -n "${SBX_APPARMOR:-}" ]; then
+	put scripts/apparmor.sh "$rdir/apparmor.sh"
+	rsh "chmod +x $remote $rdir/apparmor.sh && $rdir/apparmor.sh load $remote"
+	rsh "$remote$args" || rc=$?
+	rsh "$rdir/apparmor.sh remove $remote" || true
+else
+	rsh "chmod +x $remote && $remote$args" || rc=$?
+fi
+exit $rc

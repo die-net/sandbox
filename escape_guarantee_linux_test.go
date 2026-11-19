@@ -1009,6 +1009,13 @@ func escPasswd(e *escT, args []string) {
 		e.fail("LookupId = %+v, %v", u, err)
 	}
 	for _, other := range []string{"root", "daemon", "nobody"} {
+		// With cgo the lookup goes through NSS, and nss-systemd (on hosts
+		// whose nsswitch.conf lists it, such as Debian with systemd's
+		// libnss-systemd) makes up root and nobody even when /etc/passwd
+		// does not list them. That is not a host listing leaking in.
+		if cgoBuild && (other == "root" || other == "nobody") {
+			continue
+		}
 		if _, err := user.Lookup(other); err == nil {
 			e.fail("user %s is listed", other)
 		}

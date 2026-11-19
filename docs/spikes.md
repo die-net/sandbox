@@ -67,7 +67,7 @@ The command must follow `--` in bubblewrap's own argv. Putting it inside the `--
 - **(f) Passes.** Inside `--unshare-all`, the only interface was `lo` (up). TCP to `1.1.1.1:443` and to the VM's gateways (`10.0.2.2:22`, `192.168.5.2:22`), and UDP to `1.1.1.1:53`, all failed with `network is unreachable`.
 
 **What it changes:**
-- Risk 1 is retired for bubblewrap 0.12.0. Debian 13's version is the floor tested, and legwork's 0.8 minimum is untested.
+- Risk 1 is retired for bubblewrap 0.12.0. Debian 13's version was the floor tested then. The suite has since passed on Ubuntu 24.04's 0.9.0, so 0.9 is the lowest tested, and legwork's 0.8 minimum is still untested.
 - The 4.4 control-socket, info-fd and lifeline design holds as written.
 - Add the close-by-number caveat to 4.4.
 

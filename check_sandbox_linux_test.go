@@ -70,7 +70,7 @@ func TestCheckSandbox(t *testing.T) {
 
 // TestCheckArgvHoldsNoSettings polls /proc while Check runs, with and
 // without a Spec, and requires that no command line holds the payload, and
-// that the check child's is only the binary and the marker.
+// that the check child's is only the binary and the marker, or for a namespace attempt a fixed mode.
 func TestCheckArgvHoldsNoSettings(t *testing.T) {
 	for _, withSpec := range []bool{false, true} {
 		t.Run("spec="+strconv.FormatBool(withSpec), func(t *testing.T) {
@@ -117,7 +117,11 @@ func TestCheckArgvHoldsNoSettings(t *testing.T) {
 						}
 						if len(args) >= 2 && string(args[1]) == checkArg {
 							children++
-							if len(args) != 2 {
+							// A check child's own namespace attempts are
+							// this binary with a fixed mode, which a
+							// sampler that is quick enough sees too.
+							grandchild := len(args) == 3 && (string(args[2]) == modeNoop || string(args[2]) == modeMount)
+							if len(args) != 2 && !grandchild {
 								leaks = append(leaks, line)
 							}
 						}

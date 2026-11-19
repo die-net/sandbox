@@ -179,6 +179,11 @@ func reaperStage(command []string) (int, error) {
 	if err := unix.Prctl(unix.PR_SET_DUMPABLE, 0, 0, 0, 0); err != nil {
 		return 0, fmt.Errorf("make pid 1 undumpable: %w", err)
 	}
+	// Without the lifeline, watchLifeline's first read fails with EBADF
+	// and exits 137, racing the clean error below. Fail here instead.
+	if _, err := unix.FcntlInt(fdLifeline, unix.F_GETFD, 0); err != nil {
+		return 0, fmt.Errorf("descriptor %d is not the lifeline: %w", fdLifeline, err)
+	}
 	// Watch from the first moment, so a parent that died during setup
 	// leaves no command running, even briefly. Its write end closing is
 	// EOF whenever this first reads it.

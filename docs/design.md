@@ -525,7 +525,7 @@ In operator mode the render side runs `Check(ctx, nil, want)` at startup and on 
 | Finding | Detected by | Fix in `Detail` |
 |---|---|---|
 | bubblewrap missing, setuid, or older than 0.8 | `PATH`, mode bits, `--version` | the distro's package |
-| Ubuntu's AppArmor userns restriction | `kernel.apparmor_restrict_unprivileged_userns=1`, and the mount fails in a new userns | an AppArmor profile for this binary's path, which the library generates, plus the one root command to load it (one-binary, Ubuntu) |
+| Ubuntu's AppArmor userns restriction | `kernel.apparmor_restrict_unprivileged_userns=1`, and the mount fails in a new userns | an AppArmor profile for this binary's path with a `userns` rule, which the library generates, plus the one root command to load it. A child profile for bubblewrap does not work: see sandbox.md (verified on Ubuntu 24.04) |
 | Userns turned off by sysctl | `kernel.unprivileged_userns_clone=0` (older Debian), `user.max_user_namespaces=0` | the sysctl |
 | Docker's or Podman's default seccomp profile | `Seccomp: 2`, a container detected, and `unshare(CLONE_NEWUSER)` returns `EPERM`. The moby profile grants these calls only with `CAP_SYS_ADMIN`. That's inferred from legwork's `strict` filter, which starts from moby's list without capabilities and lacks them. | a profile that is the default plus `clone` namespace flags and the calls `nested` adds (read: `nestedSyscalls`: `unshare`, `mount`, `umount2`, `pivot_root`, the new mount API). Never `seccomp=unconfined`. |
 | Docker's AppArmor profile | `/proc/self/attr/current` reads `docker-default` | a profile that allows `mount`, or `apparmor=unconfined` for the render container only (inferred) |
@@ -555,7 +555,7 @@ The container fixes relax the outer layer just enough for the inner one, which t
 **legwork** (no behavior change):
 
 1. Seed this repo from legwork's history (`git filter-repo --path internal/sandbox --path docs/sandbox.md`). `cmd/legwork-sandbox` stays in legwork, since it imports `internal/cli` and pflag.
-2. Library: rename the markers and constants. Add `Command`, `Probe`, `Check`, the control socket, the lifeline, `Files`, `Rlimits` and `Pid`, and make `Run` a wrapper. Move the tests and the CI job (Ubuntu 24.04, apt bubblewrap, `apparmor_restrict_unprivileged_userns=0`). CI runs with `CGO_ENABLED=0` and `=1`. Tag releases from the first one.
+2. Library: rename the markers and constants. Add `Command`, `Probe`, `Check`, the control socket, the lifeline, `Files`, `Rlimits` and `Pid`, and make `Run` a wrapper. Move the tests and the CI job (Ubuntu 24.04, apt bubblewrap, `apparmor_restrict_unprivileged_userns` left at 1 and the test binary's profile loaded, so CI exercises the fix users get). CI runs with `CGO_ENABLED=0` and `=1`. Tag releases from the first one.
 3. Split the docs. The library gets the threat model, mechanism, "Tried and dropped", "Limits", "How it is tested", and the one findings list, kernel and Seatbelt alike. legwork's `sandbox.md` keeps only its policy, and its CLAUDE.md points at the library's findings, so there's never a second copy to drift.
 4. legwork imports the module at a pinned, tagged version. That's a deliberate exception to its stdlib-then-`x` dependency rule, so say so where the rule is written.
    - `cli.SandboxSpec` sets `Hostname: "legwork"`, `Dir` from `os.Getwd()` and `Network: NetworkHost`, and legwork sets `Cmd.Env` to the environment `serve` builds for each child (one-binary, Processes). `NetworkHost` keeps today's behavior until phase 4, since the zero value is now `NetworkNone`.
@@ -591,7 +591,7 @@ The API is settled against both backends (sections 4.1 and 4.2). This repo build
 1. **Linux library, complete.** legwork's code imported with its history, then:
    - the full API: `Command`/`Cmd`, `Network` (`--unshare-net` for none), `Listen` and `Loopback`, `Files`, `Rlimits`, `Pid` from `--info-fd`, the lifeline, `Probe`, and `Check` with its generic checks
    - a test for every public entry point, and a test for every Linux guarantee in section 2 that tries the escape and expects it to fail
-   - a CI job (Ubuntu 24.04, CGO on and off)
+   - a CI job (Ubuntu 24.04, CGO on and off): `.github/workflows/test.yml`, which also vets arm64 and arm and builds on macOS. It has not run, since this repo has no GitHub remote yet; actionlint passes
    - a security review of the result.
 2. **macOS library, complete:**
    - the Seatbelt backend: profile generation, the stage, `Services` groups
@@ -610,7 +610,7 @@ Why this order: the Linux backend has a review record and tests behind it, and i
 3. **Seatbelt profiles come from deny logs on one macOS version.** Firefox's minimal set (spikes.md M2) is small, but Apple renames and adds services between releases, and a missing one can fail silently (Firefox exits 0 with no PNG). Still open: trmnlp, geckodriver and the runtimes under the profile, and recipes with media that start the utility or GMP process. `renderer check` should run a known page and compare the PNG on each macOS release.
 4. **Install friction that pushes users to `--no-sandbox`.** Ubuntu's AppArmor step; Ruby 4 and geckodriver outside the Debian/Ubuntu archives; the snap Firefox on Ubuntu. `renderer check` should name the exact fix for each, and the docs should lead with the shortest path per platform.
 5. **Operator mode set up wrong**, such as the data volume or `TRMNL_SECRET_KEY` on the render side, or a shared container with the sandbox off. The as-is checks catch the common cases. A pass is still only a failed attempt, not proof.
-6. **The outer-runtime fixes in 6.3 are partly inferred**: the AppArmor and masked-`/proc` rows, and which `docker`/`podman` options apply. Run bubblewrap in default Docker, rootless Podman and a hardened systemd unit before writing the messages.
+6. **The outer-runtime fixes in 6.3 are partly inferred**: the masked-`/proc` row (the AppArmor row is verified on Ubuntu 24.04), and which `docker`/`podman` options apply. Run bubblewrap in default Docker, rootless Podman and a hardened systemd unit before writing the messages.
 7. **A derived `Read` that's too broad** could show a credential (`~/.gem/credentials`, an npm token in `~/.npmrc`). Rule: narrowest versioned prefix only, plus explicit covers for known secret files when a broader directory can't be avoided.
 8. **Selenium Manager** downloading drivers or browsers per build if trmnl's paths and `SE_OFFLINE` aren't honored. Check in the first Linux run.
 9. **trmnlp changes:** headless, if `MOZ_HEADLESS` isn't enough, and fixed WebDriver ports for macOS (risk 2). Neither blocks. The `--headless` flag worked for `firefox --screenshot` (spikes.md L2). Neither `MOZ_HEADLESS` from the environment nor trmnlp's own WebDriver path was run.

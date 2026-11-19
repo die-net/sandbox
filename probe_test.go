@@ -1,6 +1,8 @@
 package sandbox
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
@@ -77,7 +79,7 @@ func TestDiagnose(t *testing.T) {
 		{"old", mod(func(f *probeFacts) { f.Version = "bubblewrap 0.4.1" }), "probe.bubblewrap", "older than 0.8"},
 		{"no version", mod(func(f *probeFacts) { f.Version = "" }), "probe.bubblewrap", "no version"},
 		{"no filter", mod(func(f *probeFacts) { f.Kernels = nil }), "probe.seccomp", "architecture"},
-		{"apparmor", mod(func(f *probeFacts) { f.Sysctl["kernel.apparmor_restrict_unprivileged_userns"] = "1" }), "probe.apparmor-userns", `/usr/bin/bwrap cx -> bwrap,`},
+		{"apparmor", mod(func(f *probeFacts) { f.Sysctl["kernel.apparmor_restrict_unprivileged_userns"] = "1" }), "probe.apparmor-userns", "  userns,"},
 		{"apparmor names this binary", mod(func(f *probeFacts) { f.Sysctl["kernel.apparmor_restrict_unprivileged_userns"] = "1" }), "probe.apparmor-userns", "profile sandbox-opt-app-server /opt/app/server flags=(unconfined)"},
 		{"sysctl clone", mod(func(f *probeFacts) { f.Sysctl["kernel.unprivileged_userns_clone"] = "0" }), "probe.userns-sysctl", "unprivileged_userns_clone=1"},
 		{"sysctl max", mod(func(f *probeFacts) { f.Sysctl["user.max_user_namespaces"] = "0" }), "probe.userns-sysctl", "max_user_namespaces="},
@@ -140,7 +142,7 @@ func TestMasked(t *testing.T) {
 }
 
 func TestApparmorProfile(t *testing.T) {
-	p, name, err := apparmorProfile("/opt/app/server", "/usr/bin/bwrap")
+	p, name, err := apparmorProfile("/opt/app/server")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,24 +151,19 @@ func TestApparmorProfile(t *testing.T) {
 	}
 	for _, s := range []string{
 		"abi <abi/4.0>,",
-		"profile sandbox-opt-app-server /opt/app/server flags=(unconfined) {",
-		"/usr/bin/bwrap cx -> bwrap,",
-		"profile bwrap /usr/bin/bwrap flags=(unconfined) {\n    userns,",
+		"profile sandbox-opt-app-server /opt/app/server flags=(unconfined) {\n  userns,\n}",
 	} {
 		if !strings.Contains(p, s) {
 			t.Errorf("profile lacks %q:\n%s", s, p)
 		}
 	}
-	// userns is granted once, inside bwrap's child profile, which comes
-	// after this binary's profile opens: no top-level profile is for bwrap.
-	if strings.Count(p, "userns,") != 1 || strings.Index(p, "userns,") < strings.Index(p, "cx -> bwrap") {
-		t.Errorf("userns is not only in the child profile:\n%s", p)
+	// The one grant is in the one profile, which is for this binary and not
+	// for bubblewrap.
+	if strings.Count(p, "userns,") != 1 || strings.Count(p, "\nprofile ") != 1 || strings.Contains(p, "bwrap") {
+		t.Errorf("want one profile, for this binary, with one userns rule:\n%s", p)
 	}
-	if strings.Count(p, "\nprofile ") != 1 {
-		t.Errorf("want one top-level profile:\n%s", p)
-	}
-	for _, bad := range [][2]string{{"", "/usr/bin/bwrap"}, {"relative", "/usr/bin/bwrap"}, {"/opt/my app/x", "/usr/bin/bwrap"}, {"/bad\"path", "/usr/bin/bwrap"}, {"/opt/app/server", ""}} {
-		if _, _, err := apparmorProfile(bad[0], bad[1]); err == nil {
+	for _, bad := range []string{"", "relative", "/opt/my app/x", "/bad\"path", "/bad\nname"} {
+		if _, _, err := apparmorProfile(bad); err == nil {
 			t.Errorf("accepted %q", bad)
 		}
 	}
@@ -194,5 +191,30 @@ func TestDetectContainer(t *testing.T) {
 		if got := detectContainer(tc.f); got != tc.want {
 			t.Errorf("%s: detectContainer = %q, want %q", tc.name, got, tc.want)
 		}
+	}
+}
+
+// TestWriteApparmorProfile writes this test binary's AppArmor profile into
+// the directory named by SBX_APPARMOR_OUT, under the name to load it by.
+// scripts/apparmor.sh uses it, so the profile the suite runs under is the
+// one the library prints.
+func TestWriteApparmorProfile(t *testing.T) {
+	dir := os.Getenv("SBX_APPARMOR_OUT")
+	if dir == "" {
+		t.Skip("SBX_APPARMOR_OUT is not set")
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exe, err = filepath.EvalSymlinks(exe); err != nil {
+		t.Fatal(err)
+	}
+	p, name, err := apparmorProfile(exe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(p), 0o644); err != nil {
+		t.Fatal(err)
 	}
 }
