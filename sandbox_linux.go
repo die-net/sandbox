@@ -2,15 +2,15 @@ package sandbox
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
+	"net"
 	"os"
 	"os/exec"
-	"os/signal"
 	"os/user"
 	"path/filepath"
-	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -19,168 +19,117 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// stageArg is the first argument of the run of this binary that bubblewrap
-// starts inside the sandbox ahead of the command, and reaperArg that of the
-// run the first stage execs. stagePath is where the binary is bound in. /dev
-// is a tmpfs bubblewrap makes, so the bind lands in no directory a sandbox
-// writes.
-const (
-	stageArg  = "--sandbox-stage"
-	reaperArg = "--sandbox-reaper"
-	stagePath = "/dev/sandbox-stage"
-)
-
-// failed is the exit status of a sandbox whose stages could not set up, as
-// distinct from the command's own.
-const failed = 125
-
-// Stage runs one of the sandbox's stages if this process was started as it,
-// and reports false otherwise. A program that uses this package calls it
-// first in main, before it reads its arguments.
-func Stage() (int, bool) {
-	if len(os.Args) < 5 || (os.Args[1] != stageArg && os.Args[1] != reaperArg) || os.Args[3] != "--" {
-		return 0, false
-	}
-	var level Kernel
-	err := level.Set(os.Args[2])
-	code := failed
-	if err == nil && os.Args[1] == stageArg {
-		err = firstStage()
-	} else if err == nil {
-		code, err = reaperStage(level, os.Args[4:])
-	}
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "sandbox: %v\n", err)
-		return failed, true
-	}
-	return code, true
+// run is what a started Cmd holds.
+type run struct {
+	started, waited bool
+	cmd             *exec.Cmd
+	pid             int
+	// lifeline is the write end of the pipe pid 1 watches. Only this
+	// process holds it, and it is close-on-exec, so when this process
+	// goes, however it goes, pid 1 reads EOF and ends the sandbox.
+	lifeline  *os.File
+	sent      <-chan error
+	listeners []net.Listener
 }
 
-// firstStage runs inside the sandbox as pid 1, which bubblewrap starts with
-// --as-pid-1, holding CAP_SYS_ADMIN and CAP_SETPCAP in the sandbox's user
-// namespace, before anything untrusted runs. bubblewrap leaves the view a
-// slave of the host's mounts, so a mount made on the host later, such as a
-// bind of a covered path, would appear inside. Run unprivileged, bubblewrap
-// puts pid 1 in a user namespace nested in the one that owns the view's
-// mounts, so the capabilities cannot change those. This copies the view
-// into a mount namespace of its own and makes every mount in it private.
-// unshare moves only the calling thread, so it then execs this binary again
-// as the reaper, which leaves the whole of pid 1 in the new namespace and
-// none in bubblewrap's.
+// resources maps each Resource to its Linux number.
+var resources = map[Resource]int{
+	ResourceCPU:          unix.RLIMIT_CPU,
+	ResourceFileSize:     unix.RLIMIT_FSIZE,
+	ResourceCore:         unix.RLIMIT_CORE,
+	ResourceOpenFiles:    unix.RLIMIT_NOFILE,
+	ResourceProcesses:    unix.RLIMIT_NPROC,
+	ResourceAddressSpace: unix.RLIMIT_AS,
+}
+
+// Command returns a Cmd that will run spec's command in a sandbox that
+// bubblewrap builds. It checks what needs no look at the host and starts
+// nothing; Start does the rest. ctx kills the sandbox when it is done, once
+// Start has been called.
 //
-// It also gives up every capability and sets no_new_privs before that exec.
-// Both belong to a thread, not a process, and bubblewrap raised the
-// capabilities as ambient ones before it started this binary, so every
-// thread the Go runtime made holds them. Dropping them on any thread but the
-// one that execs would leave the others holding them, and the command could
-// be forked from one of those. execve carries only this locked thread's
-// empty sets into the new image, which starts with that one thread, so every
-// thread of the reaper, and the command, starts with none.
-func firstStage() error {
-	runtime.LockOSThread()
-	if err := unix.Unshare(unix.CLONE_NEWNS); err != nil {
-		return fmt.Errorf("copy the view into a mount namespace of its own: %w", err)
+// It refuses to run as root, and there is no way to ask for another
+// account, since it opens paths and writes the sandbox's passwd in this
+// process. A caller that runs as root switches to the sandbox's uid first.
+// It refuses a kernel level the host cannot give, such as strict on an
+// architecture with no system call list, and never starts a weaker one.
+func Command(ctx context.Context, spec Spec) (*Cmd, error) {
+	if os.Geteuid() == 0 {
+		return nil, errors.New("the sandbox will not run as root: switch to the sandbox's own uid first")
 	}
-	if err := unix.Mount("", "/", "", unix.MS_REC|unix.MS_PRIVATE, ""); err != nil {
-		return fmt.Errorf("make mounts private: %w", err)
+	if err := spec.checkRequest(); err != nil {
+		return nil, err
 	}
-	if err := dropCapabilities(); err != nil {
-		return err
+	if strings.ContainsRune(spec.Hostname, 0) {
+		return nil, errors.New("the hostname holds a NUL")
 	}
-	if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
-		return fmt.Errorf("set no_new_privs: %w", err)
+	if spec.Kernel == "" {
+		spec.Kernel = KernelStrict
 	}
-	args := slices.Concat([]string{os.Args[0], reaperArg}, os.Args[2:])
-	return syscall.Exec("/proc/self/exe", args, os.Environ()) //nolint:gosec // This is the sandbox's own binary, not a shell.
+	if err := spec.Kernel.Set(string(spec.Kernel)); err != nil {
+		return nil, err
+	}
+	// pid 1 builds the filter again to install it, but a filter that
+	// cannot be built is refused here, before bubblewrap builds the view.
+	if _, err := filterProgram(spec.Kernel); err != nil {
+		return nil, err
+	}
+	spec.Command = slices.Clone(spec.Command)
+	spec.Files = slices.Clone(spec.Files)
+	spec.Rlimits = slices.Clone(spec.Rlimits)
+	return &Cmd{ctx: ctx, spec: spec, CgroupFD: -1}, nil
 }
 
-// reaperStage runs as pid 1 in the sandbox's own mount namespace, with no
-// capabilities and no_new_privs set, which the first stage left it. It makes
-// itself undumpable, so the command cannot read its memory or descriptors
-// through /proc, installs the filter on all its threads, and starts the
-// command. Then it relays signals to the command,
-// reaps every orphan in the namespace, and exits with the command's status,
-// which also kills whatever is left. The filter goes on here rather than
-// through bubblewrap, since it refuses the calls the first stage makes.
-func reaperStage(level Kernel, command []string) (int, error) {
-	// Undumpable belongs to the process, and execve resets it, so it is
-	// set here rather than in the first stage.
-	if err := unix.Prctl(unix.PR_SET_DUMPABLE, 0, 0, 0, 0); err != nil {
-		return 0, fmt.Errorf("make pid 1 undumpable: %w", err)
+// ListenAddrs returns the addresses of the Listen listeners, which the
+// command reaches. They are known before Start, so Env can carry them.
+func (c *Cmd) ListenAddrs() []string {
+	var addrs []string
+	for i := range c.spec.Listen {
+		addrs = append(addrs, net.JoinHostPort("127.0.0.1", strconv.Itoa(listenPort+i)))
 	}
-	// bubblewrap gave the stages the command's environment, so its PATH is
-	// the one to look the command up on.
-	path, err := exec.LookPath(command[0])
-	if err != nil {
-		return 0, err
-	}
-	if err := installSeccomp(level); err != nil {
-		return 0, err
-	}
-	child, err := os.StartProcess(path, command, &os.ProcAttr{ //nolint:gosec // Running the configured command is the sandbox's job, and it is not a shell.
-		Env:   os.Environ(),
-		Files: []*os.File{os.Stdin, os.Stdout, os.Stderr},
-	})
-	if err != nil {
-		return 0, fmt.Errorf("start command: %w", err)
-	}
-	stop := relaySignals(child)
-	defer stop()
-	for {
-		var ws unix.WaitStatus
-		pid, err := unix.Wait4(-1, &ws, 0, nil)
-		if errors.Is(err, unix.EINTR) {
-			continue
-		}
-		if err != nil {
-			return 0, fmt.Errorf("wait: %w", err)
-		}
-		if pid != child.Pid {
-			continue
-		}
-		if ws.Signaled() {
-			return 128 + int(ws.Signal()), nil
-		}
-		return ws.ExitStatus(), nil
-	}
+	return addrs
 }
 
-// dropCapabilities empties the calling thread's bounding set and clears all
-// its other sets. The calls act on that thread alone, so the caller must be
-// locked to it and exec from it. What it then runs holds none, even as uid 0
-// inside, and the empty bounding set is inherited by everything that starts.
-func dropCapabilities() error {
-	for c := 0; ; c++ {
-		err := unix.Prctl(unix.PR_CAPBSET_DROP, uintptr(c), 0, 0, 0)
-		if errors.Is(err, unix.EINVAL) {
-			break
-		}
-		if err != nil {
-			return fmt.Errorf("drop capability %d from the bounding set: %w", c, err)
-		}
+// LoopbackPorts returns the Loopback ports the command may bind and dial.
+// On Linux they are fixed, 4444 and up, and private to the sandbox's network
+// namespace, so two sandboxes use the same ones without meeting.
+func (c *Cmd) LoopbackPorts() []int {
+	var ports []int
+	for i := range c.spec.Loopback {
+		ports = append(ports, loopbackPort+i)
 	}
-	if err := unix.Prctl(unix.PR_CAP_AMBIENT, unix.PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0); err != nil {
-		return fmt.Errorf("clear ambient capabilities: %w", err)
-	}
-	hdr := unix.CapUserHeader{Version: unix.LINUX_CAPABILITY_VERSION_3}
-	var data [2]unix.CapUserData
-	if err := unix.Capset(&hdr, &data[0]); err != nil {
-		return fmt.Errorf("clear capabilities: %w", err)
-	}
-	return nil
+	return ports
 }
 
-// Run runs spec's command in a sandbox that bubblewrap builds, and returns
-// its exit status. A status from a signal is 128 plus the signal's number,
-// as a shell reports it.
-func Run(ctx context.Context, spec Spec) (int, error) {
+// Listeners returns the Listen listeners, in order, once Start has
+// returned. The caller serves them, and closes them when it is done.
+func (c *Cmd) Listeners() []net.Listener {
+	return c.run.listeners
+}
+
+// Pid returns the host pid of the sandbox's pid 1, which bubblewrap reports
+// on its --info-fd, after Start. It never comes from the control socket,
+// which the stages trust only during setup.
+func (c *Cmd) Pid() int {
+	return c.run.pid
+}
+
+// Start resolves the spec's paths, opens what bubblewrap binds, and starts
+// bubblewrap. It returns once pid 1 has set the sandbox up and handed over
+// its listeners, and before the command's own start, so a command that
+// fails to run shows in Wait's status.
+func (c *Cmd) Start() error {
+	if c.run.started {
+		return errors.New("sandbox: already started")
+	}
+	c.run.started = true
+	spec := c.spec
 	bwrap, err := findBwrap()
 	if err != nil {
-		return 0, err
+		return err
 	}
 	homes, err := hostHomes()
 	if err != nil {
-		return 0, err
+		return err
 	}
 	// The account the program runs as may come from a directory service that
 	// /etc/passwd does not list.
@@ -188,57 +137,289 @@ func Run(ctx context.Context, spec Spec) (int, error) {
 		homes = append(homes, home)
 	}
 	if spec.Dir == "" {
-		if spec.Dir, err = os.Getwd(); err != nil {
-			return 0, fmt.Errorf("find working directory: %w", err)
-		}
+		spec.Dir = spec.Home
 	}
 	mounts, err := hostMounts()
 	if err != nil {
-		return 0, err
+		return err
 	}
 	spec, err = prepare(spec, homes, os.DirFS("/"), mounts)
 	if err != nil {
-		return 0, err
+		return err
 	}
-	// pid 1 builds the filter again to install it, but a filter that
-	// cannot be built is refused here, before bubblewrap builds the view.
-	if _, err := filterProgram(spec.Kernel); err != nil {
-		return 0, err
+	settings := stageSettings{Kernel: spec.Kernel, Listen: spec.Listen, Files: len(spec.Files)}
+	for _, r := range spec.Rlimits {
+		settings.Rlimits = append(settings.Rlimits, stageLimit{resources[r.Resource], r.Soft, r.Hard})
 	}
-	l, err := newLaunch(spec, lookupAccount())
+	body, err := json.Marshal(settings)
 	if err != nil {
-		return 0, err
+		return err
+	}
+
+	// What the parent keeps is closed on any failure below, and what
+	// bubblewrap is given is closed by the launch.
+	var parent []*os.File
+	ok := false
+	defer func() {
+		if !ok {
+			for _, f := range parent {
+				_ = f.Close()
+			}
+		}
+	}()
+	infoR, infoW, err := os.Pipe()
+	if err != nil {
+		return err
+	}
+	parent = append(parent, infoR)
+	lifeR, lifeW, err := os.Pipe()
+	if err != nil {
+		_ = infoW.Close()
+		return err
+	}
+	parent = append(parent, lifeW)
+	ctlP, ctlC, err := socketpair()
+	if err != nil {
+		_ = infoW.Close()
+		_ = lifeR.Close()
+		return err
+	}
+	parent = append(parent, ctlP)
+	// bubblewrap passes these on to pid 1 at the same numbers: the control
+	// socket, the lifeline's read end, and the command's files.
+	inherit := []*os.File{infoW, ctlC, lifeR}
+	for _, f := range spec.Files {
+		d, err := dupFile(f)
+		if err != nil {
+			for _, f := range inherit {
+				_ = f.Close()
+			}
+			return err
+		}
+		inherit = append(inherit, d)
+	}
+	l, err := newLaunch(spec, lookupAccount(), inherit)
+	if err != nil {
+		for _, f := range inherit {
+			_ = f.Close()
+		}
+		return err
 	}
 	defer l.close()
+	// The message waits in the socket's buffer until pid 1 reads it.
+	if _, err := ctlP.Write(body); err != nil {
+		return fmt.Errorf("send the settings: %w", err)
+	}
 
 	// The options go on a descriptor so that pid 1's command line, which
 	// any process inside can read, does not list them. bubblewrap takes the
 	// command only from its own arguments, and the command is the first
 	// stage, with the real one after it.
-	args := append([]string{"--args", "3", "--", stagePath, stageArg, string(spec.Kernel), "--"}, spec.Command...)
-	cmd := exec.CommandContext(ctx, bwrap, args...) //nolint:gosec // Running the configured command in the sandbox is its job, and bubblewrap is not a shell.
+	args := append([]string{"--args", strconv.Itoa(fdArgs), "--", stagePath, stageArg, "--"}, spec.Command...)
+	cmd := exec.CommandContext(c.ctx, bwrap, args...) //nolint:gosec // Running the configured command in the sandbox is its job, and bubblewrap is not a shell.
 	cmd.Args[0] = "bwrap"
-	cmd.Env = commandEnv(os.Environ(), spec)
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	cmd.Env = commandEnv(c.Env, spec)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = c.Stdin, c.Stdout, c.Stderr
+	cmd.WaitDelay = c.WaitDelay
 	cmd.ExtraFiles = l.inherit
-	cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
+	// No Pdeathsig: it fires when the OS thread that started bubblewrap
+	// exits, and a Go server's threads come and go. The lifeline does it.
+	if c.Setpgid || c.CgroupFD > 0 {
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: c.Setpgid, UseCgroupFD: c.CgroupFD > 0, CgroupFD: max(c.CgroupFD, 0)}
+	}
 	if err := cmd.Start(); err != nil {
-		return 0, fmt.Errorf("start bubblewrap: %w", err)
+		return fmt.Errorf("start bubblewrap: %w", err)
 	}
 	sent := l.send()
+	// From here the sandbox may be running, so a failure kills it.
+	fail := func(err error) error {
+		_ = cmd.Process.Kill()
+		waitErr := cmd.Wait()
+		<-sent
+		var ee *exec.ExitError
+		if errors.As(waitErr, &ee) {
+			err = fmt.Errorf("%w (bubblewrap: %v)", err, ee)
+		}
+		return err
+	}
+	// bubblewrap writes its --info-fd once it has made pid 1.
+	var info struct {
+		ChildPid int `json:"child-pid"`
+	}
+	if err := json.NewDecoder(infoR).Decode(&info); err != nil || info.ChildPid <= 0 {
+		return fail(errors.New("the sandbox did not start"))
+	}
+	listeners, err := receiveReply(ctlP, spec.Listen)
+	if err != nil {
+		return fail(err)
+	}
+	// Nothing more on the control socket is read. Pid 1 closed its end
+	// before the command started, and the command never held it.
+	_ = ctlP.Close()
+	_ = infoR.Close()
+	c.run.cmd, c.run.pid, c.run.lifeline, c.run.sent, c.run.listeners = cmd, info.ChildPid, lifeW, sent, listeners
+	ok = true
+	return nil
+}
+
+// Wait waits for the sandbox to exit and returns what exec's Wait does for
+// bubblewrap, whose exit status is the command's. It closes the lifeline.
+func (c *Cmd) Wait() error {
+	if c.run.cmd == nil {
+		return errors.New("sandbox: not started")
+	}
+	if c.run.waited {
+		return errors.New("sandbox: Wait was already called")
+	}
+	c.run.waited = true
+	err := c.run.cmd.Wait()
+	_ = c.run.lifeline.Close()
+	// A write fails only when bubblewrap exited before it read everything,
+	// which its status already says.
+	if serr := <-c.run.sent; serr != nil && err == nil {
+		err = serr
+	}
+	return err
+}
+
+// receiveReply reads the stage's one message from the control socket: its
+// setup error, or the n listeners it bound.
+func receiveReply(ctl *os.File, n int) ([]net.Listener, error) {
+	buf := make([]byte, maxMessage)
+	oob := make([]byte, unix.CmsgSpace(4*max(n, 1)))
+	var got, oobn, flags int
+	for {
+		var err error
+		got, oobn, flags, _, err = unix.Recvmsg(int(ctl.Fd()), buf, oob, unix.MSG_CMSG_CLOEXEC)
+		if errors.Is(err, unix.EINTR) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read the sandbox's setup: %w", err)
+		}
+		break
+	}
+	var fds []int
+	if msgs, err := unix.ParseSocketControlMessage(oob[:oobn]); err == nil {
+		for i := range msgs {
+			if rights, err := unix.ParseUnixRights(&msgs[i]); err == nil {
+				fds = append(fds, rights...)
+			}
+		}
+	}
+	files := make([]*os.File, len(fds))
+	for i, fd := range fds {
+		files[i] = os.NewFile(uintptr(fd), "listener")
+	}
+	closeAll := func() {
+		for _, f := range files {
+			_ = f.Close()
+		}
+	}
+	// Zero bytes is an end of file: pid 1 or bubblewrap ended first.
+	var reply stageReply
+	switch {
+	case got == 0:
+		closeAll()
+		return nil, errors.New("the sandbox ended during setup")
+	case flags&(unix.MSG_TRUNC|unix.MSG_CTRUNC) != 0 || json.Unmarshal(buf[:got], &reply) != nil:
+		closeAll()
+		return nil, errors.New("the sandbox sent a malformed reply")
+	case reply.Error != "":
+		closeAll()
+		return nil, errors.New(reply.Error)
+	case len(files) != n:
+		closeAll()
+		return nil, fmt.Errorf("the sandbox sent %d listeners, not %d", len(files), n)
+	}
+	listeners := make([]net.Listener, 0, n)
+	for i, f := range files {
+		ln, err := net.FileListener(f)
+		_ = f.Close()
+		if err == nil {
+			want := net.JoinHostPort("127.0.0.1", strconv.Itoa(listenPort+i))
+			if got := ln.Addr().String(); got != want {
+				_ = ln.Close()
+				err = fmt.Errorf("listener %d is on %s, not %s", i, got, want)
+			}
+		}
+		if err != nil {
+			for _, ln := range listeners {
+				_ = ln.Close()
+			}
+			for _, f := range files[i+1:] {
+				_ = f.Close()
+			}
+			return nil, err
+		}
+		listeners = append(listeners, ln)
+	}
+	return listeners, nil
+}
+
+// socketpair makes the control socket: a connected pair, close-on-exec,
+// that keeps message boundaries.
+func socketpair() (parent, child *os.File, err error) {
+	fd, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_SEQPACKET|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return nil, nil, fmt.Errorf("make the control socket: %w", err)
+	}
+	return os.NewFile(uintptr(fd[0]), "control-parent"), os.NewFile(uintptr(fd[1]), "control-child"), nil
+}
+
+// dupFile returns a close-on-exec copy of f that the launch may own, without
+// switching f to blocking mode as its Fd method would.
+func dupFile(f *os.File) (*os.File, error) {
+	rc, err := f.SyscallConn()
+	if err != nil {
+		return nil, fmt.Errorf("file %s: %w", f.Name(), err)
+	}
+	var nfd int
+	var dupErr error
+	if err := rc.Control(func(fd uintptr) {
+		nfd, dupErr = unix.FcntlInt(fd, unix.F_DUPFD_CLOEXEC, 3)
+	}); err != nil {
+		return nil, fmt.Errorf("file %s: %w", f.Name(), err)
+	}
+	if dupErr != nil {
+		return nil, fmt.Errorf("file %s: %w", f.Name(), dupErr)
+	}
+	return os.NewFile(uintptr(nfd), f.Name()), nil
+}
+
+// Run runs spec's command in a sandbox that bubblewrap builds, with this
+// process's own standard streams and environment, and returns its exit
+// status. A status from a signal is 128 plus the signal's number, as a shell
+// reports it. It is for a process that does nothing else: it relays
+// SIGTERM and SIGHUP, and an empty Dir means the working directory. Spec's
+// Listen is refused, since nothing here serves a listener.
+func Run(ctx context.Context, spec Spec) (int, error) {
+	if spec.Listen > 0 {
+		return 0, errors.New("Run cannot serve listeners; use Command")
+	}
+	if spec.Dir == "" {
+		dir, err := os.Getwd()
+		if err != nil {
+			return 0, fmt.Errorf("find working directory: %w", err)
+		}
+		spec.Dir = dir
+	}
+	c, err := Command(ctx, spec)
+	if err != nil {
+		return 0, err
+	}
+	c.Env = os.Environ()
+	c.Stdin, c.Stdout, c.Stderr = os.Stdin, os.Stdout, os.Stderr
+	if err := c.Start(); err != nil {
+		return 0, err
+	}
 	// bubblewrap's outer process does not pass signals on, so a SIGTERM
 	// or SIGHUP relayed to it ends it, and --die-with-parent then kills
 	// everything inside with SIGKILL. Relaying rather than dying lets Run
 	// still wait for it and return its status.
-	stop := relaySignals(cmd.Process)
+	stop := relaySignals(c.run.cmd.Process)
 	defer stop()
-	code, err := exitStatus(cmd.Wait())
-	// A write fails only when bubblewrap exited before it read everything,
-	// which its status already says.
-	if serr := <-sent; serr != nil && err == nil && code == 0 {
-		err = serr
-	}
-	return code, err
+	return exitStatus(c.Wait())
 }
 
 // findBwrap finds bubblewrap on the PATH. It refuses a setuid copy, since
@@ -340,7 +521,11 @@ const scratchSize = 1 << 30
 // here without following links and passed as a descriptor, so nothing
 // changed between prepare and bubblewrap's setup can redirect it. Mounts go
 // parent first, since bubblewrap makes them in the order given.
-func newLaunch(spec Spec, acct account) (*launch, error) {
+//
+// stageFiles are the descriptors the stages are passed, from fdInfo up, in
+// the order stage_linux.go numbers them. The launch owns them, and closes
+// them once bubblewrap has them.
+func newLaunch(spec Spec, acct account, stageFiles []*os.File) (*launch, error) {
 	l := &launch{}
 	ok := false
 	defer func() {
@@ -348,13 +533,26 @@ func newLaunch(spec Spec, acct account) (*launch, error) {
 			l.close()
 		}
 	}()
-	argsPipe, _, err := l.pipe()
+	argsPipe, argsFd, err := l.pipe()
 	if err != nil {
 		return nil, err
 	}
+	if argsFd != strconv.Itoa(fdArgs) {
+		return nil, fmt.Errorf("bubblewrap's options are on descriptor %s, not %d", argsFd, fdArgs)
+	}
+	for i, f := range stageFiles {
+		if fd := l.fd(f); fd != strconv.Itoa(fdInfo+i) {
+			return nil, fmt.Errorf("stage descriptor %d is numbered %s", fdInfo+i, fd)
+		}
+	}
+	hostname := spec.Hostname
+	if hostname == "" {
+		hostname = "sandbox"
+	}
 	args := []string{
 		"--unshare-user", "--unshare-pid", "--unshare-ipc", "--unshare-uts",
-		"--die-with-parent", "--hostname", "sandbox",
+		"--die-with-parent", "--hostname", hostname,
+		"--info-fd", strconv.Itoa(fdInfo),
 		// The first stage is pid 1 and the reaper, so bubblewrap's own
 		// does not stay in the mount namespace the stage leaves.
 		"--as-pid-1",
@@ -364,6 +562,11 @@ func newLaunch(spec Spec, acct account) (*launch, error) {
 		// of the command's starter, and the filter refuses TIOCSTI,
 		// which a new session would otherwise guard against.
 		"--ro-bind", "/", "/",
+	}
+	if spec.Network == NetworkNone {
+		// A network namespace with only a loopback, and abstract sockets
+		// of its own.
+		args = append(args, "--unshare-net")
 	}
 	var ops []mountOp
 	var readOnly []string
@@ -555,11 +758,14 @@ func lookupAccount() account {
 }
 
 // commandEnv returns env with the sandbox's home and its own temporary
-// directory in the variables programs read them from.
+// directory in the variables programs read them from. XDG_RUNTIME_DIR is
+// the private /tmp too, since the host's /run/user/<uid> is covered, and a
+// program that was given the caller's would look for it there.
 func commandEnv(env []string, spec Spec) []string {
 	set := map[string]string{
 		"HOME":            spec.Home,
 		"TMPDIR":          "/tmp",
+		"XDG_RUNTIME_DIR": "/tmp",
 		"XDG_CONFIG_HOME": filepath.Join(spec.Home, ".config"),
 		"XDG_CACHE_HOME":  filepath.Join(spec.Home, ".cache"),
 		"XDG_DATA_HOME":   filepath.Join(spec.Home, ".local", "share"),
@@ -574,29 +780,6 @@ func commandEnv(env []string, spec Spec) []string {
 		out = append(out, name+"="+value)
 	}
 	return out
-}
-
-// relaySignals passes the signals a supervisor sends on to p, and returns a
-// function that stops. An interrupt from a terminal already reaches the
-// whole process group, so it is not relayed.
-func relaySignals(p *os.Process) func() {
-	sigs := make(chan os.Signal, 4)
-	signal.Notify(sigs, unix.SIGTERM, unix.SIGHUP)
-	done := make(chan struct{})
-	go func() {
-		for {
-			select {
-			case s := <-sigs:
-				_ = p.Signal(s)
-			case <-done:
-				return
-			}
-		}
-	}()
-	return func() {
-		signal.Stop(sigs)
-		close(done)
-	}
 }
 
 // exitStatus turns the error from waiting on bubblewrap into its exit

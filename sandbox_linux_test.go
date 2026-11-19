@@ -75,6 +75,11 @@ func TestMain(m *testing.M) {
 	if body, ok := os.LookupEnv(testSpecVar); ok {
 		os.Exit(runFromEnv(body))
 	}
+	if len(os.Args) >= 2 {
+		if mode, ok := childModes[os.Args[1]]; ok {
+			os.Exit(mode(os.Args[2:]))
+		}
+	}
 	if len(os.Args) == 2 && os.Args[1] == "rename" {
 		os.Exit(renameBetweenDirs())
 	}
@@ -383,8 +388,9 @@ type isolationTargets struct {
 	// Abstract is an abstract socket a process outside listens on.
 	Abstract string `json:"abstract"`
 	// Pid is a process outside, which stands for serve.
-	Pid    int    `json:"pid"`
-	Kernel Kernel `json:"kernel"`
+	Pid     int     `json:"pid"`
+	Kernel  Kernel  `json:"kernel"`
+	Network Network `json:"network"`
 }
 
 // isolationChecks tries each way out of the sandbox in body, an
@@ -402,6 +408,13 @@ func isolationChecks(body string) int {
 	traced := unix.ESRCH
 	if tg.Kernel != KernelOpen {
 		traced = unix.ENOSYS
+	}
+	// Abstract sockets belong to a network namespace. Under NetworkHost the
+	// sandbox shares the host's, which is a gap the doc lists, and under
+	// NetworkNone it has one of its own.
+	var abstract error
+	if tg.Network == NetworkNone {
+		abstract = unix.ECONNREFUSED
 	}
 	checks := []struct {
 		name string
@@ -433,10 +446,7 @@ func isolationChecks(body string) int {
 		{"connect to a covered socket", unix.ECONNREFUSED, func() error {
 			return connectUnix(coveredSock)
 		}},
-		// Abstract sockets belong to a network namespace, and the sandbox
-		// shares the host's until the egress proxy brings one of its own,
-		// so for now this is a gap the doc lists.
-		{"connect to an abstract socket outside", nil, func() error {
+		{"connect to an abstract socket outside", abstract, func() error {
 			return connectUnix(tg.Abstract)
 		}},
 		{"signal a process outside", unix.ESRCH, func() error {
@@ -798,8 +808,17 @@ func TestKernelLevels(t *testing.T) {
 // stands for serve. The open level shows what the namespaces refuse without
 // the filter in front of them.
 func TestIsolation(t *testing.T) {
-	for _, level := range []Kernel{KernelStrict, KernelOpen} {
-		t.Run(string(level), func(t *testing.T) {
+	for _, tc := range []struct {
+		level   Kernel
+		network Network
+	}{
+		{KernelStrict, NetworkNone},
+		{KernelOpen, NetworkNone},
+		{KernelStrict, NetworkHost},
+		{KernelOpen, NetworkHost},
+	} {
+		level := tc.level
+		t.Run(string(level)+"/"+tc.network.String(), func(t *testing.T) {
 			other := filepath.Join(t.TempDir(), "f")
 			if err := os.WriteFile(other, []byte("other"), 0o600); err != nil {
 				t.Fatal(err)
@@ -826,11 +845,12 @@ func TestIsolation(t *testing.T) {
 				Abstract:     abstract,
 				Pid:          os.Getpid(),
 				Kernel:       level,
+				Network:      tc.network,
 			})
 			if err != nil {
 				t.Fatal(err)
 			}
-			spec := Spec{Home: t.TempDir(), Cover: []string{appDir, coveredSock}, Kernel: level}
+			spec := Spec{Home: t.TempDir(), Cover: []string{appDir, coveredSock}, Kernel: level, Network: tc.network}
 			if code, out := runSandbox(t, spec, true, "isolation", string(body)); code != 0 {
 				t.Fatalf("a way out of the sandbox, exit %d: %s", code, out)
 			}

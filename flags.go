@@ -15,6 +15,7 @@ func (s *Spec) RegisterFlags(fs *flag.FlagSet) {
 	fs.Var((*paths)(&s.Read), "read", "a host path the command may read even under a covered path; repeatable")
 	fs.Var((*paths)(&s.Cover), "cover", "another host path to hide; repeatable")
 	fs.Var(&s.Kernel, "kernel", "how much of the kernel the command may reach: strict, nested, or open; strict when empty")
+	fs.Var(&s.Network, "network", "what the command can reach of the network: none, or host to share the host's; none when empty")
 }
 
 // paths is a flag that adds one path each time it is given.

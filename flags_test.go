@@ -29,6 +29,28 @@ func TestRegisterFlags(t *testing.T) {
 	}
 }
 
+func TestNetworkFlag(t *testing.T) {
+	for _, tc := range []struct {
+		args []string
+		want Network
+		ok   bool
+	}{
+		{nil, NetworkNone, true},
+		{[]string{"-network", "none"}, NetworkNone, true},
+		{[]string{"-network", "host"}, NetworkHost, true},
+		{[]string{"-network", "all"}, NetworkNone, false},
+	} {
+		var spec Spec
+		fs := flag.NewFlagSet("test", flag.ContinueOnError)
+		fs.SetOutput(io.Discard)
+		spec.RegisterFlags(fs)
+		err := fs.Parse(tc.args)
+		if (err == nil) != tc.ok || spec.Network != tc.want {
+			t.Errorf("%q: Network = %v, err = %v; want %v, ok %v", tc.args, spec.Network, err, tc.want, tc.ok)
+		}
+	}
+}
+
 func TestKernelFlag(t *testing.T) {
 	for _, tc := range []struct {
 		value string
