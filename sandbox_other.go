@@ -9,6 +9,16 @@ import (
 	"os"
 )
 
+// SelfPath is the path under which a sandbox's command names this binary.
+// Here it is a variable, the executable's real path found at start-up, since
+// no backend can bind a copy at a fixed path (Linux's SelfPath is a
+// constant). It is empty if the path cannot be found. Callers must not
+// change it.
+var SelfPath = func() string {
+	exe, _ := os.Executable()
+	return exe
+}()
+
 // run is what a started Cmd holds, which is nothing where there is no
 // backend yet.
 type run struct{}

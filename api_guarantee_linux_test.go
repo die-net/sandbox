@@ -39,6 +39,8 @@ func init() {
 	escChecks["pwd"] = func(e *escT, _ []string) { wd, err := os.Getwd(); e.is("getwd", err); fmt.Println(wd) }
 	escChecks["gate-read-fds"] = func(e *escT, a []string) { _, _ = io.Copy(io.Discard, os.Stdin); readFds(e, a) }
 	escChecks["dial-each"] = dialEach
+	escChecks["fill-scratch"] = fillScratch
+	childModes["self-hello"] = func(args []string) int { fmt.Println("hello from", strings.Join(args, " ")); return 0 }
 	escChecks["hostname"] = func(*escT, []string) { h, _ := os.Hostname(); fmt.Println(h) }
 }
 
@@ -133,6 +135,7 @@ func TestAPICommandErrors(t *testing.T) {
 		{"resource zero", mod(func(s *Spec) { s.Rlimits = []Rlimit{{Resource: 0}} }), "resource"},
 		{"an unknown resource", mod(func(s *Spec) { s.Rlimits = []Rlimit{{Resource: ResourceAddressSpace + 1}} }), "resource"},
 		{"a soft limit above the hard one", mod(func(s *Spec) { s.Rlimits = []Rlimit{{ResourceCore, 2, 1}} }), "soft"},
+		{"a negative ScratchSize", mod(func(s *Spec) { s.ScratchSize = -1 }), "scratch"},
 		{"a NUL in the hostname", mod(func(s *Spec) { s.Hostname = "a\x00b" }), "NUL"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -161,6 +164,7 @@ func TestAPICommandErrors(t *testing.T) {
 				s.Rlimits = append(s.Rlimits, Rlimit{r, 1, 2})
 			}
 		})},
+		{"a small ScratchSize", mod(func(s *Spec) { s.ScratchSize = 4096 })},
 		{"NetworkHost with none of either", mod(func(s *Spec) { s.Network = NetworkHost })},
 		{"macOS fields, which Linux ignores", mod(func(s *Spec) { s.Services, s.BroadLoopback = []Service{"fonts"}, true })},
 		{"a long hostname, which Start checks", mod(func(s *Spec) { s.Hostname = strings.Repeat("h", 100) })},
@@ -1236,11 +1240,81 @@ func TestAPIPid(t *testing.T) {
 	}
 }
 
+// fillScratch writes 1 MiB at a time into each scratch directory until a
+// write fails, and prints the directory, the bytes that fit and the error.
+func fillScratch(e *escT, _ []string) {
+	chunk := make([]byte, 1<<20)
+	for _, d := range []string{"/tmp", "/var/tmp", "/dev/shm"} {
+		f, err := os.Create(d + "/fill")
+		if err != nil {
+			e.fail("create in %s: %v", d, err)
+			continue
+		}
+		total := 0
+		for total < 64<<20 {
+			n, err := f.Write(chunk)
+			total += n
+			if err != nil {
+				fmt.Printf("%s %d %v\n", d, total, errors.Is(err, unix.ENOSPC))
+				break
+			}
+		}
+		if total >= 64<<20 {
+			fmt.Printf("%s %d unlimited\n", d, total)
+		}
+		_ = f.Close()
+	}
+}
+
+// ScratchSize: each private tmpfs holds no more than it says, and a write
+// past it fails with ENOSPC.
+func TestAPIScratchSize(t *testing.T) {
+	const limit = 4 << 20
+	c, stdout, stderr := escCmd(t, t.Context(), Spec{ScratchSize: limit}, "esc", "fill-scratch")
+	if err := c.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Wait(); err != nil {
+		t.Fatalf("%v: %s", err, stderr)
+	}
+	lines := strings.Split(strings.TrimSpace(stdout.String()), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("output %q, want a line for each of three directories", stdout)
+	}
+	for _, l := range lines {
+		var dir string
+		var n int
+		var enospc string
+		if _, err := fmt.Sscan(l, &dir, &n, &enospc); err != nil || enospc != "true" || n > limit || n < limit/2 {
+			t.Errorf("%q: want ENOSPC after about %d bytes", l, limit)
+		}
+	}
+}
+
+// SelfPath: a command that runs this binary again by it gets that binary's
+// mode.
+func TestAPISelfPath(t *testing.T) {
+	c, err := Command(t.Context(), Spec{Home: t.TempDir(), Command: []string{SelfPath, "self-hello", "a", "b"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	c.Stdout, c.Stderr = &stdout, &stderr
+	if err := c.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Wait(); err != nil {
+		t.Fatalf("%v: %s", err, stderr.String())
+	}
+	if got, want := stdout.String(), "hello from a b\n"; got != want {
+		t.Errorf("output %q, want %q", got, want)
+	}
+}
+
 // A server's threads come and go: a sandbox started from a goroutine whose
 // thread then exits must not be killed, which design.md 4.4 gives as the
-// reason there is a lifeline and no Pdeathsig on the server's side.
+// reason there is a lifeline and neither Pdeathsig nor --die-with-parent.
 func TestAPIStartThreadExits(t *testing.T) {
-	t.Skip("KNOWN FAILURE: the sandbox dies when the OS thread that called Start exits. bubblewrap's --die-with-parent is PR_SET_PDEATHSIG, which the kernel delivers when the parent *thread* exits, and it is bubblewrap's parent (the Go thread), not bubblewrap itself, that comes and goes. design.md 4.4 says bubblewrap's own pdeathsig has no thread problem. Seen on the VM: after a locked goroutine that called Start returns, Wait gives 'signal: killed' and the command's output never arrives, on most runs")
 	for i := range 3 {
 		ctx, cancel := context.WithCancel(t.Context())
 		c, stdout, _ := escCmd(t, ctx, Spec{}, "esc", "hold")

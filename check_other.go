@@ -2,8 +2,6 @@
 
 package sandbox
 
-import "os"
-
 // platformChecks are the checks that need Linux, which are skipped here, and
 // the limits, which nothing here can enforce.
 func platformChecks(*checkEnv) []Result {
@@ -39,10 +37,3 @@ func initialUserNS() bool { return true }
 
 // grandchild has no modes here.
 func grandchild([]string) (int, bool) { return 0, false }
-
-// selfInSandbox is this binary's path as a sandbox's command names it. No
-// backend runs a command here yet.
-func selfInSandbox() string {
-	exe, _ := os.Executable()
-	return exe
-}

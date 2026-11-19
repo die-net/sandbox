@@ -22,4 +22,5 @@ rdir=/tmp/sandbox-test-$$
 remote=$rdir/sandbox.test
 limactl shell --workdir /tmp "$vm" -- mkdir "$rdir"
 limactl copy "$out/sandbox.test" "$vm:$remote"
-limactl shell --workdir /tmp "$vm" -- sh -c "chmod +x $remote && $remote $* ; rc=\$?; rm -rf $rdir; exit \$rc"
+args=$(printf " %q" "$@")
+limactl shell --workdir /tmp "$vm" -- sh -c "chmod +x $remote && $remote$args ; rc=\$?; rm -rf $rdir; exit \$rc"

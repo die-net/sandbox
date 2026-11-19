@@ -142,6 +142,16 @@ func firstStage() error {
 	if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
 		return fmt.Errorf("set no_new_privs: %w", err)
 	}
+	// Die with bubblewrap's outer process, which is the parent of pid 1.
+	// bubblewrap is single-threaded, so this has no thread problem, unlike
+	// the same call on the caller's side. Without it a bubblewrap killed on
+	// its own would leave pid 1 and the command holding the caller's output
+	// pipes until the lifeline closes, which only Wait does, after those
+	// pipes have closed. It is set on the thread that execs, which becomes
+	// the reaper's only thread.
+	if err := unix.Prctl(unix.PR_SET_PDEATHSIG, uintptr(unix.SIGKILL), 0, 0, 0); err != nil {
+		return fmt.Errorf("die with bubblewrap: %w", err)
+	}
 	args := slices.Concat([]string{os.Args[0], reaperArg}, os.Args[2:])
 	return syscall.Exec("/proc/self/exe", args, os.Environ()) //nolint:gosec // This is the sandbox's own binary, not a shell.
 }
@@ -164,6 +174,10 @@ func reaperStage(command []string) (int, error) {
 	if err := unix.Prctl(unix.PR_SET_DUMPABLE, 0, 0, 0, 0); err != nil {
 		return 0, fmt.Errorf("make pid 1 undumpable: %w", err)
 	}
+	// Watch from the first moment, so a parent that died during setup
+	// leaves no command running, even briefly. Its write end closing is
+	// EOF whenever this first reads it.
+	go watchLifeline()
 	settings, err := receiveSettings()
 	if err != nil {
 		return 0, err
@@ -199,7 +213,6 @@ func reaperStage(command []string) (int, error) {
 	// Held until here, so that nothing closes one of them while it is
 	// being passed on.
 	runtime.KeepAlive(files)
-	go watchLifeline()
 	stop := relaySignals(child)
 	defer stop()
 	for {

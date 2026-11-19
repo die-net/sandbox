@@ -222,7 +222,8 @@ func (c *Cmd) Start() error {
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = c.Stdin, c.Stdout, c.Stderr
 	cmd.WaitDelay = c.WaitDelay
 	cmd.ExtraFiles = l.inherit
-	// No Pdeathsig: it fires when the OS thread that started bubblewrap
+	// No Pdeathsig, and no --die-with-parent, which is the same call made
+	// in bubblewrap: it fires when the OS thread that started bubblewrap
 	// exits, and a Go server's threads come and go. The lifeline does it.
 	if c.Setpgid || c.CgroupFD > 0 {
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: c.Setpgid, UseCgroupFD: c.CgroupFD > 0, CgroupFD: max(c.CgroupFD, 0)}
@@ -414,9 +415,9 @@ func Run(ctx context.Context, spec Spec) (int, error) {
 		return 0, err
 	}
 	// bubblewrap's outer process does not pass signals on, so a SIGTERM
-	// or SIGHUP relayed to it ends it, and --die-with-parent then kills
-	// everything inside with SIGKILL. Relaying rather than dying lets Run
-	// still wait for it and return its status.
+	// or SIGHUP relayed to it ends it, and Wait's close of the lifeline then
+	// makes pid 1 kill everything inside. Relaying rather than dying lets
+	// Run still wait for it and return its status.
 	stop := relaySignals(c.run.cmd.Process)
 	defer stop()
 	return exitStatus(c.Wait())
@@ -507,14 +508,23 @@ type mountOp struct {
 	args []string
 }
 
+// SelfPath is the path under which a sandbox's command names this binary,
+// for a command that runs it again: Spec.Command = []string{SelfPath, "mode"}. The
+// binary must call Stage first in main, which handles the mode's marker or
+// returns false so main can. On Linux it is a constant, the copy Command
+// binds in at /dev/sandbox-stage, so it holds on any host. Elsewhere it is
+// a variable set at start-up, since the path is the executable's real one.
+const SelfPath = stagePath
+
 // scratchDirs are the covered paths that get a writable tmpfs of the
 // sandbox's own rather than an empty, read-only one: temporary files and
 // shared memory.
 var scratchDirs = []string{"/tmp", "/var/tmp", "/dev/shm"}
 
-// scratchSize is the most each of scratchDirs holds. A tmpfs is otherwise as
-// large as the host's memory, so one sandbox could fill it, and only a
-// delegated cgroup's memory limit would stop it.
+// scratchSize is the most each of scratchDirs holds unless Spec.ScratchSize
+// says otherwise. A tmpfs is otherwise as large as the host's memory, so one
+// sandbox could fill it, and only a delegated cgroup's memory limit would
+// stop it.
 const scratchSize = 1 << 30
 
 // newLaunch builds bubblewrap's options for spec. Each bind source is opened
@@ -551,7 +561,7 @@ func newLaunch(spec Spec, acct account, stageFiles []*os.File) (*launch, error) 
 	}
 	args := []string{
 		"--unshare-user", "--unshare-pid", "--unshare-ipc", "--unshare-uts",
-		"--die-with-parent", "--hostname", hostname,
+		"--hostname", hostname,
 		"--info-fd", strconv.Itoa(fdInfo),
 		// The first stage is pid 1 and the reaper, so bubblewrap's own
 		// does not stay in the mount namespace the stage leaves.
@@ -592,9 +602,13 @@ func newLaunch(spec Spec, acct account, stageFiles []*os.File) (*launch, error) 
 			ops = append(ops, mountOp{c, coverMount, []string{"--ro-bind", "/dev/null", c}})
 		}
 	}
+	size := spec.ScratchSize
+	if size == 0 {
+		size = scratchSize
+	}
 	for _, d := range scratchDirs {
 		if fi, err := os.Stat(filepath.Dir(d)); err == nil && fi.IsDir() {
-			ops = append(ops, mountOp{d, scratchMount, []string{"--perms", "01777", "--size", strconv.Itoa(scratchSize), "--tmpfs", d}})
+			ops = append(ops, mountOp{d, scratchMount, []string{"--perms", "01777", "--size", strconv.FormatInt(size, 10), "--tmpfs", d}})
 		}
 	}
 	self, err := unix.Open("/proc/self/exe", unix.O_PATH|unix.O_CLOEXEC, 0)

@@ -68,6 +68,10 @@ type Spec struct {
 	Rlimits []Rlimit `json:"rlimits,omitempty"`
 	// Hostname is the sandbox's hostname on Linux. Empty means "sandbox".
 	Hostname string `json:"hostname,omitempty"`
+	// ScratchSize is the size in bytes of each private tmpfs (/tmp,
+	// /var/tmp and /dev/shm) on Linux. Zero means 1 GiB, and a negative
+	// size is an error.
+	ScratchSize int64 `json:"scratch_size,omitempty"`
 }
 
 // maxListen is the most Listen and Loopback may each be, which keeps their
@@ -158,6 +162,9 @@ func (s Spec) checkRequest() error {
 	}
 	if s.Network == NetworkHost && (s.Listen > 0 || s.Loopback > 0) {
 		return errors.New("listeners and loopback ports need NetworkNone, since the host's network has no private loopback")
+	}
+	if s.ScratchSize < 0 {
+		return fmt.Errorf("scratch size %d is negative", s.ScratchSize)
 	}
 	for _, f := range s.Files {
 		if f == nil {

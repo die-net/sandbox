@@ -624,11 +624,13 @@ func escSeccomp(e *escT, args []string) {
 	defer ptmx.Close()
 	fd := ptmx.Fd()
 	ch := byte('x')
+	// On 32-bit, uintptr drops the high bit and these repeat the plain calls.
+	high := uintptr(uint64(1) << 32 & uint64(^uintptr(0)))
 	e.is("TIOCSTI", sc(unix.SYS_IOCTL, fd, unix.TIOCSTI, uintptr(unsafe.Pointer(&ch))), unix.EPERM)
-	e.is("TIOCSTI with a high bit", sc(unix.SYS_IOCTL, fd, 1<<32|unix.TIOCSTI, uintptr(unsafe.Pointer(&ch))), unix.EPERM)
+	e.is("TIOCSTI with a high bit", sc(unix.SYS_IOCTL, fd, high|unix.TIOCSTI, uintptr(unsafe.Pointer(&ch))), unix.EPERM)
 	sub := [4]byte{2}
 	e.is("TIOCLINUX", sc(unix.SYS_IOCTL, fd, unix.TIOCLINUX, uintptr(unsafe.Pointer(&sub[0]))), unix.EPERM)
-	e.is("TIOCLINUX with a high bit", sc(unix.SYS_IOCTL, fd, 1<<32|unix.TIOCLINUX, uintptr(unsafe.Pointer(&sub[0]))), unix.EPERM)
+	e.is("TIOCLINUX with a high bit", sc(unix.SYS_IOCTL, fd, high|unix.TIOCLINUX, uintptr(unsafe.Pointer(&sub[0]))), unix.EPERM)
 	// A TIOCSTI on the controlling terminal's own descriptor 0, whatever
 	// it is, is refused by the filter before the device sees it.
 	e.is("TIOCSTI on fd 0", sc(unix.SYS_IOCTL, 0, unix.TIOCSTI, uintptr(unsafe.Pointer(&ch))), unix.EPERM)
@@ -2260,7 +2262,7 @@ func TestEscapeRlimitsEnforced(t *testing.T) {
 	})
 	t.Run("address space", func(t *testing.T) {
 		const limit = 8 << 30
-		escRun(t, Spec{Rlimits: []Rlimit{{ResourceAddressSpace, limit, limit}}}, "rlimit-as", strconv.Itoa(limit))
+		escRun(t, Spec{Rlimits: []Rlimit{{ResourceAddressSpace, limit, limit}}}, "rlimit-as", strconv.FormatUint(limit, 10))
 	})
 	t.Run("processes", func(t *testing.T) {
 		// RLIMIT_NPROC counts every process of the uid. In a user
