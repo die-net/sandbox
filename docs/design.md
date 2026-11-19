@@ -580,19 +580,22 @@ The container fixes relax the outer layer just enough for the inner one, which t
 
 ## 8. Sequencing
 
-Settle the API against both backends now. Build Linux first.
+The API is settled against both backends (sections 4.1 and 4.2). This repo builds the library. Each project adopts it in its own repo, on its own schedule. trmnl-byos-go is expected to adopt first, then legwork, which keeps its own `internal/sandbox` until it switches. Until then, fixes to that copy are ported here, and legwork's copy takes fixes only.
 
-1. **Now:** agree on `Spec`, `Report` and the mapping in 4.2, so macOS lands without breaking changes.
-2. **Linux extraction** (mostly moving tested code), plus `Command`, `Probe`, `Network` (`--unshare-net` for none), `Files`, `Rlimits`, `Pid`, `Footprint`, and `Check` with its generic checks (most exist as tests in `internal/sandbox`). legwork switches over.
-   - Nothing in this step needs egress under `NetworkNone`. legwork uses `NetworkHost`, `Check(ctx, nil, ...)` has no `Spec`, and a `Check` of a `NetworkNone` spec just expects its egress attempts to fail. trmnl needs `Listen`, which comes in step 3.
-   - trmnl can use `Check(ctx, nil, want)` in today's compose render container right away, before it has an in-place sandbox, because the as-is checks need no namespace code.
-3. **Listener handoff** (`Listen`, `Loopback`), with legwork's phase 4.
-4. **trmnlp's fixed WebDriver ports**, proposed upstream early, since macOS needs it to drop `BroadLoopback`.
-5. **trmnl on Linux:** one binary, `renderer check`, headless, cgroup or watchdog. Firefox under `strict` is settled (spikes.md L2).
-6. **Seatbelt backend** (legwork's phase 6, built here): profile generation, the stage, `Services` groups, the deny-log runs with both legwork CLIs and with trmnlp, geckodriver and the recipe runtimes (headless Firefox alone is done: spikes.md M2), and a hole-finding review of the profile.
-7. **trmnl on macOS.**
+1. **Linux library, complete.** legwork's code imported with its history, then:
+   - the full API: `Command`/`Cmd`, `Network` (`--unshare-net` for none), `Listen` and `Loopback`, `Files`, `Rlimits`, `Pid` from `--info-fd`, the lifeline, `Probe`, and `Check` with its generic checks
+   - a test for every public entry point, and a test for every Linux guarantee in section 2 that tries the escape and expects it to fail
+   - a CI job (Ubuntu 24.04, CGO on and off)
+   - a security review of the result.
+2. **macOS library, complete:**
+   - the Seatbelt backend: profile generation, the stage, `Services` groups
+   - tests for the macOS column of section 2, including a raw-XPC `lsopen` attempt
+   - a security review.
+3. **Adoption,** by each project's own sessions: trmnl on Linux, then on macOS, then legwork. Deny-log runs with real workloads (trmnlp, geckodriver, the recipe runtimes, legwork's CLIs) happen there, and fixes to the library come back here.
 
-Why this order: the Linux backend has a review record and tests behind it, and it's mostly a move. Seatbelt is new code in an undocumented profile language, and its findings will come from running it. trmnl's macOS users can run the server meanwhile.
+Outside this repo, and not blocking it: trmnlp's fixed WebDriver ports, proposed upstream early, since macOS needs them to drop `BroadLoopback`.
+
+Why this order: the Linux backend has a review record and tests behind it, and it's mostly a move. Seatbelt is new code in an undocumented profile language, and its findings will come from running it.
 
 ## 9. Risks and open questions, ranked
 
