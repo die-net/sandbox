@@ -1,0 +1,690 @@
+package sandbox
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+)
+
+// Status is the outcome of one check.
+type Status int
+
+const (
+	// Pass means the attempt failed, or the property holds.
+	Pass Status = iota
+	// Fail means the attempt worked.
+	Fail
+	// NotEnforceable means the check applies, but nothing on this platform
+	// can enforce it.
+	NotEnforceable
+	// Skipped means the check does not apply here, or was not asked for.
+	Skipped
+)
+
+// String returns the status's name.
+func (s Status) String() string {
+	switch s {
+	case Pass:
+		return "pass"
+	case Fail:
+		return "fail"
+	case NotEnforceable:
+		return "not-enforceable"
+	case Skipped:
+		return "skipped"
+	}
+	return "status(" + strconv.Itoa(int(s)) + ")"
+}
+
+// Result is one check's finding.
+type Result struct {
+	// Name is stable, such as "userns.create". A check run once per path
+	// or target appends ":" and it.
+	Name   string `json:"name"`
+	Status Status `json:"status"`
+	// Detail says what was tried and what happened, with the fix when
+	// there is one.
+	Detail string `json:"detail,omitempty"`
+}
+
+// Expect is what a project says its sandbox must enforce, beyond the checks
+// every sandbox gets.
+type Expect struct {
+	// Unreadable lists paths the code must not read. Each is also tried
+	// through its filesystem's snapshot directories.
+	Unreadable []string `json:"unreadable,omitempty"`
+	// Unwritable lists paths the code must not write.
+	Unwritable []string `json:"unwritable,omitempty"`
+	// Unreachable lists endpoints the code must not reach, as
+	// "tcp:127.0.0.1:8080", "udp:host:port" or "unix:/path".
+	Unreachable []string `json:"unreachable,omitempty"`
+	// Proxy is the host:port the code should use for egress.
+	Proxy string `json:"proxy,omitempty"`
+	// Allowed lists CONNECT targets the proxy must allow.
+	Allowed []string `json:"allowed,omitempty"`
+	// Refused lists CONNECT targets the proxy must refuse.
+	Refused []string `json:"refused,omitempty"`
+}
+
+// checkArg is the first argument of the run of this binary that Check starts.
+// Stage hands such a run to checkStage.
+const checkArg = "--sandbox-check"
+
+// checkFailed is the exit status of a check child that could not run its suite.
+const checkFailed = 125
+
+// resultFD is the descriptor on which the check child writes its results.
+const resultFD = 3
+
+// netTimeout bounds each network attempt, so a check run never hangs.
+const netTimeout = 2 * time.Second
+
+// checkInput is what the runner hands the child, as JSON in argv[2].
+type checkInput struct {
+	Want Expect `json:"want"`
+	Spec *Spec  `json:"spec,omitempty"`
+}
+
+// Check runs the suite in a child of this binary and returns the results,
+// in a fixed order. With spec the child runs inside a sandbox built from it.
+// With nil it inherits this process's context as it is, which is what an
+// operator's container or unit gives.
+//
+// The child is started as the current binary with checkArg as its first
+// argument, so the program must call Stage first in main.
+func Check(ctx context.Context, spec *Spec, want Expect) ([]Result, error) {
+	in := checkInput{Want: want}
+	if spec != nil {
+		c := *spec
+		c.Command = nil
+		in.Spec = &c
+	}
+	payload, err := json.Marshal(in)
+	if err != nil {
+		return nil, fmt.Errorf("check: %w", err)
+	}
+	r, w, err := os.Pipe()
+	if err != nil {
+		return nil, fmt.Errorf("check: %w", err)
+	}
+	defer r.Close()
+	var stderr bytes.Buffer
+	var wait func() error
+	if spec == nil {
+		exe, err := os.Executable()
+		if err != nil {
+			w.Close()
+			return nil, fmt.Errorf("check: find this binary: %w", err)
+		}
+		cmd := exec.CommandContext(ctx, exe, checkArg, string(payload))
+		cmd.ExtraFiles = []*os.File{w}
+		cmd.Stderr = &stderr
+		cmd.WaitDelay = netTimeout
+		if err := cmd.Start(); err != nil {
+			w.Close()
+			return nil, fmt.Errorf("check: start the child: %w", err)
+		}
+		wait = cmd.Wait
+	} else if wait, err = startInSandbox(ctx, *spec, string(payload), w, &stderr); err != nil {
+		w.Close()
+		return nil, fmt.Errorf("check: start the sandbox: %w", err)
+	}
+	w.Close() // the child holds the only write end now
+
+	var results []Result
+	sc := bufio.NewScanner(r)
+	sc.Buffer(nil, 1<<20)
+	for sc.Scan() {
+		var res Result
+		if err := json.Unmarshal(sc.Bytes(), &res); err != nil {
+			return results, fmt.Errorf("check: bad result line %q: %w", sc.Text(), err)
+		}
+		results = append(results, res)
+	}
+	werr := wait()
+	if werr != nil || len(results) == 0 {
+		msg := strings.TrimSpace(stderr.String())
+		if werr == nil {
+			werr = errors.New("no results")
+		}
+		return results, fmt.Errorf("check: the child failed: %w: %s", werr, msg)
+	}
+	return results, nil
+}
+
+// checkStage is the check child's entry point, which Stage calls when
+// os.Args[1] is checkArg. It returns the exit status.
+func checkStage() int {
+	if len(os.Args) < 3 {
+		return checkFailed
+	}
+	if code, ok := grandchild(os.Args[2:]); ok {
+		return code
+	}
+	var in checkInput
+	if err := json.Unmarshal([]byte(os.Args[2]), &in); err != nil {
+		fmt.Fprintf(os.Stderr, "sandbox check: %v\n", err)
+		return checkFailed
+	}
+	out := os.NewFile(resultFD, "results")
+	if out == nil {
+		fmt.Fprintln(os.Stderr, "sandbox check: no result descriptor")
+		return checkFailed
+	}
+	defer out.Close()
+	enc := json.NewEncoder(out)
+	for _, res := range runChecks(&checkEnv{want: in.Want, spec: in.Spec}) {
+		if err := enc.Encode(res); err != nil {
+			fmt.Fprintf(os.Stderr, "sandbox check: %v\n", err)
+			return checkFailed
+		}
+	}
+	return 0
+}
+
+// checkEnv is what each check sees: the caller's Expect, and the Spec the
+// child runs under, nil when it runs as it is.
+type checkEnv struct {
+	want Expect
+	spec *Spec
+}
+
+// checkFn runs one check, or a group of them, and returns its results.
+type checkFn func(*checkEnv) []Result
+
+// genericChecks is the suite, in the order of the results. The checks that
+// only exist on Linux come from platformChecks.
+var genericChecks = []checkFn{
+	checkIdentity,
+	checkGroups,
+	platformChecks,
+	checkProcesses,
+	checkSecrets,
+	checkSockets,
+	checkWrites,
+	checkCovers,
+	checkEgress,
+	checkMetadata,
+	checkLAN,
+	checkProxy,
+	checkExpect,
+}
+
+// runChecks runs every check at once, since most wait on a network, and
+// returns the results in table order. A check that panics is a failure.
+func runChecks(e *checkEnv) []Result {
+	groups := make([][]Result, len(genericChecks))
+	var wg sync.WaitGroup
+	for i, fn := range genericChecks {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() {
+				if p := recover(); p != nil {
+					groups[i] = []Result{{Name: "check.internal", Status: Fail, Detail: fmt.Sprint("check panicked: ", p)}}
+				}
+			}()
+			groups[i] = fn(e)
+		}()
+	}
+	wg.Wait()
+	return slices.Concat(groups...)
+}
+
+func pass(name, format string, a ...any) Result {
+	return Result{Name: name, Status: Pass, Detail: fmt.Sprintf(format, a...)}
+}
+
+func fail(name, format string, a ...any) Result {
+	return Result{Name: name, Status: Fail, Detail: fmt.Sprintf(format, a...)}
+}
+
+func skipped(name, format string, a ...any) Result {
+	return Result{Name: name, Status: Skipped, Detail: fmt.Sprintf(format, a...)}
+}
+
+// verdict makes a Result from an attempt that is a failure if it worked.
+// worked lists what the attempt got, and tried says what was tried.
+func verdict(name, tried string, worked []string) Result {
+	if len(worked) > 0 {
+		return fail(name, "%s: worked for %s", tried, strings.Join(worked, ", "))
+	}
+	return pass(name, "%s: refused or absent", tried)
+}
+
+func checkGroups(*checkEnv) []Result {
+	gs, err := os.Getgroups()
+	if err != nil {
+		return []Result{fail("groups.supplementary", "getgroups: %v", err)}
+	}
+	if len(gs) > 0 {
+		return []Result{fail("groups.supplementary", "getgroups returned %v", gs)}
+	}
+	return []Result{pass("groups.supplementary", "getgroups returned none")}
+}
+
+func checkIdentity(*checkEnv) []Result {
+	const name = "uid.root-initial-ns"
+	if os.Geteuid() != 0 {
+		return []Result{pass(name, "euid is %d", os.Geteuid())}
+	}
+	if initialUserNS() {
+		return []Result{fail(name, "euid 0 in the initial user namespace")}
+	}
+	return []Result{pass(name, "euid 0, but in a user namespace of its own")}
+}
+
+// homeDirs returns the home directories to look for secrets in: this
+// process's own, and every account's in /etc/passwd.
+func homeDirs() []string {
+	var homes []string
+	if h := os.Getenv("HOME"); h != "" {
+		homes = append(homes, h)
+	}
+	if b, err := os.ReadFile("/etc/passwd"); err == nil {
+		for _, line := range strings.Split(string(b), "\n") {
+			f := strings.Split(line, ":")
+			if len(f) >= 6 && filepath.IsAbs(f[5]) && f[5] != "/" {
+				homes = append(homes, f[5])
+			}
+		}
+	}
+	slices.Sort(homes)
+	return slices.Compact(homes)
+}
+
+// secretFiles are the well-known secrets, under a home. /etc/shadow and the
+// like are listed in secretPaths.
+var secretFiles = []string{".ssh", ".aws", ".config/gcloud", ".kube/config", ".docker/config.json", ".netrc", ".npmrc", ".gem/credentials", "Library/Keychains"}
+
+var secretPaths = []string{"/etc/shadow"}
+
+// readable reports whether path can be opened for reading, and for a
+// directory listed, which is what covers a home that is only searchable.
+func readable(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	if fi, err := f.Stat(); err == nil && fi.IsDir() {
+		_, err = f.Readdirnames(1)
+		return err == nil || errors.Is(err, io.EOF)
+	}
+	return true
+}
+
+func checkSecrets(*checkEnv) []Result {
+	var worked []string
+	tried := slices.Clone(secretPaths)
+	for _, h := range homeDirs() {
+		for _, s := range secretFiles {
+			tried = append(tried, filepath.Join(h, s))
+		}
+	}
+	for _, p := range tried {
+		if readable(p) {
+			worked = append(worked, p)
+		}
+	}
+	return []Result{verdict("secrets.readable", fmt.Sprintf("open of %d well-known secret paths", len(tried)), worked)}
+}
+
+// socketCandidates are the well-known sockets to connect to.
+func socketCandidates() []string {
+	uid := strconv.Itoa(os.Getuid())
+	socks := []string{
+		"/var/run/docker.sock", "/run/docker.sock", "/run/podman/podman.sock",
+		"/run/user/" + uid + "/podman/podman.sock", "/run/containerd/containerd.sock",
+		"/run/dbus/system_bus_socket", "/var/run/dbus/system_bus_socket",
+		"/run/user/" + uid + "/bus", "/run/user/" + uid + "/systemd/private",
+		os.Getenv("SSH_AUTH_SOCK"),
+	}
+	for _, a := range strings.Split(os.Getenv("DBUS_SESSION_BUS_ADDRESS"), ",") {
+		if p, ok := strings.CutPrefix(a, "unix:path="); ok {
+			socks = append(socks, p)
+		}
+	}
+	socks = slices.DeleteFunc(socks, func(s string) bool { return s == "" })
+	slices.Sort(socks)
+	return slices.Compact(socks)
+}
+
+func checkSockets(*checkEnv) []Result {
+	var worked []string
+	socks := socketCandidates()
+	for _, s := range socks {
+		if out, _ := tryDial("unix", s, netTimeout); out == connected {
+			worked = append(worked, s)
+		}
+	}
+	return []Result{verdict("sockets.reachable", fmt.Sprintf("connect to %d well-known sockets", len(socks)), worked)}
+}
+
+// outcome is how a connection attempt ended.
+type outcome int
+
+const (
+	connected outcome = iota
+	refused
+	timedOut
+	failedOther
+)
+
+// tryDial connects to addr and closes at once.
+func tryDial(network, addr string, timeout time.Duration) (outcome, string) {
+	c, err := net.DialTimeout(network, addr, timeout)
+	if err == nil {
+		c.Close()
+		return connected, "connected"
+	}
+	var ne net.Error
+	switch {
+	case errors.Is(err, syscall.ECONNREFUSED):
+		return refused, "refused"
+	case errors.As(err, &ne) && ne.Timeout():
+		return timedOut, fmt.Sprintf("timed out after %v, with no answer, not a refusal", timeout)
+	}
+	return failedOther, "failed: " + err.Error()
+}
+
+// reachResult turns a dial's outcome into a Result, where connecting is a
+// failure. refusedReaches says that a refusal still shows the host answered.
+func reachResult(name, what string, out outcome, detail string, refusedReaches bool) Result {
+	if out == connected || (out == refused && refusedReaches) {
+		return fail(name, "%s: %s", what, detail)
+	}
+	return pass(name, "%s: %s", what, detail)
+}
+
+func checkEgress(*checkEnv) []Result {
+	var res []Result
+	out, d := tryDial("tcp", "1.1.1.1:443", netTimeout)
+	res = append(res, reachResult("egress.direct-tcp", "TCP to 1.1.1.1:443", out, d, false))
+	return append(res, dnsProbe("egress.direct-udp", "9.9.9.9:53"))
+}
+
+// dnsQuery asks for the root's NS records, which any resolver answers.
+var dnsQuery = []byte{0xbe, 0xef, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 1}
+
+func dnsProbe(name, addr string) Result {
+	what := "UDP DNS query to " + addr
+	c, err := net.DialTimeout("udp", addr, netTimeout)
+	if err != nil {
+		return pass(name, "%s: %v", what, err)
+	}
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(netTimeout))
+	if _, err := c.Write(dnsQuery); err == nil {
+		var buf [512]byte
+		n, err := c.Read(buf[:])
+		if err == nil && n >= 12 {
+			return fail(name, "%s: got a %d-byte answer", what, n)
+		}
+		var ne net.Error
+		if errors.As(err, &ne) && ne.Timeout() {
+			return pass(name, "%s: timed out after %v, with no answer, not a refusal", what, netTimeout)
+		}
+	}
+	return pass(name, "%s: no answer", what)
+}
+
+func checkMetadata(*checkEnv) []Result {
+	var res []Result
+	for _, m := range []struct{ name, addr string }{{"metadata.v4", "169.254.169.254:80"}, {"metadata.v6", "[fd00:ec2::254]:80"}} {
+		out, d := tryDial("tcp", m.addr, netTimeout)
+		res = append(res, reachResult(m.name, "TCP to "+m.addr, out, d, false))
+	}
+	return res
+}
+
+func checkLAN(*checkEnv) []Result {
+	const name = "lan.gateway"
+	gw, err := defaultGateway()
+	if err != nil {
+		return []Result{skipped(name, "no default gateway: %v", err)}
+	}
+	ports := []string{"22", "80", "443"}
+	var worked []string
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for _, p := range ports {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// A refusal comes from the gateway itself, so it was reached.
+			if out, d := tryDial("tcp", net.JoinHostPort(gw, p), netTimeout); out == connected || out == refused {
+				mu.Lock()
+				worked = append(worked, p+" ("+d+")")
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	slices.Sort(worked)
+	return []Result{verdict(name, "TCP to gateway "+gw+" on "+strings.Join(ports, ", "), worked)}
+}
+
+// connectVia asks proxy to CONNECT to target and returns the status code,
+// closing the connection at once.
+func connectVia(proxy, target string) (int, error) {
+	c, err := net.DialTimeout("tcp", proxy, netTimeout)
+	if err != nil {
+		return 0, err
+	}
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(2 * netTimeout))
+	if _, err := fmt.Fprintf(c, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", target, target); err != nil {
+		return 0, err
+	}
+	line, err := bufio.NewReader(c).ReadString('\n')
+	if err != nil {
+		return 0, err
+	}
+	f := strings.Fields(line)
+	if len(f) < 2 || !strings.HasPrefix(f[0], "HTTP/") {
+		return 0, fmt.Errorf("not an HTTP status line: %q", strings.TrimSpace(line))
+	}
+	return strconv.Atoi(f[1])
+}
+
+func checkProxy(e *checkEnv) []Result {
+	if e.want.Proxy == "" {
+		return []Result{skipped("proxy", "no proxy given")}
+	}
+	var res []Result
+	for _, t := range e.want.Allowed {
+		name := "proxy.allowed:" + t
+		code, err := connectVia(e.want.Proxy, t)
+		switch {
+		case err != nil:
+			res = append(res, fail(name, "CONNECT %s through %s: %v", t, e.want.Proxy, err))
+		case code/100 != 2:
+			res = append(res, fail(name, "CONNECT %s through %s: status %d, want 2xx", t, e.want.Proxy, code))
+		default:
+			res = append(res, pass(name, "CONNECT %s through %s: status %d", t, e.want.Proxy, code))
+		}
+	}
+	for _, t := range e.want.Refused {
+		name := "proxy.refused:" + t
+		code, err := connectVia(e.want.Proxy, t)
+		switch {
+		case err != nil:
+			// The proxy not answering is no evidence of a refusal.
+			res = append(res, fail(name, "CONNECT %s through %s: %v, so no refusal was seen", t, e.want.Proxy, err))
+		case code/100 == 2:
+			res = append(res, fail(name, "CONNECT %s through %s: status %d, want a refusal", t, e.want.Proxy, code))
+		default:
+			res = append(res, pass(name, "CONNECT %s through %s: status %d", t, e.want.Proxy, code))
+		}
+	}
+	return res
+}
+
+// tryCreate creates and removes a file of a random name in dir, and for a
+// path that is not a directory opens it for writing without truncating.
+func tryCreate(path string) error {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if !fi.IsDir() {
+		f, err := os.OpenFile(path, os.O_WRONLY, 0)
+		if err == nil {
+			f.Close()
+		}
+		return err
+	}
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return err
+	}
+	name := filepath.Join(path, ".sandbox-check-"+hex.EncodeToString(b[:]))
+	f, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	f.Close()
+	return os.Remove(name)
+}
+
+// under reports whether path is root or inside it.
+func under(path, root string) bool {
+	rel, err := filepath.Rel(root, path)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, "../")
+}
+
+func checkWrites(e *checkEnv) []Result {
+	const name = "writes.outside"
+	if e.spec == nil {
+		return []Result{skipped(name, "no sandbox spec given")}
+	}
+	allowed := append([]string{e.spec.Home}, e.spec.Write...)
+	var tried, worked []string
+	for _, p := range append([]string{"/"}, e.spec.Read...) {
+		if slices.ContainsFunc(allowed, func(a string) bool { return under(p, a) }) {
+			continue
+		}
+		tried = append(tried, p)
+		if tryCreate(p) == nil {
+			worked = append(worked, p)
+		}
+	}
+	return []Result{verdict(name, "create of a random name in "+strings.Join(tried, ", "), worked)}
+}
+
+// coverLimit bounds the entries looked at under one cover.
+const coverLimit = 5000
+
+func checkCovers(e *checkEnv) []Result {
+	if e.spec == nil {
+		return []Result{skipped("covers", "no sandbox spec given")}
+	}
+	// Paths the sandbox shows on purpose, and the directories that lead to them.
+	shown := slices.Concat([]string{e.spec.Home, e.spec.Dir}, e.spec.Write, e.spec.Read)
+	shown = slices.DeleteFunc(shown, func(s string) bool { return s == "" })
+	covers := slices.Concat(defaultCover, e.spec.Cover)
+	slices.Sort(covers)
+	covers = slices.Compact(covers)
+	res := make([]Result, 0, len(covers))
+	for _, c := range covers {
+		name := "covers:" + c
+		if _, err := os.Lstat(c); err != nil {
+			res = append(res, pass(name, "%s: %v", c, err))
+			continue
+		}
+		var leak string
+		n := 0
+		_ = filepath.WalkDir(c, func(p string, d fs.DirEntry, err error) error {
+			if p == c || err != nil {
+				return nil
+			}
+			if n++; n > coverLimit {
+				return fs.SkipAll
+			}
+			if slices.ContainsFunc(shown, func(s string) bool { return under(p, s) }) {
+				return fs.SkipDir
+			}
+			if slices.ContainsFunc(shown, func(s string) bool { return under(s, p) }) {
+				return nil // on the way to a shown path
+			}
+			leak = p
+			return fs.SkipAll
+		})
+		if leak != "" {
+			res = append(res, fail(name, "%s shows %s, which no Home, Write or Read path explains", c, leak))
+		} else {
+			res = append(res, pass(name, "%s lists nothing but paths the spec shows", c))
+		}
+	}
+	return res
+}
+
+func checkExpect(e *checkEnv) []Result {
+	var res []Result
+	for _, p := range e.want.Unreadable {
+		name := "expect.unreadable:" + p
+		if readable(p) {
+			res = append(res, fail(name, "open of %s worked", p))
+		} else {
+			res = append(res, pass(name, "open of %s refused or absent", p))
+		}
+	}
+	res = append(res, checkSnapshots(e.want.Unreadable)...)
+	for _, p := range e.want.Unwritable {
+		name := "expect.unwritable:" + p
+		if err := tryCreate(p); err == nil {
+			res = append(res, fail(name, "write to %s worked", p))
+		} else {
+			res = append(res, pass(name, "write to %s: %v", p, err))
+		}
+	}
+	for _, u := range e.want.Unreachable {
+		name := "expect.unreachable:" + u
+		network, addr, ok := strings.Cut(u, ":")
+		switch {
+		case !ok || (network != "tcp" && network != "udp" && network != "unix"):
+			res = append(res, fail(name, "%q is not tcp:, udp: or unix: followed by an address", u))
+		case network == "udp":
+			res = append(res, dnsLike(name, addr))
+		default:
+			out, d := tryDial(network, addr, netTimeout)
+			res = append(res, reachResult(name, "connect to "+u, out, d, false))
+		}
+	}
+	return res
+}
+
+// dnsLike sends a datagram to addr and fails the check if anything comes
+// back. UDP has no handshake, so an answer is the only proof of reach.
+func dnsLike(name, addr string) Result {
+	c, err := net.DialTimeout("udp", addr, netTimeout)
+	if err != nil {
+		return pass(name, "udp:%s: %v", addr, err)
+	}
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(netTimeout))
+	c.Write(dnsQuery)
+	var buf [512]byte
+	if n, err := c.Read(buf[:]); err == nil {
+		return fail(name, "udp:%s answered with %d bytes", addr, n)
+	}
+	return pass(name, "udp:%s gave no answer", addr)
+}
