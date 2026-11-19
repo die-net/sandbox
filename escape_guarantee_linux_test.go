@@ -1542,43 +1542,42 @@ func TestEscapeDaemonDiesWithCommand(t *testing.T) {
 
 // Row: "caller's session kept": every process in the sandbox stays in the
 // caller's session, so the sandbox has not made one that could hold a
-// terminal, and the filter refuses TIOCSTI and TIOCLINUX.
+// terminal, and the filter refuses TIOCSTI and TIOCLINUX. Every process is in
+// one process group, which is not the caller's.
 func TestEscapeSessionKept(t *testing.T) {
-	for _, pgid := range []bool{false, true} {
-		t.Run(fmt.Sprintf("setpgid=%v", pgid), func(t *testing.T) {
-			ctx, cancel := context.WithCancel(t.Context())
-			defer cancel()
-			c, stdout, _ := escCmd(t, ctx, Spec{}, "esc", "hold")
-			c.Setpgid = pgid
-			if err := c.Start(); err != nil {
-				t.Fatal(err)
-			}
-			defer func() { cancel(); _ = c.Wait() }()
-			var ns string
-			for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
-				if ns, _ = lineWith(stdout.String(), "ns "); ns != "" {
-					break
-				}
-			}
-			if ns == "" {
-				t.Fatal("the command never started")
-			}
-			sid := mySid()
-			members := nsMembers(ns)
-			if len(members) == 0 {
-				t.Fatal("no members found")
-			}
-			for _, m := range members {
-				st, err := os.ReadFile("/proc/" + strconv.Itoa(m) + "/stat")
-				if err != nil {
-					continue
-				}
-				f := strings.Fields(string(st[bytes.LastIndexByte(st, ')')+2:]))
-				if f[3] != strconv.Itoa(sid) {
-					t.Errorf("process %d is in session %s, the caller's is %d", m, f[3], sid)
-				}
-			}
-		})
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	c, stdout, _ := escCmd(t, ctx, Spec{}, "esc", "hold")
+	if err := c.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { cancel(); _ = c.Wait() }()
+	var ns string
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+		if ns, _ = lineWith(stdout.String(), "ns "); ns != "" {
+			break
+		}
+	}
+	if ns == "" {
+		t.Fatal("the command never started")
+	}
+	sid, pgid := mySid(), strconv.Itoa(c.run.cmd.Process.Pid)
+	members := nsMembers(ns)
+	if len(members) == 0 {
+		t.Fatal("no members found")
+	}
+	for _, m := range members {
+		st, err := os.ReadFile("/proc/" + strconv.Itoa(m) + "/stat")
+		if err != nil {
+			continue
+		}
+		f := strings.Fields(string(st[bytes.LastIndexByte(st, ')')+2:]))
+		if f[3] != strconv.Itoa(sid) {
+			t.Errorf("process %d is in session %s, the caller's is %d", m, f[3], sid)
+		}
+		if f[2] != pgid {
+			t.Errorf("process %d is in process group %s, want the sandbox's own, %s", m, f[2], pgid)
+		}
 	}
 }
 

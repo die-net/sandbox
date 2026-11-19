@@ -62,6 +62,14 @@ type Spec struct {
 	Loopback int `json:"loopback,omitempty"`
 	// Files are the descriptors the command gets as 3, 4, and so on. The
 	// caller keeps them open, and closes them when it likes after Start.
+	//
+	// A descriptor grants whatever its object's owner and mode let the
+	// sandbox's uid do, whatever mode it was opened in and whatever the
+	// sandbox covers. On Linux the command can reopen a file through
+	// /proc/self/fd/N with more access: a file under a covered directory
+	// that was opened read-only can be opened for writing and overwritten.
+	// Where that matters, pass a pipe or a socket, which cannot be reopened,
+	// not a file.
 	Files []*os.File `json:"-"`
 	// Rlimits are the resource limits pid 1 sets before it starts the
 	// command, and so holds itself as well.
@@ -70,7 +78,10 @@ type Spec struct {
 	Hostname string `json:"hostname,omitempty"`
 	// ScratchSize is the size in bytes of each private tmpfs (/tmp,
 	// /var/tmp and /dev/shm) on Linux. Zero means 1 GiB, and a negative
-	// size is an error.
+	// size is an error. Nothing else the sandbox can write is a tmpfs, since
+	// the rest of /dev is read-only. It bounds files only: memfd_create and
+	// anonymous shared memory are not files on those tmpfs, and only a
+	// delegated cgroup's memory.max (Cmd.CgroupFD) bounds them.
 	ScratchSize int64 `json:"scratch_size,omitempty"`
 }
 

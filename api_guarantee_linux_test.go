@@ -202,7 +202,7 @@ func TestAPICommandStartsNothingAndCopies(t *testing.T) {
 	if c.CgroupFD != -1 {
 		t.Errorf("CgroupFD = %d, want -1", c.CgroupFD)
 	}
-	if c.Env != nil || c.Stdin != nil || c.Stdout != nil || c.Stderr != nil || c.WaitDelay != 0 || c.Setpgid {
+	if c.Env != nil || c.Stdin != nil || c.Stdout != nil || c.Stderr != nil || c.WaitDelay != 0 {
 		t.Errorf("a new Cmd has options set: %+v", c)
 	}
 	if c.Pid() != 0 || c.Listeners() != nil {
@@ -345,7 +345,7 @@ func TestAPICmdMisuse(t *testing.T) {
 			t.Fatal(err)
 		}
 		var other bytes.Buffer
-		c.Stdout, c.Stderr, c.Env, c.Setpgid, c.WaitDelay, c.CgroupFD = &other, &other, []string{"X=1"}, true, time.Hour, 999999
+		c.Stdout, c.Stderr, c.Env, c.WaitDelay, c.CgroupFD = &other, &other, []string{"X=1"}, time.Hour, 999999
 		if err := c.Wait(); err != nil {
 			t.Fatal(err)
 		}
@@ -1108,10 +1108,10 @@ func TestAPIMacOSFieldsIgnored(t *testing.T) {
 	escRun(t, Spec{Home: t.TempDir(), Services: []Service{"fonts", "anything"}, BroadLoopback: true}, "env")
 }
 
-// Setpgid: the sandbox is a process group, and signalling it ends it.
-func TestAPISetpgid(t *testing.T) {
+// Process group: the sandbox is always a process group of its own, and
+// signalling it ends it.
+func TestAPIProcessGroup(t *testing.T) {
 	c, _, _ := escCmd(t, t.Context(), Spec{}, "esc", "hold")
-	c.Setpgid = true
 	if err := c.Start(); err != nil {
 		t.Fatal(err)
 	}

@@ -30,6 +30,17 @@ type run struct {
 	lifeline  *os.File
 	sent      <-chan error
 	listeners []net.Listener
+	// tty is the terminal whose foreground the sandbox took, if any.
+	tty *terminal
+}
+
+// giveBackTerminal returns the terminal's foreground to the caller's process
+// group, once the sandbox, whose group id is its bubblewrap's pid, has ended.
+func (r *run) giveBackTerminal(sandboxPgrp int) {
+	if r.tty != nil {
+		r.tty.restore(sandboxPgrp)
+		r.tty = nil
+	}
 }
 
 // resources maps each Resource to its Linux number.
@@ -225,17 +236,31 @@ func (c *Cmd) Start() error {
 	// No Pdeathsig, and no --die-with-parent, which is the same call made
 	// in bubblewrap: it fires when the OS thread that started bubblewrap
 	// exits, and a Go server's threads come and go. The lifeline does it.
-	if c.Setpgid || c.CgroupFD > 0 {
-		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: c.Setpgid, UseCgroupFD: c.CgroupFD > 0, CgroupFD: max(c.CgroupFD, 0)}
+	// A process group of its own, always, and the caller's session still.
+	// The filter allows kill, tgkill and setpriority, so a sandbox that
+	// shared its caller's group could signal and renice the caller and
+	// everything else in it, through kill(0, ...) and setpriority(PRIO_PGRP).
+	// The kernel allows both across a pid namespace, since the uid is the same.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, UseCgroupFD: c.CgroupFD > 0, CgroupFD: max(c.CgroupFD, 0)}
+	// A background group is stopped when it reads the caller's terminal, so
+	// an interactive command gets the foreground until Wait gives it back.
+	tty := foregroundTerminal(c.Stdin)
+	if tty != nil {
+		cmd.SysProcAttr.Foreground, cmd.SysProcAttr.Ctty = true, tty.fd
 	}
 	if err := cmd.Start(); err != nil {
+		if tty != nil {
+			tty.restore(0)
+		}
 		return fmt.Errorf("start bubblewrap: %w", err)
 	}
+	c.run.tty = tty
 	sent := l.send()
 	// From here the sandbox may be running, so a failure kills it.
 	fail := func(err error) error {
 		_ = cmd.Process.Kill()
 		waitErr := cmd.Wait()
+		c.run.giveBackTerminal(cmd.Process.Pid)
 		<-sent
 		var ee *exec.ExitError
 		if errors.As(waitErr, &ee) {
@@ -274,6 +299,7 @@ func (c *Cmd) Wait() error {
 	}
 	c.run.waited = true
 	err := c.run.cmd.Wait()
+	c.run.giveBackTerminal(c.run.cmd.Process.Pid)
 	_ = c.run.lifeline.Close()
 	// A write fails only when bubblewrap exited before it read everything,
 	// which its status already says.
@@ -659,6 +685,11 @@ func newLaunch(spec Spec, acct account, stageFiles []*os.File) (*launch, error) 
 		}
 		args = append(args, "--perms", "0444", "--ro-bind-data", fd, f.path)
 	}
+	// /dev is a tmpfs bubblewrap makes with no size limit, which a sandbox
+	// could fill past ScratchSize. Nothing in it is meant to be written but
+	// /dev/shm and /dev/pts, which are mounts of their own, and the device
+	// nodes, which the remount leaves alone.
+	readOnly = append(readOnly, "/dev")
 	for _, c := range readOnly {
 		args = append(args, "--remount-ro", c)
 	}

@@ -627,7 +627,6 @@ func TestCmdOptions(t *testing.T) {
 	if c.CgroupFD != -1 {
 		t.Errorf("CgroupFD = %d, want -1", c.CgroupFD)
 	}
-	c.Setpgid = true
 	c.WaitDelay = 3 * time.Second
 	c.CgroupFD = 0 // none, as -1 is
 	if err := c.Start(); err != nil {
@@ -648,17 +647,6 @@ func TestCmdOptions(t *testing.T) {
 	if !gone(pid) {
 		t.Error("pid 1 stayed")
 	}
-
-	// Without Setpgid, bubblewrap stays in the caller's group.
-	c, _, _ = testCmd(t, t.Context(), Spec{}, "sleep")
-	if err := c.Start(); err != nil {
-		t.Fatal(err)
-	}
-	if pgid, err := unix.Getpgid(c.run.cmd.Process.Pid); err != nil || pgid != unix.Getpgrp() {
-		t.Errorf("process group = %d, %v, want the caller's %d", pgid, err, unix.Getpgrp())
-	}
-	_ = c.run.lifeline.Close()
-	_ = c.Wait()
 
 	// A descriptor that is no cgroup is passed to the kernel, which refuses
 	// it, so the option is used.

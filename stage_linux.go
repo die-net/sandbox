@@ -120,7 +120,9 @@ func Stage() (int, bool) {
 // as the reaper, which leaves the whole of pid 1 in the new namespace and
 // none in bubblewrap's.
 //
-// It also gives up every capability and sets no_new_privs before that exec.
+// It also joins a new, empty session keyring, since the caller's would
+// otherwise be inherited, and a key in it is readable by the same uid. And it
+// gives up every capability and sets no_new_privs before that exec.
 // Both belong to a thread, not a process, and bubblewrap raised the
 // capabilities as ambient ones before it started this binary, so every
 // thread the Go runtime made holds them. Dropping them on any thread but the
@@ -135,6 +137,9 @@ func firstStage() error {
 	}
 	if err := unix.Mount("", "/", "", unix.MS_REC|unix.MS_PRIVATE, ""); err != nil {
 		return fmt.Errorf("make mounts private: %w", err)
+	}
+	if err := joinAnonymousSessionKeyring(); err != nil {
+		return err
 	}
 	if err := dropCapabilities(); err != nil {
 		return err
@@ -362,6 +367,23 @@ func watchLifeline() {
 			os.Exit(128 + int(unix.SIGKILL))
 		}
 	}
+}
+
+// joinAnonymousSessionKeyring makes the calling thread's session keyring a
+// new, empty, anonymous one, which the reaper and the command inherit from the
+// thread that execs. Without it they share the caller's session keyring, which
+// may hold Kerberos tickets or tokens, and the kernel's permission check on a
+// key looks only at the uid, which the sandbox keeps. strict and nested refuse
+// keyctl, but open does not. A kernel with no key support has nothing to
+// share. A host filter that refuses keyctl, as Docker's does with EPERM,
+// refuses it to the command as well.
+func joinAnonymousSessionKeyring() error {
+	const keyctlJoinSessionKeyring = 1
+	_, _, errno := unix.Syscall(unix.SYS_KEYCTL, keyctlJoinSessionKeyring, 0, 0)
+	if errno != 0 && errno != unix.ENOSYS && errno != unix.EPERM {
+		return fmt.Errorf("join a new session keyring: %w", errno)
+	}
+	return nil
 }
 
 // dropCapabilities empties the calling thread's bounding set and clears all

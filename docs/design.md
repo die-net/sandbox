@@ -49,7 +49,7 @@ For trmnl, the parent brokers egress: each build gets a proxy listener and no ot
 | HOME, TMPDIR, XDG_* set to the sandbox's own | `commandEnv` | Generic and portable. Always set by `Start` over `Cmd.Env`, as `commandEnv` does today (read), plus `XDG_RUNTIME_DIR`, which it misses, and on macOS `CFFIXED_USER_HOME`, since Cocoa resolves `~/Library` from that and not from `$HOME` (spikes.md M2). An inherited `HOME` would point into a covered tmpfs. The caller sets anything else on `Cmd.Env` (trmnl's `PATH`, `GEM_HOME`, `GEM_PATH`). |
 | `--legwork-sandbox-stage`, `--legwork-sandbox-reaper`, `/dev/legwork-sandbox` | `sandbox_linux.go:28-30` | Rename |
 | `--hostname legwork`, fallback account `legwork` | `sandbox_linux.go:357, 547` | `Spec.Hostname` (Linux only); fallback becomes `sandbox` |
-| No `--new-session` | `sandbox_linux.go` | Driven by legwork's hub check, but a correct default: the filter refuses `TIOCSTI`. `Cmd` has no session option, and trmnl uses `Setpgid`. |
+| No `--new-session` | `sandbox_linux.go` | Driven by legwork's hub check, but a correct default: the filter refuses `TIOCSTI`. `Cmd` has no session option. Every sandbox gets a process group of its own instead (4.1). |
 | `Run`: own stdio, `os.Environ()`, `os.Getwd()`, process-wide `signal.Notify`, `Pdeathsig` on bwrap (read: `sandbox_linux.go:224`) | `Run` | Fine in a dedicated process. Wrong inside a server, where `Pdeathsig` fires when the forking OS thread exits, not the process. Hence `Command` (4.1, 4.4). |
 | Reaper starts the command with only fds 0-2 | `reaperStage` | Gap. one-binary's children receive their job on an inherited socketpair. |
 | `Run`/`Stage` return `ErrUnsupported` off Linux | `sandbox_other.go` | Replaced by the Seatbelt backend |
@@ -72,11 +72,13 @@ For trmnl, the parent brokers egress: each build gets a proxy listener and no ot
 | `/etc` links into covered dirs rebound | ✓ | | `/etc` is itself a link to `/private/etc`. Test reads of `/etc/localtime` and `/etc/hosts`. |
 | Path and link rules: no link in home or `write`; a link followed only outside writable dirs; a missing cover inside a writable dir aborts; no mount inside a writable dir; cwd must be shown | ✓ | passes real paths | the same checks in the library before the profile is written. Test that `subpath` on the real path holds. |
 | A home per thread; `work` beside the CLI home; `read`/`write` refused if they overlap state | | ✓ | same, in legwork |
-| Scratch tmpfs 1 GiB | ✓ default, `ScratchSize` | | none. `TMPDIR` is in `Home`, with no size cap beyond `RLIMIT_FSIZE` per file. Report. |
+| Scratch tmpfs 1 GiB; `/dev` read-only apart from `/dev/shm` | ✓ default, `ScratchSize`. memfd and anonymous shared memory are not bounded by it, only by a delegated cgroup's `memory.max` | | none. `TMPDIR` is in `Home`, with no size cap beyond `RLIMIT_FSIZE` per file. Report. |
 | One-entry passwd/group | ✓ | | none. Directory Services lists every account through `opendirectoryd`. Report, and test what `getpwnam` needs. |
 | First stage: private mounts, caps dropped on the exec'ing thread, no_new_privs, pid 1 re-exec, undumpable | ✓ | | no capabilities to drop. Test that a setuid binary can't escape the profile, such as `sudo` with a cached ticket from the admin's terminal. |
 | Filter: allowlist, arg checks, ENOSYS default, foreign ABIs refused, low-32-bit checks, TSYNC result check | ✓ | | none at the syscall level. Seatbelt filters operations. Whether `syscall-unix` rules work under `sandbox-exec` is untested. |
 | Kernel level per child | | ✓ (`kernel:`) | one profile for every level, never weaker than asked |
+| Own process group, foreground of a terminal on `Stdin`; no signals or priority changes reach the caller's group | ✓ | | the stage sets the process group (4.4). Deny `signal` outside the sandbox, as in the namespaces row, and test `kill(0)` from inside. |
+| New anonymous session keyring (the caller's is unreadable) | ✓ stage joins one before the filter, at every level | | no kernel keyrings. The keychain is the equivalent. Test that it is unreachable. |
 | Caller's session kept, `TIOCSTI`/`TIOCLINUX` refused | ✓ | relies on it | `TIOCSTI` is open, and the admin's ptys share the uid. Deny opening `/dev/ttys*` and `/dev/ptmx` beyond inherited descriptors, and deny `file-ioctl` on ttys where the profile language allows it. Test injecting into another terminal of the same user. |
 | Stage runs the caller binary's `init` with `CAP_SYS_ADMIN` (nested userns) | documented | ✓ "no `init`" rule from one-binary's Code layout | n/a: the stage runs outside the profile, as the caller |
 | Network namespace, proxy listener handed out | ✓ mechanism (new) | ✓ proxy, allowlist, logging | parent-bound port allowed by number. `BroadLoopback` only by opt-in (4.3). Test that other ports refuse. |
@@ -236,7 +238,7 @@ type Spec struct {
     Files    []*os.File  // fds 3, 4, ... in the command
     Rlimits  []Rlimit
     Hostname    string   // Linux only
-    ScratchSize int64    // Linux only: each private tmpfs; 0 means 1 GiB
+    ScratchSize int64    // Linux only: each private tmpfs; 0 means 1 GiB. Does not bound memfd or anonymous shared memory
 }
 
 func Probe() (Report, error) // tries the backend; an error means no sandbox at all
@@ -259,7 +261,6 @@ type Cmd struct {
     Stderr    io.Writer
     Env       []string      // nil means empty, never os.Environ(); Start sets HOME, TMPDIR, XDG_* (XDG_RUNTIME_DIR included) and, on macOS, CFFIXED_USER_HOME over it
     WaitDelay time.Duration // as exec.Cmd's
-    Setpgid   bool          // new process group (macOS teardown)
     CgroupFD  int           // Linux: start in this cgroup; -1 none
     // unexported: the exec.Cmd, ExtraFiles, SysProcAttr, Path
 }
@@ -284,7 +285,11 @@ const SelfPath = ... // this binary as the command names it: /dev/sandbox-stage 
   - A server that forgets to set it passes on nothing, so none of its tokens leak. `Run`, the standalone form, passes `os.Environ()` explicitly.
   - Rejected: making every listener address known before `Command`. Linux listeners are bound inside the namespace, so the backends would diverge. Also rejected: a `SANDBOX_LISTEN_n` variable for the command to translate, since legwork execs its CLI directly and nothing would translate it.
 - **The uid.** `Command` and `Start` run as the sandbox's uid. They resolve paths, open bind sources by fd, read homes and write the passwd entry in the calling process, and switching uid at exec would leave all of that done as root. So `Command` refuses euid 0. There's no `Credential` option at all. legwork's root launcher switches uid in its own child, then calls the library, which matches one-binary's Root.
-- **`Cmd` wraps `exec.Cmd` instead of embedding it.** The `--args` body bakes in descriptor numbers, so a caller changing `ExtraFiles`, `SysProcAttr` or `Path` would break the sandbox or drop its parent-death handling. The fields above are trmnl's and legwork's whole need: stdio, `Env`, cancellation through `ctx` plus `WaitDelay`, a process group, and a cgroup. `Start` checks them, then does the path work. Sessions stay unset (2, "No `--new-session`").
+- **`Cmd` wraps `exec.Cmd` instead of embedding it.** The `--args` body bakes in descriptor numbers, so a caller changing `ExtraFiles`, `SysProcAttr` or `Path` would break the sandbox or drop its parent-death handling. The fields above are trmnl's and legwork's whole need: stdio, `Env`, cancellation through `ctx` plus `WaitDelay`, and a cgroup. `Start` checks them, then does the path work. Sessions stay unset (2, "No `--new-session`").
+- **Process group.** `Start` always starts bubblewrap in a process group of its own and keeps the caller's session. There is no field for it. The filter allows `kill`, `tgkill` and `setpriority`, and the kernel lets a process in a pid namespace signal or renice a group outside it when the uid matches. A sandbox that shared its caller's group could end the caller and its siblings with `kill(0, ...)`, or lower their priority with `setpriority(PRIO_PGRP, 0, ...)`. The review that found this reproduced both. A group of its own has no one else in it.
+  - When `Stdin` is a terminal whose foreground group is the caller's (which is what `Run` passes), `Start` makes the sandbox's group the foreground one, so a command that reads the terminal is not stopped by `SIGTTIN`. `Wait` gives the foreground back, if the sandbox still holds it, with `SIGTTOU` blocked on the calling thread for the call.
+  - Ctrl-C then goes to the sandbox's group, not the caller's. That is fine for `Run`: bubblewrap ends, and pid 1 follows it.
+- **Descriptors handed in.** An `*os.File` in `Spec.Files`, or as `Stdin`, `Stdout` or `Stderr`, gives the command whatever the underlying object's owner and mode allow the sandbox's uid, whatever mode the caller opened it in and whatever the sandbox covers. `/proc/self/fd/N` reopens a file with any mode the object allows. The review reopened a read-only file under a covered directory for writing, and truncated an append-only log. This is how Unix descriptors work, so it is documented, not prevented. A socket cannot be reopened, and a pipe reopens only as another end of the same pipe. Pass those where it matters.
 - `Services` is the one knob that only means something on one backend. A browser needs Mach services legwork's CLIs don't, so it's a list of library-defined, reviewed groups, not free-form names. Adding a group is a reviewed library change, as sandbox.md requires for a system call.
 
 ### 4.2 How `Spec` maps onto each backend
@@ -575,7 +580,7 @@ The container fixes relax the outer layer just enough for the inner one, which t
      - `Services: [fonts, ...]`
      - `Rlimits`: `CPU`, `NOFILE`, `FSIZE`
    - On the returned `Cmd` it sets `Env`: `buildEnv` plus `HTTP(S)_PROXY` from `ListenAddrs()`, the resolved `PATH`/`GEM_HOME`/`GEM_PATH`, `MOZ_HEADLESS=1`, `MOZ_CRASHREPORTER_DISABLE=1`, `MOZ_ASSUME_USER_NS=0` on Linux, `MOZ_DISABLE_CONTENT_SANDBOX=1`, `MOZ_DISABLE_SOCKET_PROCESS_SANDBOX=1` and `MOZ_DISABLE_RDD_SANDBOX=1` on macOS, and the `FIELD_*` values.
-   - It also sets `Stdout`/`Stderr`, `WaitDelay`, and `CgroupFD` when a cgroup is delegated, or `Setpgid` and the watchdog otherwise. Then it serves `renderproxy` on the listener, waits, and reads the outputs through `os.Root`.
+   - It also sets `Stdout`/`Stderr`, `WaitDelay`, and `CgroupFD` when a cgroup is delegated, or the watchdog otherwise. Then it serves `renderproxy` on the listener, waits, and reads the outputs through `os.Root`.
 5. Ship a systemd unit with `Delegate=yes`, a launchd plist, and install docs per platform (3.3).
 6. Keep `compose.yaml` as the operator-mode reference (5.1). Add a `--isolation=operator` flag (name to pick) to the render side. Then it runs `Check(ctx, nil, want)` at startup, reports the results to the server, and refuses only on the no-boundary findings in 5.1.
 
