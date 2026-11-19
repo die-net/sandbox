@@ -86,9 +86,11 @@ const maxMessage = 1 << 16
 // and reports false otherwise. A program that uses this package calls it
 // first in main, before it reads its arguments.
 func Stage() (int, bool) {
-	// A later --sandbox-check marker dispatches here, ahead of the stage
-	// test below, so that a program started with it runs the checks and
+	// The check child is started with checkArg, and runs the checks and
 	// nothing else.
+	if len(os.Args) > 1 && os.Args[1] == checkArg {
+		return checkStage(), true
+	}
 	if len(os.Args) < 4 || (os.Args[1] != stageArg && os.Args[1] != reaperArg) || os.Args[2] != "--" {
 		return 0, false
 	}

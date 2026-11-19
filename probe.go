@@ -100,9 +100,15 @@ func firstBlock(f probeFacts) Result {
 	container := f.Container != "" && f.Container != "systemd-unit"
 	switch {
 	case f.Sysctl["kernel.apparmor_restrict_unprivileged_userns"] == "1":
+		profile, name, err := apparmorProfile(f.Self, f.Bwrap)
+		if err != nil {
+			return fail("probe.apparmor-userns", "AppArmor restricts unprivileged user namespaces (kernel.apparmor_restrict_unprivileged_userns=1), and bubblewrap failed: %s\n"+
+				"No profile can be generated: %v", f.TryErr, err)
+		}
 		return fail("probe.apparmor-userns", "AppArmor restricts unprivileged user namespaces (kernel.apparmor_restrict_unprivileged_userns=1), and bubblewrap failed: %s\n"+
-			"Fix: save this as /etc/apparmor.d/sandbox, then run: sudo apparmor_parser -r /etc/apparmor.d/sandbox\n\n%s",
-			f.TryErr, apparmorProfile(f.Bwrap, f.Self))
+			"Fix: save this as /etc/apparmor.d/%s, then run: sudo apparmor_parser -r /etc/apparmor.d/%s\n"+
+			"It grants user namespaces to bubblewrap only when %s runs it. It gives no other process any.\n\n%s",
+			f.TryErr, name, name, f.Self, profile)
 	case f.Sysctl["kernel.unprivileged_userns_clone"] == "0":
 		return fail("probe.userns-sysctl", "kernel.unprivileged_userns_clone is 0, which turns user namespaces off for ordinary users. Fix: sudo sysctl -w kernel.unprivileged_userns_clone=1, and put it in /etc/sysctl.d/ to keep it")
 	case f.Sysctl["user.max_user_namespaces"] == "0":
@@ -130,27 +136,40 @@ func masked(mounts []mount) bool {
 	return false
 }
 
-// apparmorProfile writes an AppArmor profile that lets each binary create
-// user namespaces, as Ubuntu 24.04 and later require. A path with characters
-// the profile syntax would need escaped is left out.
-func apparmorProfile(paths ...string) string {
-	var b strings.Builder
-	b.WriteString("abi <abi/4.0>,\ninclude <tunables/global>\n")
-	seen := map[string]bool{}
-	for _, p := range paths {
-		if p == "" || seen[p] || !filepath.IsAbs(p) || strings.ContainsAny(p, "\"\\\n{}[]?*^,;") {
-			continue
+// apparmorProfile writes an AppArmor profile for the binary at self, with a
+// child profile for bubblewrap at bwrap that allows user namespaces, and
+// returns it with the name to save it under. Ubuntu 24.04 and later need it.
+// A profile on bwrap itself would give every process on the host user
+// namespaces through it, so bwrap gets them only when self runs it.
+//
+// UNVERIFIED on a real Ubuntu: the syntax below, and that a child profile
+// of a flags=(unconfined) parent is entered through the cx rule, come from
+// the design and from reading apparmor.d(5), not from loading it. Run
+// apparmor_parser -r on it and start a sandbox on Ubuntu 24.04 before
+// trusting it.
+func apparmorProfile(self, bwrap string) (profile, name string, err error) {
+	for _, p := range []string{self, bwrap} {
+		if !filepath.IsAbs(p) || strings.ContainsAny(p, "\"\\\n{}[]?*^,;@$ ") {
+			return "", "", fmt.Errorf("the path %q is empty, relative, or has a character a profile would need escaped", p)
 		}
-		seen[p] = true
-		name := "sandbox-" + strings.Map(func(r rune) rune {
-			if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' {
-				return r
-			}
-			return '-'
-		}, strings.Trim(p, "/"))
-		fmt.Fprintf(&b, "\nprofile %s %q flags=(unconfined) {\n  userns,\n\n  include if exists <local/%s>\n}\n", name, p, name)
 	}
-	return b.String()
+	name = "sandbox-" + strings.Map(func(r rune) rune {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' {
+			return r
+		}
+		return '-'
+	}, strings.Trim(self, "/"))
+	return fmt.Sprintf(`abi <abi/4.0>,
+include <tunables/global>
+
+profile %[1]s %[2]s flags=(unconfined) {
+  %[3]s cx -> bwrap,
+
+  profile bwrap %[3]s flags=(unconfined) {
+    userns,
+  }
+}
+`, name, self, bwrap), name, nil
 }
 
 // containerFacts is what detectContainer reads.

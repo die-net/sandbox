@@ -90,13 +90,17 @@ const checkArg = "--sandbox-check"
 // checkFailed is the exit status of a check child that could not run its suite.
 const checkFailed = 125
 
-// resultFD is the descriptor on which the check child writes its results.
-const resultFD = 3
+// The check child's descriptors: it writes its results to resultFD and reads
+// its settings from payloadFD, so nothing about the Spec is in its argv.
+const (
+	resultFD  = 3
+	payloadFD = 4
+)
 
 // netTimeout bounds each network attempt, so a check run never hangs.
 const netTimeout = 2 * time.Second
 
-// checkInput is what the runner hands the child, as JSON in argv[2].
+// checkInput is what the runner hands the child, as JSON on payloadFD.
 type checkInput struct {
 	Want Expect `json:"want"`
 	Spec *Spec  `json:"spec,omitempty"`
@@ -125,6 +129,19 @@ func Check(ctx context.Context, spec *Spec, want Expect) ([]Result, error) {
 		return nil, fmt.Errorf("check: %w", err)
 	}
 	defer r.Close()
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		w.Close()
+		return nil, fmt.Errorf("check: %w", err)
+	}
+	defer pr.Close()
+	// The child's end of the payload pipe may close early, so a failed write
+	// is the child's own error to report. The write runs alongside the start,
+	// since a payload larger than the pipe waits for the child to read.
+	go func() {
+		defer pw.Close()
+		_, _ = pw.Write(payload)
+	}()
 	var stderr bytes.Buffer
 	var wait func() error
 	if spec == nil {
@@ -133,8 +150,8 @@ func Check(ctx context.Context, spec *Spec, want Expect) ([]Result, error) {
 			w.Close()
 			return nil, fmt.Errorf("check: find this binary: %w", err)
 		}
-		cmd := exec.CommandContext(ctx, exe, checkArg, string(payload))
-		cmd.ExtraFiles = []*os.File{w}
+		cmd := exec.CommandContext(ctx, exe, checkArg)
+		cmd.ExtraFiles = []*os.File{w, pr}
 		cmd.Stderr = &stderr
 		cmd.WaitDelay = netTimeout
 		if err := cmd.Start(); err != nil {
@@ -142,11 +159,12 @@ func Check(ctx context.Context, spec *Spec, want Expect) ([]Result, error) {
 			return nil, fmt.Errorf("check: start the child: %w", err)
 		}
 		wait = cmd.Wait
-	} else if wait, err = startInSandbox(ctx, *spec, string(payload), w, &stderr); err != nil {
+	} else if wait, err = startInSandbox(ctx, *spec, w, pr, &stderr); err != nil {
 		w.Close()
 		return nil, fmt.Errorf("check: start the sandbox: %w", err)
 	}
 	w.Close() // the child holds the only write end now
+	pr.Close()
 
 	var results []Result
 	sc := bufio.NewScanner(r)
@@ -172,14 +190,13 @@ func Check(ctx context.Context, spec *Spec, want Expect) ([]Result, error) {
 // checkStage is the check child's entry point, which Stage calls when
 // os.Args[1] is checkArg. It returns the exit status.
 func checkStage() int {
-	if len(os.Args) < 3 {
-		return checkFailed
-	}
-	if code, ok := grandchild(os.Args[2:]); ok {
-		return code
+	if len(os.Args) >= 3 {
+		if code, ok := grandchild(os.Args[2:]); ok {
+			return code
+		}
 	}
 	var in checkInput
-	if err := json.Unmarshal([]byte(os.Args[2]), &in); err != nil {
+	if err := json.NewDecoder(os.NewFile(payloadFD, "payload")).Decode(&in); err != nil {
 		fmt.Fprintf(os.Stderr, "sandbox check: %v\n", err)
 		return checkFailed
 	}

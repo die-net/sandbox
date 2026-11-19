@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -38,7 +39,9 @@ func Probe() (Report, error) {
 		}
 		f.Version = runOutput(path, "--version")
 	}
-	f.Self, _ = os.Executable()
+	if exe, err := os.Executable(); err == nil {
+		f.Self, _ = filepath.EvalSymlinks(exe)
+	}
 	rep.Container = gatherContainer()
 	f.Container = rep.Container
 	// The trial needs a working bubblewrap, and is skipped when diagnose

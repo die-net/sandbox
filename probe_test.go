@@ -77,8 +77,8 @@ func TestDiagnose(t *testing.T) {
 		{"old", mod(func(f *probeFacts) { f.Version = "bubblewrap 0.4.1" }), "probe.bubblewrap", "older than 0.8"},
 		{"no version", mod(func(f *probeFacts) { f.Version = "" }), "probe.bubblewrap", "no version"},
 		{"no filter", mod(func(f *probeFacts) { f.Kernels = nil }), "probe.seccomp", "architecture"},
-		{"apparmor", mod(func(f *probeFacts) { f.Sysctl["kernel.apparmor_restrict_unprivileged_userns"] = "1" }), "probe.apparmor-userns", `profile sandbox-usr-bin-bwrap "/usr/bin/bwrap" flags=(unconfined)`},
-		{"apparmor names this binary", mod(func(f *probeFacts) { f.Sysctl["kernel.apparmor_restrict_unprivileged_userns"] = "1" }), "probe.apparmor-userns", `"/opt/app/server"`},
+		{"apparmor", mod(func(f *probeFacts) { f.Sysctl["kernel.apparmor_restrict_unprivileged_userns"] = "1" }), "probe.apparmor-userns", `/usr/bin/bwrap cx -> bwrap,`},
+		{"apparmor names this binary", mod(func(f *probeFacts) { f.Sysctl["kernel.apparmor_restrict_unprivileged_userns"] = "1" }), "probe.apparmor-userns", "profile sandbox-opt-app-server /opt/app/server flags=(unconfined)"},
 		{"sysctl clone", mod(func(f *probeFacts) { f.Sysctl["kernel.unprivileged_userns_clone"] = "0" }), "probe.userns-sysctl", "unprivileged_userns_clone=1"},
 		{"sysctl max", mod(func(f *probeFacts) { f.Sysctl["user.max_user_namespaces"] = "0" }), "probe.userns-sysctl", "max_user_namespaces="},
 		{"docker seccomp", mod(func(f *probeFacts) {
@@ -140,13 +140,34 @@ func TestMasked(t *testing.T) {
 }
 
 func TestApparmorProfile(t *testing.T) {
-	p := apparmorProfile("/usr/bin/bwrap", "/usr/bin/bwrap", "/opt/my app/bin", "/bad\"path", "relative")
-	if strings.Count(p, "profile ") != 2 {
-		t.Errorf("want two profiles (one deduplicated, one with a space, two refused):\n%s", p)
+	p, name, err := apparmorProfile("/opt/app/server", "/usr/bin/bwrap")
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, s := range []string{"abi <abi/4.0>,", "userns,", `"/opt/my app/bin"`, "profile sandbox-opt-my-app-bin "} {
+	if name != "sandbox-opt-app-server" {
+		t.Errorf("name = %q", name)
+	}
+	for _, s := range []string{
+		"abi <abi/4.0>,",
+		"profile sandbox-opt-app-server /opt/app/server flags=(unconfined) {",
+		"/usr/bin/bwrap cx -> bwrap,",
+		"profile bwrap /usr/bin/bwrap flags=(unconfined) {\n    userns,",
+	} {
 		if !strings.Contains(p, s) {
 			t.Errorf("profile lacks %q:\n%s", s, p)
+		}
+	}
+	// userns is granted once, inside bwrap's child profile, which comes
+	// after this binary's profile opens: no top-level profile is for bwrap.
+	if strings.Count(p, "userns,") != 1 || strings.Index(p, "userns,") < strings.Index(p, "cx -> bwrap") {
+		t.Errorf("userns is not only in the child profile:\n%s", p)
+	}
+	if strings.Count(p, "\nprofile ") != 1 {
+		t.Errorf("want one top-level profile:\n%s", p)
+	}
+	for _, bad := range [][2]string{{"", "/usr/bin/bwrap"}, {"relative", "/usr/bin/bwrap"}, {"/opt/my app/x", "/usr/bin/bwrap"}, {"/bad\"path", "/usr/bin/bwrap"}, {"/opt/app/server", ""}} {
+		if _, _, err := apparmorProfile(bad[0], bad[1]); err == nil {
+			t.Errorf("accepted %q", bad)
 		}
 	}
 }

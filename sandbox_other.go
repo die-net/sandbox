@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"os"
 )
 
 // run is what a started Cmd holds, which is nothing where there is no
@@ -43,6 +44,8 @@ func Run(context.Context, Spec) (int, error) {
 // Stage reports that this process is not a sandbox stage, since none run off
 // Linux yet.
 func Stage() (int, bool) {
-	// A later --sandbox-check marker dispatches here, as on Linux.
+	if len(os.Args) > 1 && os.Args[1] == checkArg {
+		return checkStage(), true
+	}
 	return 0, false
 }

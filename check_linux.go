@@ -650,3 +650,8 @@ func parseGateway(r io.Reader) (string, error) {
 	}
 	return "", errors.New("no default route")
 }
+
+// selfInSandbox is this binary's path as a sandbox's command names it: the
+// copy Command binds in at stagePath, so the view needs no path to the
+// binary.
+func selfInSandbox() string { return stagePath }

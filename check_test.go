@@ -11,14 +11,6 @@ import (
 	"time"
 )
 
-// init stands in for the line Stage will have, which dispatches the check
-// marker to checkStage, until that line is merged. It runs before TestMain.
-func init() {
-	if len(os.Args) > 1 && os.Args[1] == checkArg {
-		os.Exit(checkStage())
-	}
-}
-
 // fakeProxy answers CONNECT to ok with 200 and anything else with 403.
 func fakeProxy(t *testing.T, ok string) string {
 	t.Helper()

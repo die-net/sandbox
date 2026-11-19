@@ -1,5 +1,3 @@
-//go:build sandbox_cmd
-
 package sandbox
 
 import (
@@ -9,14 +7,13 @@ import (
 )
 
 // startInSandbox starts the check child inside a sandbox built from spec,
-// with out as its descriptor 3, and returns a function that waits for it.
-// It is the one place Check touches Command: it assumes
-// Command(ctx, Spec) (*Cmd, error), Cmd.Start, Cmd.Wait, settable
-// Cmd.Stdout, Cmd.Stderr and Cmd.Env, Spec.Files for descriptors 3 and up,
-// and SelfPath, the binary as the command names it.
-func startInSandbox(ctx context.Context, spec Spec, payload string, out *os.File, stderr io.Writer) (func() error, error) {
-	spec.Command = []string{SelfPath, checkArg, payload}
-	spec.Files = append([]*os.File{out}, spec.Files...) // fd 3
+// and returns a function that waits for it. The child gets the results
+// descriptor and the payload descriptor as 3 and 4, then spec's own Files.
+// Its command is selfInSandbox, so the view needs no path to this binary on
+// Linux.
+func startInSandbox(ctx context.Context, spec Spec, out, payload *os.File, stderr io.Writer) (func() error, error) {
+	spec.Command = []string{selfInSandbox(), checkArg}
+	spec.Files = append([]*os.File{out, payload}, spec.Files...)
 	cmd, err := Command(ctx, spec)
 	if err != nil {
 		return nil, err
