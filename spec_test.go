@@ -15,7 +15,7 @@ func TestCovers(t *testing.T) {
 		paths, binds, want []string
 	}{
 		{"nested covers", []string{"/var", "/var/lib", "/home"}, nil, []string{"/home", "/var"}},
-		{"a prefix that is not a parent", []string{"/users/aaron", "/users/aaron/.config/legwork", "/users/aaronx"}, nil, []string{"/users/aaron", "/users/aaronx"}},
+		{"a prefix that is not a parent", []string{"/users/aaron", "/users/aaron/.config/app", "/users/aaronx"}, nil, []string{"/users/aaron", "/users/aaronx"}},
 		{"duplicates", []string{"/tmp", "/tmp"}, nil, []string{"/tmp"}},
 		{
 			"a cover inside a bind inside a cover",
@@ -26,7 +26,7 @@ func TestCovers(t *testing.T) {
 		// A home outside every default cover that is also a person's home,
 		// as the account's own is when it is the sandbox's. Covering it
 		// would make the bind on top of it read-only.
-		{"a cover that is the home", []string{"/srv/legwork", "/tmp"}, []string{"/srv/legwork"}, []string{"/tmp"}},
+		{"a cover that is the home", []string{"/srv/app", "/tmp"}, []string{"/srv/app"}, []string{"/tmp"}},
 		{"a cover inside a read path that is a cover", []string{"/opt/tool", "/opt/tool/secret"}, []string{"/opt/tool"}, []string{"/opt/tool/secret"}},
 	} {
 		if got := covers(tc.paths, tc.binds); !slices.Equal(got, tc.want) {
@@ -53,12 +53,12 @@ func fakeHost(dirs, files []string, links map[string]string) fstest.MapFS {
 
 func TestResolve(t *testing.T) {
 	host := fakeHost(
-		[]string{"/run/legwork", "/srv/legwork/state", "/home/agent/.claude/projects/a", "/data"},
-		[]string{"/srv/legwork/state/db"},
+		[]string{"/run/app", "/srv/app/state", "/home/agent/.claude/projects/a", "/data"},
+		[]string{"/srv/app/state/db"},
 		map[string]string{
 			"/var/run":                       "/run",
-			"/state":                         "../srv/legwork/state",
-			"/home/agent/.claude/projects/b": "/srv/legwork/state",
+			"/state":                         "../srv/app/state",
+			"/home/agent/.claude/projects/b": "/srv/app/state",
 			"/home/agent/data":               "/data",
 			"/loop":                          "/loop",
 		},
@@ -68,9 +68,9 @@ func TestResolve(t *testing.T) {
 		name, path, want string
 		missing, refused bool
 	}{
-		{name: "plain", path: "/run/legwork", want: "/run/legwork"},
-		{name: "an absolute link", path: "/var/run/legwork", want: "/run/legwork"},
-		{name: "a relative link", path: "/state/db", want: "/srv/legwork/state/db"},
+		{name: "plain", path: "/run/app", want: "/run/app"},
+		{name: "an absolute link", path: "/var/run/app", want: "/run/app"},
+		{name: "a relative link", path: "/state/db", want: "/srv/app/state/db"},
 		{name: "dot dot after a link", path: "/var/run/../srv", want: "/srv"},
 		{name: "inside a writable directory", path: "/home/agent/.claude/projects/a", want: "/home/agent/.claude/projects/a"},
 		{name: "a planted link", path: "/home/agent/.claude/projects/b", refused: true},
@@ -98,26 +98,26 @@ func TestResolve(t *testing.T) {
 func TestPrepare(t *testing.T) {
 	host := fakeHost(
 		[]string{
-			"/home", "/root", "/run", "/tmp", "/var", "/mnt", "/dev/shm", "/srv/legwork/state/servers/a",
+			"/home", "/root", "/run", "/tmp", "/var", "/mnt", "/dev/shm", "/srv/app/state/servers/a",
 			"/users/aaron", "/srv/agent/.claude/projects/a", "/srv/agent/.claude/projects/b",
 		},
 		[]string{"/var/lib/sgml-base/supercatalog"},
 		map[string]string{
 			"/var/run":          "/run",
-			"/state":            "/srv/legwork/state",
+			"/state":            "/srv/app/state",
 			"/etc/sgml/catalog": "/var/lib/sgml-base/supercatalog",
 		},
 	)
 	spec, err := prepare(Spec{
 		Command: []string{"true"},
-		Home:    "/srv/legwork/state/servers/a",
+		Home:    "/srv/app/state/servers/a",
 		Write:   []string{"/gone"},
 		Cover:   []string{"/state", "/var/run"},
 	}, []string{"/users/aaron"}, host, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"/dev/shm", "/home", "/mnt", "/root", "/run", "/srv/legwork/state", "/tmp", "/users/aaron", "/var"}
+	want := []string{"/dev/shm", "/home", "/mnt", "/root", "/run", "/srv/app/state", "/tmp", "/users/aaron", "/var"}
 	if !slices.Equal(spec.Cover, want) {
 		t.Errorf("Cover = %q, want %q", spec.Cover, want)
 	}
@@ -129,11 +129,11 @@ func TestPrepare(t *testing.T) {
 	}
 
 	for _, tc := range []struct{ dir, want string }{
-		{"/srv/legwork/state/servers/a", "/srv/legwork/state/servers/a"},
+		{"/srv/app/state/servers/a", "/srv/app/state/servers/a"},
 		{"/srv/agent", "/srv/agent"},
-		{"/state/servers/a", "/srv/legwork/state/servers/a"},
+		{"/state/servers/a", "/srv/app/state/servers/a"},
 	} {
-		spec, err := prepare(Spec{Command: []string{"true"}, Home: "/srv/legwork/state/servers/a", Dir: tc.dir}, nil, host, nil)
+		spec, err := prepare(Spec{Command: []string{"true"}, Home: "/srv/app/state/servers/a", Dir: tc.dir}, nil, host, nil)
 		if err != nil {
 			t.Errorf("dir %s: %v", tc.dir, err)
 		} else if spec.Dir != tc.want {
@@ -142,9 +142,9 @@ func TestPrepare(t *testing.T) {
 	}
 
 	planted := fakeHost(
-		[]string{"/home", "/srv/agent/.claude/projects", "/srv/legwork/state"},
+		[]string{"/home", "/srv/agent/.claude/projects", "/srv/app/state"},
 		nil,
-		map[string]string{"/srv/agent/.claude/projects/a": "/srv/legwork/state"},
+		map[string]string{"/srv/agent/.claude/projects/a": "/srv/app/state"},
 	)
 	moved := fakeHost([]string{"/home", "/srv/agent/.claude-moved/projects/a"}, nil, nil)
 	for _, tc := range []struct {
@@ -231,9 +231,9 @@ func TestMountCovers(t *testing.T) {
 		// Another filesystem entirely.
 		{dev: "0:99", root: "/", point: "/data", fsType: "ext4"},
 	}
-	got := mountCovers([]string{"/home", "/var/lib/legwork"}, []string{"/srv/agent"}, mounts)
+	got := mountCovers([]string{"/home", "/var/lib/app"}, []string{"/srv/agent"}, mounts)
 	slices.Sort(got)
-	want := []string{"/.zfs", "/export/homes", "/mnt/aaron", "/sysroot/ostree/deploy/os/var/lib/legwork"}
+	want := []string{"/.zfs", "/export/homes", "/mnt/aaron", "/sysroot/ostree/deploy/os/var/lib/app"}
 	if !slices.Equal(got, want) {
 		t.Errorf("mountCovers = %q, want %q", got, want)
 	}
@@ -244,7 +244,7 @@ func TestLinkedFiles(t *testing.T) {
 		nil,
 		[]string{
 			"/etc/hosts", "/run/systemd/resolve/stub-resolv.conf", "/run/systemd/resolve/resolv.conf",
-			"/var/lib/sgml-base/supercatalog", "/usr/lib/os-release", "/srv/legwork/config.yaml",
+			"/var/lib/sgml-base/supercatalog", "/usr/lib/os-release", "/srv/app/config.yaml",
 			"/home/aaron/notes", "/var/lib/state/db",
 		},
 		map[string]string{
@@ -252,7 +252,7 @@ func TestLinkedFiles(t *testing.T) {
 			"/etc/resolv.conf.old": "/run/systemd/resolve/stub-resolv.conf",
 			"/etc/sgml/catalog":    "/var/lib/sgml-base/supercatalog",
 			"/etc/os-release":      "/usr/lib/os-release",
-			"/etc/legwork":         "/srv/legwork/config.yaml",
+			"/etc/app":             "/srv/app/config.yaml",
 			"/etc/notes":           "/home/aaron/notes",
 			"/etc/state":           "/var/lib/state",
 			"/etc/missing":         "/run/missing",
@@ -261,7 +261,7 @@ func TestLinkedFiles(t *testing.T) {
 			"/etc/alternatives/catalog": "/etc/sgml/catalog",
 		},
 	)
-	got, err := linkedFiles(host, "etc", []string{"/home", "/run", "/var"}, []string{"/home/aaron", "/srv/legwork"})
+	got, err := linkedFiles(host, "etc", []string{"/home", "/run", "/var"}, []string{"/home/aaron", "/srv/app"})
 	if err != nil {
 		t.Fatal(err)
 	}

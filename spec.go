@@ -30,13 +30,13 @@ type Spec struct {
 	// lies outside every directory a sandbox can write.
 	Dir string `json:"dir,omitempty"`
 	// Write lists more host paths the command may write. A socket listed
-	// here is one the command may connect to, such as mcp.sock.
+	// here is one the command may connect to, such as a bridge socket.
 	Write []string `json:"write,omitempty"`
 	// Read lists host paths the command may read even where they lie under
-	// a covered path, such as a CLI's install directory under a home.
+	// a covered path, such as an install directory under a home.
 	Read []string `json:"read,omitempty"`
 	// Cover lists host paths to hide in addition to defaultCover, such as
-	// Legwork's own config and state.
+	// the caller's own config and state.
 	Cover []string `json:"cover,omitempty"`
 	// Kernel is how much of the kernel the command may reach. Empty means
 	// KernelStrict.
@@ -94,7 +94,7 @@ var defaultCover = []string{"/home", "/root", "/run", "/tmp", "/var", "/mnt", "/
 //
 // The home and the Write paths are what some sandbox can write, so a link
 // inside one of them may have been planted by an earlier run to point this
-// one at Legwork's data. They must have no link in them at all, and every
+// one at the caller's data. They must have no link in them at all, and every
 // other path is resolved without following a link inside one of them, a cover inside one of them that has gone missing is refused, since
 // a sandbox could have moved it away to uncover what it hid, and so is any
 // other path inside one of them, since bubblewrap would mount on it.
@@ -294,7 +294,7 @@ func resolve(host fs.FS, p string, writable []string) (string, error) {
 
 // linkedFiles returns the regular files that links under dir in host lead to
 // inside shared, the paths every sandbox has covered, and not inside private,
-// which holds Legwork's data, people's homes, and the sandbox's own
+// which holds the caller's data, people's homes, and the sandbox's own
 // directories. The view binds them back read-only, since a covered target
 // breaks the link: Ubuntu's /etc/resolv.conf leads into /run, and without it
 // a resolver falls back to a nameserver that is not there. A link to a

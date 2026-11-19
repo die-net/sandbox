@@ -20,18 +20,16 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
-
-	"github.com/die-net/legwork/internal/peer"
 )
 
 // testSpecVar carries a Spec, as JSON, to a run of the test binary that
 // starts a sandbox from it, so that withFakeHost can change the host for
 // that run alone first.
-const testSpecVar = "LEGWORK_SANDBOX_TEST_SPEC"
+const testSpecVar = "SANDBOX_TEST_SPEC"
 
 // fakeHostVar tells that run to make the host withFakeHost describes before
 // it starts the sandbox.
-const fakeHostVar = "LEGWORK_SANDBOX_TEST_FAKE_HOST"
+const fakeHostVar = "SANDBOX_TEST_FAKE_HOST"
 
 // fakeHomes are the secrets withFakeHost puts in each home. carol has no
 // passwd entry, as an account from a directory service would not.
@@ -43,15 +41,15 @@ const (
 	sharedLink = "/etc/skel/shared"
 	// privateLink leads from /etc to alice's secret.
 	privateLink = "/etc/skel/private"
-	// legworkDir stands for a directory the config names, such as
-	// Legwork's state, outside every default cover.
-	legworkDir = "/srv/legwork"
-	// legworkDB stands for the database in it.
-	legworkDB = legworkDir + "/legwork.db"
+	// appDir stands for a directory the config names, such as
+	// the caller's state, outside every default cover.
+	appDir = "/srv/app"
+	// appDB stands for the database in it.
+	appDB = appDir + "/app.db"
 	// outsidePath is where a sandbox tries to write outside its own
 	// directories, in a directory whose mode lets its account write.
 	outsidePath = "/srv/planted"
-	// lateMount is where TestLateMounts binds legworkDir once a sandbox is
+	// lateMount is where TestLateMounts binds appDir once a sandbox is
 	// running, and lateDone is the file it writes when it has.
 	lateMount = "/srv/late"
 	// coveredSock is a socket withFakeHost listens on outside every
@@ -161,7 +159,7 @@ func runFromEnv(body string) int {
 // /srv/users, each holding a secret, and binds a passwd over the host's that
 // lists alice and bob, so that two homes with one prefix make /srv/users a
 // directory of homes. Only one uid is mapped, so every account is the
-// account's own uid, which owns the homes. /srv also holds legworkDB,
+// account's own uid, which owns the homes. /srv also holds appDB,
 // and its own mode lets that account write outsidePath. It also mounts a
 // tmpfs on /mnt, which every sandbox covers, with a shared file, and one on
 // /etc/skel with sharedLink to that file and privateLink to alice's secret.
@@ -189,7 +187,7 @@ func withFakeHost() error {
 	if _, err := lc.Listen(context.Background(), "unix", coveredSock); err != nil {
 		return err
 	}
-	for _, p := range append(slices.Clone(fakeHomes), legworkDB) {
+	for _, p := range append(slices.Clone(fakeHomes), appDB) {
 		if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
 			return err
 		}
@@ -309,7 +307,7 @@ func startTrue(flags uintptr) error {
 }
 
 // dial connects to the unix socket at path, as the bridge connects to
-// mcp.sock, and waits for the other end to close it.
+// a socket, and waits for the other end to close it.
 func dial(path string) int {
 	var dialer net.Dialer
 	conn, err := dialer.DialContext(context.Background(), "unix", path)
@@ -326,7 +324,7 @@ func dial(path string) int {
 }
 
 // bindWhenStarted waits until a sandbox with home has written started there,
-// then binds legworkDir, which the sandbox covers, at lateMount, as someone
+// then binds appDir, which the sandbox covers, at lateMount, as someone
 // on the host might while a long-lived sandbox runs, and writes lateDone. A
 // sandbox that is not waiting for it never writes started.
 func bindWhenStarted(home string) {
@@ -336,7 +334,7 @@ func bindWhenStarted(home string) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if err := unix.Mount(legworkDir, lateMount, "", unix.MS_BIND, ""); err != nil {
+	if err := unix.Mount(appDir, lateMount, "", unix.MS_BIND, ""); err != nil {
 		fmt.Fprintln(os.Stderr, "bind late:", err)
 		return
 	}
@@ -346,7 +344,7 @@ func bindWhenStarted(home string) {
 }
 
 // lateMountHidden writes started in its working directory, which is its
-// home, waits for bindWhenStarted to bind legworkDir at lateMount, and
+// home, waits for bindWhenStarted to bind appDir at lateMount, and
 // reports, as its exit status, whether the database shows there.
 func lateMountHidden() int {
 	if err := os.WriteFile("started", nil, 0o600); err != nil {
@@ -363,12 +361,12 @@ func lateMountHidden() int {
 		}
 	}
 	code := 0
-	if _, err := os.ReadFile(filepath.Join(lateMount, filepath.Base(legworkDB))); !errors.Is(err, unix.ENOENT) {
+	if _, err := os.ReadFile(filepath.Join(lateMount, filepath.Base(appDB))); !errors.Is(err, unix.ENOENT) {
 		fmt.Fprintf(os.Stderr, "read the late bind: %v, want %v\n", err, unix.ENOENT)
 		code = 1
 	}
 	// pid 1's view of the files, which every process inside can try.
-	if _, err := os.ReadFile("/proc/1/root" + lateMount + "/" + filepath.Base(legworkDB)); err == nil {
+	if _, err := os.ReadFile("/proc/1/root" + lateMount + "/" + filepath.Base(appDB)); err == nil {
 		fmt.Fprintln(os.Stderr, "read the late bind through pid 1's root")
 		code = 1
 	}
@@ -418,7 +416,7 @@ func isolationChecks(body string) int {
 			return err
 		}},
 		{"read a path the config names", unix.ENOENT, func() error {
-			_, err := os.ReadFile(legworkDB)
+			_, err := os.ReadFile(appDB)
 			return err
 		}},
 		{"read another sandbox's directory", unix.ENOENT, func() error {
@@ -482,8 +480,8 @@ func isolationChecks(body string) int {
 			if err != nil && !errors.Is(err, unix.EACCES) {
 				return err
 			}
-			if strings.Contains(string(cmdline)+string(environ), legworkDir) {
-				return fmt.Errorf("pid 1's command line or environment names %s", legworkDir)
+			if strings.Contains(string(cmdline)+string(environ), appDir) {
+				return fmt.Errorf("pid 1's command line or environment names %s", appDir)
 			}
 			fds, err := os.ReadDir("/proc/1/fd")
 			if errors.Is(err, unix.EACCES) {
@@ -493,7 +491,7 @@ func isolationChecks(body string) int {
 				return err
 			}
 			for _, fd := range fds {
-				if target, err := os.Readlink("/proc/1/fd/" + fd.Name()); err == nil && within(target, legworkDir) {
+				if target, err := os.Readlink("/proc/1/fd/" + fd.Name()); err == nil && within(target, appDir) {
 					return fmt.Errorf("pid 1 holds %s", target)
 				}
 			}
@@ -566,7 +564,7 @@ type nestedTargets struct {
 
 // nestedTargetsVar carries a nestedTargets, as JSON, from startNested to
 // nestedMounts.
-const nestedTargetsVar = "LEGWORK_SANDBOX_TEST_NESTED"
+const nestedTargetsVar = "SANDBOX_TEST_NESTED"
 
 // startNested starts nestedMounts in a user and mount namespace of its own,
 // as software with a sandbox of its own would under kernel nested, and
@@ -793,57 +791,6 @@ func TestKernelLevels(t *testing.T) {
 	}
 }
 
-// TestBridgePeer checks that a process in a sandbox passes the hub's check
-// on the bridge: it reaches a socket under a covered path when the socket is
-// in Write, and it is in the session of the process the runner started.
-func TestBridgePeer(t *testing.T) {
-	// The test's temporary directory is under /tmp, which every sandbox
-	// covers, as /run covers mcp.sock.
-	sock := filepath.Join(t.TempDir(), "mcp.sock")
-	var lc net.ListenConfig
-	ln, err := lc.Listen(t.Context(), "unix", sock)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close()
-	spec := Spec{Home: t.TempDir(), Write: []string{sock}}
-	cmd := sandboxCmd(t, spec, false, "dial", sock)
-	// The runner starts the CLI as the leader of a new session.
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	var out strings.Builder
-	cmd.Stdout, cmd.Stderr = &out, &out
-	if err := cmd.Start(); err != nil {
-		t.Fatal(err)
-	}
-	leader, err := peer.Of(cmd.Process.Pid)
-	if err != nil {
-		t.Fatal(err)
-	}
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
-	conns := make(chan net.Conn, 1)
-	go func() {
-		if conn, err := ln.Accept(); err == nil {
-			conns <- conn
-		}
-	}()
-	select {
-	case conn := <-conns:
-		if err := peer.Check(conn, leader); err != nil {
-			t.Errorf("peer check: %v", err)
-		}
-		// Closing it ends the dialer.
-		if err := conn.Close(); err != nil {
-			t.Fatal(err)
-		}
-	case err := <-done:
-		t.Fatalf("the sandbox exited before connecting: %v: %s", err, out.String())
-	}
-	if err := <-done; err != nil {
-		t.Fatalf("sandbox: %v: %s", err, out.String())
-	}
-}
-
 // TestIsolation runs, under the strict and open kernel levels, the checks
 // from the doc's list that need no egress proxy: a path the config names,
 // another sandbox's directory, writing outside, a socket file and an
@@ -861,7 +808,7 @@ func TestIsolation(t *testing.T) {
 			// The test's temporary directory is under /tmp, which every
 			// sandbox covers.
 			sock := filepath.Join(t.TempDir(), "other.sock")
-			abstract := fmt.Sprintf("@legwork-sandbox-test-%d-%s", os.Getpid(), strings.ReplaceAll(t.Name(), "/", "-"))
+			abstract := fmt.Sprintf("@sandbox-test-%d-%s", os.Getpid(), strings.ReplaceAll(t.Name(), "/", "-"))
 			for _, addr := range []string{sock, abstract} {
 				ln, err := lc.Listen(t.Context(), "unix", addr)
 				if err != nil {
@@ -883,7 +830,7 @@ func TestIsolation(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			spec := Spec{Home: t.TempDir(), Cover: []string{legworkDir, coveredSock}, Kernel: level}
+			spec := Spec{Home: t.TempDir(), Cover: []string{appDir, coveredSock}, Kernel: level}
 			if code, out := runSandbox(t, spec, true, "isolation", string(body)); code != 0 {
 				t.Fatalf("a way out of the sandbox, exit %d: %s", code, out)
 			}
@@ -939,9 +886,9 @@ func TestRefusedLayouts(t *testing.T) {
 		plant func(t *testing.T, store string)
 	}{
 		{"a cover and a bind inside the home", func(*testing.T, string) {}},
-		{"a write path made a link to Legwork's state", func(t *testing.T, store string) {
+		{"a write path made a link to the caller's state", func(t *testing.T, store string) {
 			state := t.TempDir()
-			if err := os.WriteFile(filepath.Join(state, "legwork.db"), []byte("secret"), 0o600); err != nil {
+			if err := os.WriteFile(filepath.Join(state, "app.db"), []byte("secret"), 0o600); err != nil {
 				t.Fatal(err)
 			}
 			if err := os.RemoveAll(filepath.Join(store, "a")); err != nil {
@@ -999,7 +946,7 @@ func TestHomeCovered(t *testing.T) {
 // see, does not appear inside it.
 func TestLateMounts(t *testing.T) {
 	home := t.TempDir()
-	spec := Spec{Home: home, Cover: []string{legworkDir}}
+	spec := Spec{Home: home, Cover: []string{appDir}}
 	if code, out := runSandbox(t, spec, true, "late"); code != 0 {
 		t.Fatalf("a later mount reached the sandbox, exit %d: %s", code, out)
 	}

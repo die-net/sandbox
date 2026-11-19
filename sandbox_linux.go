@@ -25,9 +25,9 @@ import (
 // is a tmpfs bubblewrap makes, so the bind lands in no directory a sandbox
 // writes.
 const (
-	stageArg  = "--legwork-sandbox-stage"
-	reaperArg = "--legwork-sandbox-reaper"
-	stagePath = "/dev/legwork-sandbox"
+	stageArg  = "--sandbox-stage"
+	reaperArg = "--sandbox-reaper"
+	stagePath = "/dev/sandbox-stage"
 )
 
 // failed is the exit status of a sandbox whose stages could not set up, as
@@ -182,7 +182,7 @@ func Run(ctx context.Context, spec Spec) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	// The account Legwork runs as may come from a directory service that
+	// The account the program runs as may come from a directory service that
 	// /etc/passwd does not list.
 	if home, err := os.UserHomeDir(); err == nil {
 		homes = append(homes, home)
@@ -354,14 +354,14 @@ func newLaunch(spec Spec, acct account) (*launch, error) {
 	}
 	args := []string{
 		"--unshare-user", "--unshare-pid", "--unshare-ipc", "--unshare-uts",
-		"--die-with-parent", "--hostname", "legwork",
+		"--die-with-parent", "--hostname", "sandbox",
 		// The first stage is pid 1 and the reaper, so bubblewrap's own
 		// does not stay in the mount namespace the stage leaves.
 		"--as-pid-1",
 		// For the first stage alone, which drops them before the command.
 		"--cap-add", "CAP_SYS_ADMIN", "--cap-add", "CAP_SETPCAP",
-		// No --new-session: the hub checks that a bridge is in the session
-		// of the CLI the runner started, and the filter refuses TIOCSTI,
+		// No --new-session: a caller may check that a bridge is in the session
+		// of the command's starter, and the filter refuses TIOCSTI,
 		// which a new session would otherwise guard against.
 		"--ro-bind", "/", "/",
 	}
@@ -401,7 +401,7 @@ func newLaunch(spec Spec, acct account) (*launch, error) {
 	ops = append(ops,
 		mountOp{"/proc", bindMount, []string{"--proc", "/proc"}},
 		mountOp{"/dev", bindMount, []string{"--dev", "/dev"}},
-		mountOp{stagePath, bindMount, []string{"--ro-bind-fd", l.fd(os.NewFile(uintptr(self), "legwork")), stagePath}},
+		mountOp{stagePath, bindMount, []string{"--ro-bind-fd", l.fd(os.NewFile(uintptr(self), "sandbox")), stagePath}},
 	)
 	for _, b := range []struct {
 		paths []string
@@ -458,7 +458,7 @@ func newLaunch(spec Spec, acct account) (*launch, error) {
 
 // openNoLinks opens path, which prepare resolved, for bubblewrap to bind
 // from, refusing a link anywhere in it. A link found here was put there
-// since prepare looked, and following it could bind Legwork's data in the
+// since prepare looked, and following it could bind the caller's data in the
 // place of what was meant.
 func openNoLinks(path string) (*os.File, error) {
 	fd, err := unix.Openat2(unix.AT_FDCWD, path, &unix.OpenHow{
@@ -544,7 +544,7 @@ type account struct {
 // lookupAccount finds this process's user and group names in the host's
 // files.
 func lookupAccount() account {
-	acct := account{user: "legwork", group: "legwork"}
+	acct := account{user: "sandbox", group: "sandbox"}
 	if u, err := user.LookupId(strconv.Itoa(os.Getuid())); err == nil {
 		acct.user = u.Username
 	}
