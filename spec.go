@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -21,12 +22,12 @@ type Spec struct {
 	// Home is the sandbox's own directory. It is writable, and it is the
 	// command's HOME.
 	Home string `json:"home"`
-	// Dir is the command's working directory. Empty means the directory
-	// Run is called from, so a caller that starts each command in a
-	// directory of its own, as the runner does a turn's scratch directory,
-	// needs no flag naming it. Either way it must be a directory the
-	// sandbox shows from the host: its home, a Write or Read path, or a path
-	// no cover hides. It is followed through a link only where the link
+	// Dir is the command's working directory. Empty means Home, except
+	// that Run uses the directory it is called from, so a caller that
+	// starts each command in a directory of its own, as the runner does a
+	// turn's scratch directory, needs no flag naming it. Either way it must
+	// be a directory the sandbox shows from the host: its home, a Write or
+	// Read path, or a path no cover hides. It is followed through a link only where the link
 	// lies outside every directory a sandbox can write.
 	Dir string `json:"dir,omitempty"`
 	// Write lists more host paths the command may write. A socket listed
@@ -41,6 +42,137 @@ type Spec struct {
 	// Kernel is how much of the kernel the command may reach. Empty means
 	// KernelStrict.
 	Kernel Kernel `json:"kernel,omitempty"`
+	// Network is what the command can reach. The zero value is
+	// NetworkNone.
+	Network Network `json:"network,omitempty"`
+	// Services and BroadLoopback only mean something on macOS, and Linux
+	// ignores them.
+	Services      []Service `json:"services,omitempty"`
+	BroadLoopback bool      `json:"broad_loopback,omitempty"`
+	// Listen is how many TCP listeners the caller serves for the command,
+	// which reaches them on ListenAddrs. On Linux the first stage binds
+	// them on 127.0.0.1 in the sandbox's own network namespace, from port
+	// 3128 up, so it needs NetworkNone, and Listeners returns them once
+	// Start has. It may not exceed maxListen.
+	Listen int `json:"listen,omitempty"`
+	// Loopback is how many loopback TCP ports the command may bind and dial
+	// itself, which LoopbackPorts gives. On Linux the loopback is private
+	// to the sandbox under NetworkNone, and the ports are fixed, from 4444
+	// up. It may not exceed maxListen either.
+	Loopback int `json:"loopback,omitempty"`
+	// Files are the descriptors the command gets as 3, 4, and so on. The
+	// caller keeps them open, and closes them when it likes after Start.
+	Files []*os.File `json:"-"`
+	// Rlimits are the resource limits pid 1 sets before it starts the
+	// command, and so holds itself as well.
+	Rlimits []Rlimit `json:"rlimits,omitempty"`
+	// Hostname is the sandbox's hostname on Linux. Empty means "sandbox".
+	Hostname string `json:"hostname,omitempty"`
+}
+
+// maxListen is the most Listen and Loopback may each be, which keeps their
+// fixed Linux ports apart.
+const maxListen = 1000
+
+// Network is what a sandbox's command can reach of the network.
+type Network int
+
+const (
+	// NetworkNone gives the command a network namespace of its own with
+	// only a loopback, private to it, which also makes the host's abstract
+	// sockets unreachable. It is the zero value.
+	NetworkNone Network = iota
+	// NetworkHost shares the host's network, with the host's loopback and
+	// abstract sockets. It must be asked for.
+	NetworkHost
+)
+
+// String returns n's name, for a flag's default.
+func (n *Network) String() string {
+	switch {
+	case n == nil || *n == NetworkNone:
+		return "none"
+	case *n == NetworkHost:
+		return "host"
+	}
+	return fmt.Sprintf("Network(%d)", int(*n))
+}
+
+// Set sets n from a flag's value, refusing a name it does not know.
+func (n *Network) Set(v string) error {
+	switch v {
+	case "none":
+		*n = NetworkNone
+	case "host":
+		*n = NetworkHost
+	default:
+		return fmt.Errorf("network %q is not none or host", v)
+	}
+	return nil
+}
+
+// Service is a reviewed group of macOS Mach services a sandbox may look up.
+// None are defined yet, and Linux ignores the field.
+type Service string
+
+// Resource is a limit Rlimit sets.
+type Resource int
+
+const (
+	// ResourceCPU is CPU seconds, RLIMIT_CPU.
+	ResourceCPU Resource = iota + 1
+	// ResourceFileSize is the largest file a process may write,
+	// RLIMIT_FSIZE.
+	ResourceFileSize
+	// ResourceCore is the largest core file, RLIMIT_CORE.
+	ResourceCore
+	// ResourceOpenFiles is the most open descriptors, RLIMIT_NOFILE.
+	ResourceOpenFiles
+	// ResourceProcesses is the most processes the account may have,
+	// counting every process of its uid on the host, RLIMIT_NPROC.
+	ResourceProcesses
+	// ResourceAddressSpace is the most virtual memory a process may map,
+	// RLIMIT_AS.
+	ResourceAddressSpace
+)
+
+// Rlimit is one resource limit. A limit of [math.MaxUint64] is none.
+type Rlimit struct {
+	Resource Resource `json:"resource"`
+	Soft     uint64   `json:"soft"`
+	Hard     uint64   `json:"hard"`
+}
+
+// checkRequest checks the parts of spec that need no host: the
+// network and listener counts, the limits, and the files. It is shared by
+// every backend.
+func (s Spec) checkRequest() error {
+	if len(s.Command) == 0 {
+		return errors.New("no command")
+	}
+	if s.Network != NetworkNone && s.Network != NetworkHost {
+		return fmt.Errorf("unknown network %d", int(s.Network))
+	}
+	if s.Listen < 0 || s.Listen > maxListen || s.Loopback < 0 || s.Loopback > maxListen {
+		return fmt.Errorf("listen and loopback must each be from 0 to %d", maxListen)
+	}
+	if s.Network == NetworkHost && (s.Listen > 0 || s.Loopback > 0) {
+		return errors.New("listeners and loopback ports need NetworkNone, since the host's network has no private loopback")
+	}
+	for _, f := range s.Files {
+		if f == nil {
+			return errors.New("a nil file in Files")
+		}
+	}
+	for _, r := range s.Rlimits {
+		if r.Resource < ResourceCPU || r.Resource > ResourceAddressSpace {
+			return fmt.Errorf("unknown resource %d", int(r.Resource))
+		}
+		if r.Soft > r.Hard {
+			return fmt.Errorf("limit %d has a soft limit above its hard limit", int(r.Resource))
+		}
+	}
+	return nil
 }
 
 // Kernel is how much of the kernel's system calls a sandbox may reach.
