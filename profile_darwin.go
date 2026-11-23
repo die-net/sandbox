@@ -215,10 +215,17 @@ func profile(in profileInput) (string, error) {
 	// replace its Home or a Write path, which the caller reads and writes by
 	// name, with a link to somewhere of the caller's. The allows above cover the
 	// root itself, so unlink and create at it are denied by name, after them.
+	//
+	// A root can't be hard-linked elsewhere either, which would give it a
+	// second name in the home that these rules don't cover. macOS 27 refuses
+	// that link by itself, since the source has a write operation denied that
+	// the target allows (the log says forbidden-link-priv). macOS 15 and 26
+	// apply that check to other write operations but not to these two, so
+	// file-link is denied by name too (TestRootLinkRefusedByFileLink).
 	roots := slices.Concat([]string{in.Home}, in.Write)
 	slices.Sort(roots)
 	for _, r := range slices.Compact(roots) {
-		b.line("(deny file-write-unlink file-write-create (literal %s))", b.q(r))
+		b.line("(deny file-write-unlink file-write-create file-link (literal %s))", b.q(r))
 	}
 	if in.Self != "" {
 		b.line("; This binary, for the check child and a command that runs it again.")
