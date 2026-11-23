@@ -3,8 +3,9 @@ package sandbox
 // Firefox under the backend's own generated profile: a headless --screenshot
 // of a page, as trmnl's renderer takes it. This is the main macOS consumer, so
 // the profile the library makes, and not a hand-written one, has to run it.
-// docs/spikes.md (M2) found the minimal profile by hand; this checks that the
-// generated one, with Services [ServiceFirefox], does the same.
+// docs/macos.md (M2, headless Firefox under sandbox-exec) records the minimal
+// profile found by hand; this checks that the generated one, with Services
+// [ServiceFirefox], does the same.
 
 import (
 	"bytes"
@@ -184,7 +185,7 @@ func TestFirefoxScreenshot(t *testing.T) {
 
 // TestFirefoxNetwork renders a page that loads two images from loopback: one
 // from the port the sandbox was given with Listen, one from a port it was not.
-// The first loads and the second does not, as spikes.md M2 found with a
+// The first loads and the second does not, as docs/macos.md (M2) records for a
 // hand-written profile.
 func TestFirefoxNetwork(t *testing.T) {
 	if _, err := os.Stat(firefoxApp); err != nil {

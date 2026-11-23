@@ -1,9 +1,9 @@
 package sandbox
 
-// Escape tests: for each Linux guarantee in docs/design.md section 2's
-// "Where each sandbox.md guarantee lives after the split" table (Library
-// column), code runs inside a sandbox, tries the escape, and the test asserts
-// it fails. Each test cites the row it checks as "Row: ...".
+// Escape tests: for each Linux guarantee in the guarantee table of
+// docs/security-model.md, code runs inside a sandbox, tries the escape, and
+// the test asserts it fails. Each test cites the row it checks as "Row: ...",
+// by the first words of the Guarantee column.
 //
 // The code inside the sandbox is this test binary run as "esc <check>", where
 // check is a key of escChecks. A check prints what went wrong on stderr and
@@ -1637,8 +1637,8 @@ func TestEscapeNoNewPrivs(t *testing.T) {
 // Row: "First stage: ... caps dropped": the command's capability sets are
 // empty in the sandbox of a root-mapped namespace too, covered by
 // TestIsolation's thread check. The supplementary-groups caveat from
-// sandbox.md ("it holds only while the account has no supplementary
-// groups"): the groups pass through into the sandbox, which is why the
+// docs/linux.md (The view: "It holds only while the account has no
+// supplementary groups"): the groups pass through into the sandbox, which is why the
 // guarantee needs none.
 func TestEscapeSupplementaryGroups(t *testing.T) {
 	groups, err := unix.Getgroups()
@@ -1651,7 +1651,7 @@ func TestEscapeSupplementaryGroups(t *testing.T) {
 		t.Errorf("the sandbox has groups %v, the caller has %v: the count should match, since the kernel keeps them", inside, groups)
 	}
 	if len(groups) > 0 {
-		t.Logf("this account has supplementary groups %v, shown in the sandbox as %v: they still count for file modes, so the read-only root is not a guarantee here, as sandbox.md says", groups, inside)
+		t.Logf("this account has supplementary groups %v, shown in the sandbox as %v: they still count for file modes, so the read-only root is not a guarantee here, as docs/linux.md says", groups, inside)
 	}
 }
 
@@ -2024,8 +2024,7 @@ func TestEscapePlantedLink(t *testing.T) {
 	escRun(t, Spec{Home: parent}, "view", jsonArg(t, viewSpec{Hidden: []string{victim, secret}}))
 }
 
-// Row: "Network namespace, proxy listener handed out" and the Limits in
-// sandbox.md for NetworkHost: under NetworkNone the host's loopback,
+// Row: "Network" and the Limits in docs/security-model.md for NetworkHost: under NetworkNone the host's loopback,
 // abstract sockets and socket files are out of reach, and the network is
 // only a loopback. Under NetworkHost, which must be asked for, they are
 // shared, as documented.
