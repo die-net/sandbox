@@ -226,14 +226,6 @@ func (k *Kernel) Set(v string) error {
 	return fmt.Errorf("kernel %q is not strict, nested, or open", v)
 }
 
-// defaultCover lists the host paths every sandbox has hidden: people's homes,
-// and the places services keep their state, sockets, and temporary files.
-var defaultCover = []string{"/home", "/root", "/run", "/tmp", "/var", "/mnt", "/media", "/dev/shm", "/.snapshots", "/sysroot"}
-
-// The default covers end with two that hold another view of the host's
-// files rather than files of their own: snapper's btrfs snapshots, and the
-// physical root of an ostree host, where /var and /home also are.
-
 // prepare checks spec and returns it with every path absolute, clean, and
 // with symlinks resolved. Cover gains the defaults and homes, the people's
 // homes found on the host, which may live outside /home, and loses each cover
@@ -302,7 +294,7 @@ func prepare(spec Spec, homes []string, host fs.FS, mounts []mount) (Spec, error
 	spec.Home = home
 	binds := slices.Concat([]string{home}, spec.Write, spec.Read)
 	spec.Cover = covers(slices.Concat(shared, private, elsewhere), binds)
-	linked, err := linkedFiles(host, "etc", shared, slices.Concat(private, []string{home}, spec.Write))
+	linked, err := linkedFiles(host, "etc", slices.Concat(shared, coverAliases), slices.Concat(private, []string{home}, spec.Write))
 	if err != nil {
 		return Spec{}, err
 	}
@@ -439,7 +431,7 @@ func resolve(host fs.FS, p string, writable []string) (string, error) {
 		}
 		rest = append(strings.Split(target, "/"), rest...)
 	}
-	return done, nil
+	return canonicalName(done), nil
 }
 
 // linkedFiles returns the regular files that links under dir in host lead to

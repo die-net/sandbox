@@ -394,26 +394,6 @@ func socketpair() (parent, child *os.File, err error) {
 	return os.NewFile(uintptr(fd[0]), "control-parent"), os.NewFile(uintptr(fd[1]), "control-child"), nil
 }
 
-// dupFile returns a close-on-exec copy of f that the launch may own, without
-// switching f to blocking mode as its Fd method would.
-func dupFile(f *os.File) (*os.File, error) {
-	rc, err := f.SyscallConn()
-	if err != nil {
-		return nil, fmt.Errorf("file %s: %w", f.Name(), err)
-	}
-	var nfd int
-	var dupErr error
-	if err := rc.Control(func(fd uintptr) {
-		nfd, dupErr = unix.FcntlInt(fd, unix.F_DUPFD_CLOEXEC, 3)
-	}); err != nil {
-		return nil, fmt.Errorf("file %s: %w", f.Name(), err)
-	}
-	if dupErr != nil {
-		return nil, fmt.Errorf("file %s: %w", f.Name(), dupErr)
-	}
-	return os.NewFile(uintptr(nfd), f.Name()), nil
-}
-
 // Run runs spec's command in a sandbox that bubblewrap builds, with this
 // process's own standard streams and environment, and returns its exit
 // status. A status from a signal is 128 plus the signal's number, as a shell
@@ -467,20 +447,6 @@ func findBwrap() (string, error) {
 	return path, nil
 }
 
-// hostHomes returns the homes to cover for the accounts in /etc/passwd. It
-// reads the file itself, since without cgo Go cannot list a directory
-// service's accounts either.
-func hostHomes() ([]string, error) {
-	passwd, err := os.ReadFile("/etc/passwd")
-	if errors.Is(err, fs.ErrNotExist) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("read /etc/passwd: %w", err)
-	}
-	return accountHomes(passwd, ownerOf), nil
-}
-
 // hostMounts reads the host's mount table, as this process sees it.
 func hostMounts() ([]mount, error) {
 	f, err := os.Open("/proc/self/mountinfo")
@@ -489,19 +455,6 @@ func hostMounts() ([]mount, error) {
 	}
 	defer f.Close()
 	return parseMountinfo(f)
-}
-
-// ownerOf returns the uid that owns path, following symlinks.
-func ownerOf(path string) (uint64, error) {
-	fi, err := os.Stat(path)
-	if err != nil {
-		return 0, err
-	}
-	st, ok := fi.Sys().(*syscall.Stat_t)
-	if !ok {
-		return 0, fmt.Errorf("stat %s: no owner", path)
-	}
-	return uint64(st.Uid), nil
 }
 
 // launch is what Run hands bubblewrap: its options, which it reads from the
@@ -825,17 +778,4 @@ func commandEnv(env []string, spec Spec) []string {
 		out = append(out, name+"="+value)
 	}
 	return out
-}
-
-// exitStatus turns the error from waiting on bubblewrap into its exit
-// status, which is the command's.
-func exitStatus(err error) (int, error) {
-	var ee *exec.ExitError
-	if !errors.As(err, &ee) {
-		return 0, err
-	}
-	if ws, ok := ee.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
-		return 128 + int(ws.Signal()), nil
-	}
-	return ee.ExitCode(), nil
 }
