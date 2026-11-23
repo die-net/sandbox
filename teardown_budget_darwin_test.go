@@ -79,27 +79,123 @@ func TestRunWaitStopsAtTheDeadline(t *testing.T) {
 
 // ------------------------------------------------------------- spending time
 
-// Scans that keep finding members after they were signaled are a process forking
-// against the teardown, and the teardown stops early.
-func TestRunGivesUpOnMembersThatKeepTurningUp(t *testing.T) {
-	lists := make([][]int, giveUpScans*2)
-	f := newFake()
+// membersByScan makes the fake's n-th scan (from 1) find count(n) members, which
+// are the same pids at each scan, as a process that keeps forking is. It returns
+// the time, from the start, of the scan that first found a different number.
+func membersByScan(f *fakeSystem, p *prober, count func(scan int) int) (changedAt *time.Duration) {
 	f.members = map[int]bool{}
-	for i := range lists {
-		lists[i] = []int{10, 100 + i}
-		f.members[100+i] = true
+	for i := range 2000 {
+		f.members[1000+i] = true
 	}
-	f.lists = lists
-	scans, out := f.prober().run(time.Hour)
-	if out != endMembers || scans != giveUpScans {
-		t.Errorf("scans = %d, out = %v; want to give up on members after %d scans", scans, out, giveUpScans)
+	changedAt = new(time.Duration)
+	last := -1
+	p.list = func() ([]int, error) {
+		f.listed++
+		n := count(f.listed)
+		if n != last {
+			last, *changedAt = n, f.clock.Sub(f.t0)
+		}
+		pids := make([]int, 1, 1+n)
+		pids[0] = 10
+		for i := range n {
+			pids = append(pids, 1000+i)
+		}
+		return pids, nil
 	}
-	var total time.Duration
-	for _, d := range f.slept {
-		total += d
+	return changedAt
+}
+
+// Scans that keep finding as many members as they did, after they were signaled,
+// are a process forking against the teardown, and the teardown stops early.
+func TestRunGivesUpOnMembersThatKeepTurningUp(t *testing.T) {
+	f := newFake()
+	p := f.prober()
+	membersByScan(f, &p, func(int) int { return 3 })
+	scans, out := p.run(time.Hour)
+	elapsed := f.clock.Sub(f.t0)
+	if out != endMembers {
+		t.Fatalf("out = %v after %d scans; want to give up on members", out, scans)
 	}
-	if total > time.Second {
-		t.Errorf("waited %v before giving up, which is most of a budget", total)
+	if elapsed < giveUpAfter || elapsed > giveUpAfter+backoffMax+50*time.Millisecond {
+		t.Errorf("gave up after %v, want about %v", elapsed, giveUpAfter)
+	}
+}
+
+// The teardown gives up giveUpAfter after the scan that found the fewest members,
+// not after the first one that found any: a number that is still falling is a
+// program that is ending, however many scans that takes.
+func TestRunGivesUpGiveUpAfterTheLastFall(t *testing.T) {
+	f := newFake()
+	p := f.prober()
+	// 5 members for the first 30 scans, then 4 for the rest.
+	changedAt := membersByScan(f, &p, func(scan int) int {
+		if scan <= 30 {
+			return 5
+		}
+		return 4
+	})
+	scans, out := p.run(time.Hour)
+	elapsed := f.clock.Sub(f.t0)
+	if out != endMembers {
+		t.Fatalf("out = %v after %d scans; want to give up on members", out, scans)
+	}
+	if *changedAt < 500*time.Millisecond {
+		t.Fatalf("the number fell at %v, too early to tell the windows apart", *changedAt)
+	}
+	if elapsed < *changedAt+giveUpAfter || elapsed > *changedAt+giveUpAfter+backoffMax+50*time.Millisecond {
+		t.Errorf("gave up at %v, want %v after the fall at %v", elapsed, giveUpAfter, *changedAt)
+	}
+}
+
+// Scans between the ones that find members, which find none, do not start the
+// window again.
+func TestRunGivesUpThroughScansThatFindNoMember(t *testing.T) {
+	f := newFake()
+	p := f.prober()
+	membersByScan(f, &p, func(scan int) int { return 3 * (scan % 2) })
+	// The odd scans find only an unknown pid, so that they are not clean.
+	f.unknown = map[int]bool{77: true}
+	list := p.list
+	p.list = func() ([]int, error) {
+		pids, err := list()
+		return append(pids, 77), err
+	}
+	_, out := p.run(time.Hour)
+	if out != endMembers {
+		t.Errorf("out = %v, want to give up on members", out)
+	}
+}
+
+// A number that keeps falling is never given up on, over any number of scans or
+// seconds: this is what a slow machine's teardown of a program that forks as it
+// dies looks like.
+func TestRunKeepsTryingWhileTheMembersFall(t *testing.T) {
+	f := newFake()
+	p := f.prober()
+	// One member fewer in each scan, for as long as the budget allows. With the
+	// waits at their longest that is 40 scans a second.
+	const scansToEnd = 120
+	membersByScan(f, &p, func(scan int) int { return max(scansToEnd-scan, 0) })
+	scans, out := p.run(5 * time.Second)
+	elapsed := f.clock.Sub(f.t0)
+	if out != endEmpty || scans != scansToEnd {
+		t.Errorf("scans = %d, out = %v; want %d scans and a clean end", scans, out, scansToEnd)
+	}
+	if elapsed < 2*giveUpAfter {
+		t.Errorf("took %v, want it to be well past the %v after which a number that stopped falling is given up on", elapsed, giveUpAfter)
+	}
+}
+
+// What a slow machine does to the shutdown of a program: members found again for
+// a while at each number, but never for as long as the window.
+func TestRunDoesNotGiveUpOnASlowShutdown(t *testing.T) {
+	f := newFake()
+	p := f.prober()
+	counts := []int{17, 17, 9, 9, 9, 6, 6, 6, 6, 2, 2, 1, 1, 1, 1, 1, 0}
+	membersByScan(f, &p, func(scan int) int { return counts[min(scan, len(counts))-1] })
+	scans, out := p.run(5 * time.Second)
+	if out != endEmpty || scans != len(counts) {
+		t.Errorf("scans = %d, out = %v; want %d scans and a clean end", scans, out, len(counts))
 	}
 }
 
@@ -134,18 +230,18 @@ func TestRunKeepsTryingThroughNoise(t *testing.T) {
 			if out != endBudget {
 				t.Errorf("out = %v after %d scans; want the whole budget spent", out, scans)
 			}
-			if scans < 3*giveUpScans {
-				t.Errorf("%d scans: want many more than the %d that members would be given up after", scans, giveUpScans)
+			if elapsed := f.clock.Sub(f.t0); elapsed < budget {
+				t.Errorf("%d scans in %v: want the whole budget of %v tried, not the %v that members get", scans, elapsed, budget, giveUpAfter)
 			}
 		})
 	}
 }
 
 // A program that shuts down normally has its members signaled in the first scan,
-// and what they forked as they died in a few more, and then it is gone. The
-// longest chain of scans that find members, short of giving up, still ends clean.
+// and what they forked as they died in a few more, and then it is gone, however
+// many scans that is, so long as they are well within the time for giving up.
 func TestRunDoesNotGiveUpOnANormalShutdown(t *testing.T) {
-	for _, member := range []int{1, 2, 3, giveUpScans - 1} {
+	for _, member := range []int{1, 2, 3, 9} {
 		lists := make([][]int, member+1)
 		f := newFake()
 		f.members = map[int]bool{}
@@ -198,11 +294,11 @@ close $w; sysread($r, my $b, 1); _exit(0);`
 	if !errors.Is(err, ErrSurvivors) {
 		t.Errorf("Wait: %v, want ErrSurvivors", err)
 	}
-	if d := time.Since(start); d > 3*time.Second {
-		t.Errorf("Wait took %v: the teardown should give up on members in about %v, and Wait not scan again", d, 200*time.Millisecond)
+	if d := time.Since(start); d < giveUpAfter || d > giveUpAfter+3*time.Second {
+		t.Errorf("Wait took %v: the teardown should give up on members in about %v, and Wait not scan again", d, giveUpAfter)
 	}
-	if c.run.stageScans != giveUpScans {
-		t.Errorf("the stage made %d scans, want %d, each finding the member", c.run.stageScans, giveUpScans)
+	if c.run.stageScans < 10 {
+		t.Errorf("the stage made %d scans, want many, each finding the member", c.run.stageScans)
 	}
 	if n := c.run.callerScans.Load(); n != 0 {
 		t.Errorf("the caller made %d scans after the stage said it gave up on members", n)
@@ -234,11 +330,11 @@ func TestWaitGivesUpOnMembersItCannotEnd(t *testing.T) {
 	if !errors.Is(err, ErrSurvivors) {
 		t.Errorf("Wait: %v, want ErrSurvivors", err)
 	}
-	if d := time.Since(start); d > 3*time.Second {
-		t.Errorf("Wait took %v", d)
+	if d := time.Since(start); d < giveUpAfter || d > giveUpAfter+3*time.Second {
+		t.Errorf("Wait took %v, want about %v", d, giveUpAfter)
 	}
-	if n := c.run.callerScans.Load(); n < int64(giveUpScans) {
-		t.Errorf("the caller made %d scans, want at least %d", n, giveUpScans)
+	if n := c.run.callerScans.Load(); n < 10 {
+		t.Errorf("the caller made %d scans, want many", n)
 	}
 }
 
