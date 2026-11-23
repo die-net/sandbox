@@ -59,13 +59,67 @@ type stageLimit struct {
 	Hard     uint64 `json:"hard"`
 }
 
-// stageReply is the stage's one message back, once the command has been
+// stageReply is the stage's first message back, once the command has been
 // started or the setup has failed. Group is the command's process group,
 // which the caller's Footprint and a stage that was killed need, as the
 // processes that never left it.
 type stageReply struct {
+	// Kind is kindReply. The stage sends two messages on one pipe, and the
+	// lifeline's watcher can send the last before the main goroutine has sent the
+	// first, so each says what it is and a reader rejects the wrong one.
+	Kind  string `json:"kind"`
 	Error string `json:"error,omitempty"`
 	Group int    `json:"group,omitempty"`
+}
+
+// The kinds of message the stage sends.
+const (
+	kindReply = "reply"
+	kindDone  = "done"
+)
+
+// readReply reads the stage's first message, and refuses any other kind.
+func readReply(dec *json.Decoder) (stageReply, error) {
+	var r stageReply
+	if err := dec.Decode(&r); err != nil {
+		return stageReply{}, err
+	}
+	if r.Kind != kindReply {
+		return stageReply{}, fmt.Errorf("the stage's first message is a %q, not a reply", r.Kind)
+	}
+	return r, nil
+}
+
+// readDone reads the stage's last message, and refuses any other kind.
+func readDone(dec *json.Decoder) (stageDone, error) {
+	var d stageDone
+	if err := dec.Decode(&d); err != nil {
+		return stageDone{}, err
+	}
+	if d.Kind != kindDone {
+		return stageDone{}, fmt.Errorf("the stage's last message is a %q, not a report", d.Kind)
+	}
+	return d, nil
+}
+
+// stageDone is the stage's last message, sent after its teardown and before it
+// exits. Empty says that a scan proved the sandbox empty (scan_darwin.go), so
+// that the caller's Wait need not scan again. Members says the stage gave up
+// because scan after scan found members of the sandbox again after signaling
+// the ones before, which is a process forking against the teardown, so that
+// Wait does not spend another budget on it and returns ErrSurvivors. The caller
+// takes the stage's word for either: the stage runs outside the profile, and a
+// command in the sandbox cannot signal it, since the profile allows signals
+// only within the sandbox, nor reach its status pipe, which nothing in the
+// sandbox is given. Neither can make Wait return nil unless a scan proved the
+// sandbox empty. A stage that was killed, or that ran out of its budget on
+// processes it could not account for, says neither, and the caller scans
+// itself. Scans is how many scans the teardown made, for tests and diagnosis.
+type stageDone struct {
+	Kind    string `json:"kind"`
+	Empty   bool   `json:"empty,omitempty"`
+	Members bool   `json:"members,omitempty"`
+	Scans   int    `json:"scans,omitempty"`
 }
 
 // Stage runs the sandbox's stage if this process was started as it, and
@@ -96,12 +150,25 @@ func Stage() (int, bool) {
 // command's group, and every process that left it with setpgid or a shell's
 // job control or lost its parent, with SIGKILL, when the command exits or when
 // the lifeline reaches EOF, which is when the caller has gone, however it
-// went. Those are found by the profile's marker (member_darwin.go). It exits
-// with the command's status.
+// went. Those are found by the profile's marker (member_darwin.go), until a
+// scan proves none is left (scan_darwin.go). It then tells the caller whether
+// it did (stageDone), and exits with the command's status.
 func supervise(command []string) (int, error) {
 	var mu sync.Mutex
 	group := 0
 	var mark marker
+	// status is the pipe to the caller. finish sends the last message once,
+	// and mu is held when it runs.
+	var status *os.File
+	finished := false
+	finish := func(scans int, end endKind) {
+		if finished {
+			return
+		}
+		finished = true
+		_ = json.NewEncoder(status).Encode(stageDone{Kind: kindDone, Empty: end == endEmpty, Members: end == endMembers, Scans: scans})
+		_ = status.Close()
+	}
 	// Watch from the first moment, so a caller that died during setup leaves
 	// no command running. The lock is held from before the command starts
 	// until its group is known, so either this ends the process before the
@@ -115,7 +182,7 @@ func supervise(command []string) (int, error) {
 		}
 		mu.Lock()
 		if group != 0 {
-			killAll(group, mark)
+			finish(killAll(group, mark))
 		}
 		os.Exit(128 + int(unix.SIGKILL))
 	}()
@@ -130,19 +197,17 @@ func supervise(command []string) (int, error) {
 	if err := json.NewDecoder(os.NewFile(fdSettings, "settings")).Decode(&settings); err != nil {
 		return 0, fmt.Errorf("read the settings: %w", err)
 	}
-	status := os.NewFile(fdStatus, "status")
-	reply := func(r stageReply) {
-		_ = json.NewEncoder(status).Encode(r)
-		_ = status.Close()
-	}
+	status = os.NewFile(fdStatus, "status")
 	mark = settings.Marker
 	child, err := startCommand(settings, command, &mu, &group)
 	if err != nil {
-		reply(stageReply{Error: err.Error()})
+		_ = json.NewEncoder(status).Encode(stageReply{Kind: kindReply, Error: err.Error()})
+		_ = status.Close()
 		return 0, err
 	}
+	// The pipe stays open for the last message.
 	mu.Lock()
-	reply(stageReply{Group: group})
+	_ = json.NewEncoder(status).Encode(stageReply{Kind: kindReply, Group: group})
 	mu.Unlock()
 	stop := relayToChild(child)
 	defer stop()
@@ -161,7 +226,7 @@ func supervise(command []string) (int, error) {
 	// would go to the number, and the teardown below can take seconds.
 	stop()
 	mu.Lock()
-	killAll(group, mark)
+	finish(killAll(group, mark))
 	mu.Unlock()
 	giveBackTerminal(group)
 	if ws.Signaled() {
@@ -258,15 +323,24 @@ func markCloseOnExec() {
 
 // killAll ends the command's group and every other process under the
 // sandbox's profile, whatever its group or parent. The group goes first, which
-// is quick and holds what never left it, and the marker finds the rest.
-func killAll(group int, m marker) {
+// is quick and holds what never left it, and the marker finds the rest. It
+// returns how many scans that took, and how the teardown ended.
+func killAll(group int, m marker) (scans int, end endKind) {
 	killGroup(group)
-	m.kill(teardownBudget)
+	return m.kill(teardownBudget, group)
 }
 
 // killGroup ends every process in the group, and keeps going until none is
 // left, since a process that forks while the signal is sent can leave a
 // child that missed it.
+//
+// It signals a number, and after the command is reaped the group's number can
+// belong to no one, and then to someone else. That needs forkproc
+// (bsd/kern/kern_fork.c) to give it out again within the milliseconds of this
+// loop. It hands out pids in sequence from the last one, up to 99999, and
+// skips any that is in use as a pid, a group or a session, so the counter would
+// have to wrap onto this number in that time. The race is not worth a fix that
+// costs a process lookup.
 func killGroup(group int) {
 	for range 100 {
 		if err := syscall.Kill(-group, syscall.SIGKILL); err != nil {

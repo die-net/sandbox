@@ -1114,13 +1114,15 @@ func init() {
 // TestAPIErrSurvivors checks ErrSurvivors, the error Wait returns when teardown
 // could not confirm the sandbox empty: it matches with errors.Is, whether the
 // command's own result was an exit status or none, and the exit error still
-// unwraps. A teardown that could settle returns neither. A budget of none lets
-// the scan make one pass, which is not enough to settle, so it stands for a
-// chain that kept ahead of the scan until the budget ran out.
+// unwraps. A teardown that proved the sandbox empty returns neither. A budget
+// of none, with the stage's report ignored and a pid that is never settled in
+// the caller's scan, stands for a chain that kept ahead of the scan until the
+// budget ran out.
 func TestAPIErrSurvivors(t *testing.T) {
 	defer func(b time.Duration) { teardownBudget = b }(teardownBudget)
 	wait := func(budget time.Duration, script string) error {
 		teardownBudget = budget
+		unprovable(t, budget == 0)
 		c, err := Command(t.Context(), Spec{Home: realTemp(t), Command: []string{"/bin/sh", "-c", script}})
 		if err != nil {
 			t.Fatal(err)

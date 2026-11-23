@@ -131,8 +131,28 @@ func depth(p string) int {
 // It refuses a path that cannot be quoted, and a service it does not know.
 func profile(in profileInput) (string, error) {
 	var b builder
+	// Everything after the version is one form, so that a profile cut short, as
+	// when the stage is killed while sandbox-exec is still reading it from the
+	// pipe, is a syntax error and does not run. sandbox-exec takes a profile cut
+	// between two rules as it is, with the rules after it missing, which can be
+	// every deny that follows an allow (TestProfileCutShortDoesNotRun).
 	b.line("(version 1)")
+	b.line("(begin")
 	b.line("(deny default)")
+	if in.Marker.In != "" {
+		// First, so that a profile cut short anywhere still carries them (it
+		// does not run: see the wrapper above). A lookup of these names finds no
+		// service, and no rule below names them. They only tell the kernel's
+		// answer for this profile from every other's (member_darwin.go).
+		b.line("; The marker: teardown tells this sandbox's processes by it.")
+		for _, n := range []string{in.Marker.In, in.Marker.Out} {
+			if strings.Trim(n, "abcdefghijklmnopqrstuvwxyz0123456789.-") != "" {
+				return "", fmt.Errorf("marker name %q is not plain", n)
+			}
+		}
+		b.line(`(allow mach-lookup (global-name "%s"))`, in.Marker.In)
+		b.line(`(deny mach-lookup (global-name "%s"))`, in.Marker.Out)
+	}
 	b.line("; Processes stay in the sandbox, and so do the signals they send.")
 	b.line("(allow process-fork)")
 	b.line(`(allow process-exec* (subpath "/"))`)
@@ -260,19 +280,7 @@ func profile(in profileInput) (string, error) {
 			b.line("%s", r)
 		}
 	}
-	if in.Marker.In != "" {
-		// Last, so that nothing above overrides them. A lookup of these names
-		// finds no service. They only tell the kernel's answer for this
-		// profile from every other's (member_darwin.go).
-		b.line("; The marker: teardown tells this sandbox's processes by it.")
-		for _, n := range []string{in.Marker.In, in.Marker.Out} {
-			if strings.Trim(n, "abcdefghijklmnopqrstuvwxyz0123456789.-") != "" {
-				return "", fmt.Errorf("marker name %q is not plain", n)
-			}
-		}
-		b.line(`(allow mach-lookup (global-name "%s"))`, in.Marker.In)
-		b.line(`(deny mach-lookup (global-name "%s"))`, in.Marker.Out)
-	}
+	b.line(")")
 	if b.err != nil {
 		return "", b.err
 	}

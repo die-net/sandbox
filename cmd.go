@@ -11,11 +11,21 @@ import (
 // macOS when teardown could not confirm that no process still runs under the
 // sandbox's profile. A process that forks again before each signal lands can
 // keep ahead of the scan that looks for the sandbox's processes, so one may
-// be left running with the access the profile gave it. Nothing lists the
+// be left running with the access the profile gave it. Teardown gives up on
+// that after about a tenth of a second, once scan after scan has found a
+// process it had signaled to be replaced, and says so at once; it never returns
+// nil while a process of the sandbox may still run. Nothing lists the
 // survivors, so a caller that sees this should treat the host as dirty. The
 // error wraps what Wait would otherwise have returned, so errors.As still
-// finds the command's *exec.ExitError. Linux never returns it: the sandbox's
-// pid namespace ends with its pid 1 and takes every process with it.
+// finds the command's *exec.ExitError. The scan can also fail to settle,
+// without a survivor, when other processes of the same account start and exit
+// faster than it can account for them, which takes thousands of exits a second
+// with the CPUs busy (a parallel build, or a fork loop in another sandbox of the
+// account), and then teardown keeps trying for five seconds, which has been
+// enough for every load measured; a caller that does get the error there has a
+// host that is clean. Linux
+// never returns it: the sandbox's pid namespace ends with its pid 1 and takes
+// every process with it.
 var ErrSurvivors = errors.New("sandbox: teardown could not confirm that no process still runs under the sandbox's profile")
 
 // Cmd is a command in a sandbox, made by [Command]. Set its fields, then

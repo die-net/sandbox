@@ -115,7 +115,7 @@ func readPid(t *testing.T, path string) int {
 // marker, never by a pid it was told.
 func endAtCleanup(t *testing.T, c *Cmd) {
 	t.Helper()
-	t.Cleanup(func() { c.run.mark.kill(2 * time.Second) })
+	t.Cleanup(func() { c.run.mark.kill(2*time.Second, c.run.group) })
 }
 
 // waitWithin waits for c and fails the test if that takes longer than d. It
@@ -991,7 +991,7 @@ _exit(0);`
 // the whole process table and signaled afterwards, so each generation had
 // exited by the time it was signaled and the next had not been listed; it gave
 // up after 200 scans with nothing said. Each process is signaled as the scan
-// finds it, and the teardown stops only after several empty scans.
+// finds it, and the teardown stops only when a scan proves the sandbox empty.
 // The chain ends by itself after 10 seconds whatever happens.
 func TestEscapeReforkingProcessEnds(t *testing.T) {
 	home := realTemp(t)
@@ -1022,13 +1022,14 @@ func TestEscapeReforkingProcessEnds(t *testing.T) {
 }
 
 // Row: the same: when teardown cannot confirm the sandbox empty, Wait says so.
-// A budget of none lets it make one scan, which is not enough to settle, so it
-// stands for a chain that kept ahead of the scan until the budget ran out. The
-// error wraps the command's own result.
+// A budget of none, with the stage's report ignored and a pid that is never
+// settled in the caller's scan, stands for a chain that kept ahead of the scan
+// until the budget ran out. The error wraps the command's own result.
 func TestTeardownReportsWhatItCouldNotConfirm(t *testing.T) {
 	defer func(b time.Duration) { teardownBudget = b }(teardownBudget)
 	run := func(budget time.Duration, script string) error {
 		teardownBudget = budget
+		unprovable(t, budget == 0)
 		c, err := Command(t.Context(), Spec{Home: realTemp(t), Command: []string{"/bin/sh", "-c", script}})
 		if err != nil {
 			t.Fatal(err)

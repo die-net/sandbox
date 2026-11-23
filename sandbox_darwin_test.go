@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -32,9 +33,57 @@ import (
 // is this binary: the first argument names one.
 var childModes = map[string]func(args []string) int{}
 
+// stageUnprovableEnv, in the environment of a sandbox's stage, which is this
+// test binary again, gives the stage a scan that is never clean and a short
+// budget, so that it reports it could not prove the sandbox empty.
+const stageUnprovableEnv = "SANDBOX_TEST_STAGE_UNPROVABLE"
+
+// stageOrphanZombiesEnv, in the same place, hides the parent of every zombie and
+// exiting process from the stage's scan, so that none is taken as a non-member's
+// child and a lingering zombie costs the scan that sees it.
+const stageOrphanZombiesEnv = "SANDBOX_TEST_STAGE_ORPHAN_ZOMBIES"
+
+// stageNoKillEnv, in the same place, makes the stage's scan signal nothing, so
+// that a member it finds is there again at the next scan, as a process that
+// keeps forking against the teardown is.
+const stageNoKillEnv = "SANDBOX_TEST_STAGE_NO_KILL"
+
 // TestMain lets the test binary be each part of a sandbox: the process that
 // starts it, its stage, and the command inside it.
 func TestMain(m *testing.M) {
+	var hooks []func(*prober)
+	if os.Getenv(stageOrphanZombiesEnv) != "" {
+		hooks = append(hooks, func(p *prober) {
+			stat := p.stat
+			p.stat = func(pid int) (procStat, error) {
+				st, err := stat(pid)
+				if st.Zombie || st.Exiting {
+					st.PPid = 1
+				}
+				return st, err
+			}
+		})
+	}
+	if os.Getenv(stageNoKillEnv) != "" {
+		hooks = append(hooks, func(p *prober) { p.kill = func(int) {} })
+	}
+	if os.Getenv(stageUnprovableEnv) != "" {
+		teardownBudget = 200 * time.Millisecond
+		hooks = append(hooks, func(p *prober) {
+			list := p.list
+			p.list = func() ([]int, error) {
+				pids, err := list()
+				return append(pids, math.MaxInt32), err
+			}
+		})
+	}
+	if len(hooks) > 0 {
+		testProberHook = func(p *prober) {
+			for _, h := range hooks {
+				h(p)
+			}
+		}
+	}
 	if code, ok := Stage(); ok {
 		os.Exit(code)
 	}
