@@ -1,6 +1,6 @@
 # Design: a shared sandbox module
 
-Status: proposal. No code yet. Module path assumed `github.com/die-net/sandbox`.
+Status: both backends are built. Section 4.5 lists where the macOS one departs from what is written here, and why; the text above it is the design as proposed, with the statements that running the code proved wrong corrected in place and marked (macOS). Module path `github.com/die-net/sandbox`.
 
 Goal: pull legwork's in-place sandbox (`internal/sandbox`) into a module that legwork and trmnl-byos-go both use, with one interface over two backends: Linux (bubblewrap, namespaces, seccomp) and macOS (Seatbelt).
 
@@ -19,7 +19,7 @@ Sources. **Read** means I read the code or doc. **Inferred** means I reasoned it
 Principles, which are the same as legwork's "Relaxing a sandbox" section:
 
 1. **The real alternative is no sandbox.** When a sandbox is cumbersome, people turn it off. So every platform gets the strongest isolation it can give, with no setup beyond installing the packages.
-2. **Backends differ, and that's fine.** macOS has no pid namespace, no cgroups and coarser kernel filtering than Linux. It still gets a deny-by-default file and network view, which is most of what protects trmnl's assets. The library reports what each backend gives (`Probe`), and the caller logs it once at startup. Missing pieces are reported, not refused. That covers features outside the kernel filter (memory limits, private loopback, tree kill). The kernel level is the exception: a requested level can be raised but never lowered, and one the host can't meet is an error (4.1).
+2. **Backends differ, and that's fine.** macOS has no pid namespace, no cgroups and coarser kernel filtering than Linux. It still gets a deny-by-default file and network view, which is most of what protects trmnl's assets. The library reports what each backend gives (`Probe`), and the caller logs it once at startup. Missing pieces are reported, not refused. That covers features outside the kernel filter (memory limits, private loopback, a pid namespace). The kernel level is the exception: a requested level can be raised but never lowered, and one the host can't meet is an error (4.1).
 3. **Zero config.** trmnl finds its tools at startup and works out from where they're installed what the sandbox needs to show (section 3.4). A brew, rbenv or apt user configures nothing.
 4. **Refuse only when there's no sandbox at all**, as legwork's floor does. On macOS `sandbox-exec` is always present. On Linux the fix is `apt install bubblewrap`, plus one AppArmor command on Ubuntu, and trmnl's message prints it. `--no-sandbox` stays for development. It never refuses, and it logs what the checks find (section 5).
 5. **The operator's own boundary is a sandbox too.** Containers or systemd units set up as section 5 describes do the same job, and the project then runs untrusted code without the library's sandbox. The library's part is to report honestly what that boundary enforces (section 6).
@@ -65,23 +65,23 @@ For trmnl, the parent brokers egress: each build gets a proxy listener and no ot
 | bwrap from the distro, setuid refused | ✓ | | `/usr/bin/sandbox-exec` by absolute path, never from `PATH` |
 | Options on a descriptor, not in pid 1's argv | ✓ | | profile on `/dev/fd/N`, never in argv. Test that it doesn't appear in `ps`. |
 | Bind sources by fd with `RESOLVE_NO_SYMLINKS`; a cover that became a link aborts | ✓ | | no fds: Seatbelt matches paths when they're opened. Test a write dir whose component is swapped for a link after the profile is written, and a link inside it pointing out. |
-| User/pid/ipc/uts namespaces, uid mapped to itself, `--die-with-parent`, `--as-pid-1` | ✓ | | none. Same-uid processes are visible. Deny `process-info*` and `signal` outside the sandbox, and test `KERN_PROCARGS2` and `kill` on the parent. |
-| Read-only root; covers (tmpfs, or `/dev/null` for non-dirs); default covers; people's homes; the account's own home | ✓ | | `file-read*` allow, then cover denies. Test each default cover, including through the `/System/Volumes/Data` firmlink paths (inferred risk: `/Users` is reachable both ways). |
+| User/pid/ipc/uts namespaces, uid mapped to itself, `--die-with-parent`, `--as-pid-1` | ✓ | | none. Same-uid processes are visible. `signal` and `process-info*` outside the sandbox are denied, which holds (it needs an explicit `(deny process-info*)`: a deny-default profile still allows it). `KERN_PROCARGS2` returns another same-uid process's arguments and environment whatever the profile says, the caller's own included, so that is a reported gap (4.5): a caller must hold no secret in its environment on macOS. `fcntl(F_SETOWN)` with `O_ASYNC` delivers `SIGIO` and `SIGURG` to a process outside, which Seatbelt does not filter (4.5). |
+| Read-only root; covers (tmpfs, or `/dev/null` for non-dirs); default covers; people's homes; the account's own home | ✓ | | `file-read*` allow, then cover denies. Test each default cover, including through the `/System/Volumes/Data` firmlink paths (`/Users` is reachable both ways, and Seatbelt matches the usual name, so a path a caller names through the data volume is mapped to it; a `Cover` written the other way once covered nothing). Files of the account's uid outside the four covers, such as `/opt/homebrew/var`, stay readable (4.5). |
 | Legwork's config, state, and other sandboxes' directories covered | | ✓ (`Spec.Cover` from config) | same denies. Test each. |
 | Mount-table covers (`.zfs`, other mounts of a covered fs) | ✓ | | no `.zfs`. Other volumes are under `/Volumes`, which is covered. Test an APFS snapshot mount, such as Time Machine's local ones. |
 | `/etc` links into covered dirs rebound | ✓ | | `/etc` is itself a link to `/private/etc`. Test reads of `/etc/localtime` and `/etc/hosts`. |
 | Path and link rules: no link in home or `write`; a link followed only outside writable dirs; a missing cover inside a writable dir aborts; no mount inside a writable dir; cwd must be shown | ✓ | passes real paths | the same checks in the library before the profile is written. Test that `subpath` on the real path holds. |
 | A home per thread; `work` beside the CLI home; `read`/`write` refused if they overlap state | | ✓ | same, in legwork |
-| Scratch tmpfs 1 GiB; `/dev` read-only apart from `/dev/shm` | ✓ default, `ScratchSize`. memfd and anonymous shared memory are not bounded by it, only by a delegated cgroup's `memory.max` | | none. `TMPDIR` is in `Home`, with no size cap beyond `RLIMIT_FSIZE` per file. Report. |
+| Scratch tmpfs 1 GiB; `/dev` read-only apart from `/dev/shm` | ✓ default, `ScratchSize`. memfd and anonymous shared memory are not bounded by it, only by a delegated cgroup's `memory.max` | | none. `TMPDIR` is in `Home`, with no size cap beyond `RLIMIT_FSIZE` per file. Report. `/dev` is denied but for `null`, `zero`, `random`, `urandom` and `/dev/fd/N`. |
 | One-entry passwd/group | ✓ | | none. Directory Services lists every account through `opendirectoryd`. Report, and test what `getpwnam` needs. |
 | First stage: private mounts, caps dropped on the exec'ing thread, no_new_privs, pid 1 re-exec, undumpable | ✓ | | no capabilities to drop. Test that a setuid binary can't escape the profile, such as `sudo` with a cached ticket from the admin's terminal. |
 | Filter: allowlist, arg checks, ENOSYS default, foreign ABIs refused, low-32-bit checks, TSYNC result check | ✓ | | none at the syscall level. Seatbelt filters operations. Whether `syscall-unix` rules work under `sandbox-exec` is untested. |
 | Kernel level per child | | ✓ (`kernel:`) | one profile for every level, never weaker than asked |
-| Own process group, foreground of a terminal on `Stdin`; no signals or priority changes reach the caller's group | ✓ | | the stage sets the process group (4.4). Deny `signal` outside the sandbox, as in the namespaces row, and test `kill(0)` from inside. |
+| Own process group, foreground of a terminal on `Stdin`; no signals or priority changes reach the caller's group | ✓ | | the stage starts the command in a process group of its own, and stays in the caller's (4.4). `signal` outside the sandbox is denied, and `kill(0)` and `kill(-1)` from inside reach only the sandbox, and one sandbox cannot signal another's. The command can leave its group, so teardown does not rely on it (4.5). |
 | New anonymous session keyring (the caller's is unreadable) | ✓ stage joins one before the filter, at every level | | no kernel keyrings. The keychain is the equivalent. Test that it is unreachable. |
 | Caller's session kept, `TIOCSTI`/`TIOCLINUX` refused | ✓ | relies on it | `TIOCSTI` is open, and the admin's ptys share the uid. Deny opening `/dev/ttys*` and `/dev/ptmx` beyond inherited descriptors, and deny `file-ioctl` on ttys where the profile language allows it. Test injecting into another terminal of the same user. |
 | Stage runs the caller binary's `init` with `CAP_SYS_ADMIN` (nested userns) | documented | ✓ "no `init`" rule from one-binary's Code layout | n/a: the stage runs outside the profile, as the caller |
-| Network namespace, proxy listener handed out | ✓ mechanism (new) | ✓ proxy, allowlist, logging | parent-bound port allowed by number. `BroadLoopback` only by opt-in (4.3). Test that other ports refuse. |
+| Network namespace, proxy listener handed out | ✓ mechanism (new) | ✓ proxy, allowlist, logging | parent-bound port allowed by number, over TCP, on every address the host has, so a `Loopback` port can be bound on the LAN address and a LAN peer can reach it, even with `NetworkNone` (4.3). `BroadLoopback` only by opt-in (4.3). Test that other ports refuse. |
 | Bridge check by pid namespace (`--info-fd`), by session on macOS | ✓ exposes the pid, taken only from `--info-fd` (4.4) | ✓ the check | session check through `LOCAL_PEERPID` and `getsid`, legwork's. Test a sandboxed process calling `setsid` and connecting. |
 | Root launcher, uid per child, nftables for `direct`, cgroups | ✓ refuses euid 0 and a uid change. The caller must already run as the sandbox's uid, because `Command` resolves paths, opens bind sources, reads homes and writes the passwd entry in the caller. | ✓ the launcher switches uid in its own child before calling the library, as one-binary's Root describes | LaunchDaemon as root, uid switched before the library. Test the euid-0 refusal. |
 | Seatbelt profile: deny default, covers as denies after the broad allow, `mcp.sock` by path, proxy port, mach services, never `lsopen` (spikes.md M3) | ✓ (new backend) | ✓ which paths | it is the profile. `mcp.sock` in `Write` needs a `(remote unix-socket (path-literal ...))` connect rule as well as the `subpath` allow, since a file allow doesn't grant a connect. Test that it connects, and that another socket under `Write` doesn't. |
@@ -107,7 +107,7 @@ This section is the in-place mode. Compose stays a supported deployment in opera
 | dropped capabilities, no-new-privileges | first stage drops caps, no_new_privs, seccomp | deny-default profile, never `lsopen` |
 | separate uid hides server files | covers hide the data dir, config, homes | profile denies the same |
 | memory cap, no pids cap | cgroup if delegated, else rlimits plus a watchdog (3.5) | rlimits plus a watchdog (3.5) |
-| init process, group kill | pid 1 reaps; the whole tree dies with it | process group kill; `setsid` escapes |
+| init process, group kill | pid 1 reaps; the whole tree dies with it | the stage ends every process under the profile, whatever its group (4.5) |
 | tar over HTTP to the shim | `serve` writes the project into a fresh build dir before start and reads outputs through `os.Root` after `Wait` | same |
 
 ### 3.2 What the renderer needs
@@ -184,8 +184,8 @@ Use what the host gives, and log once what's missing.
 - **macOS** (web sources, nothing run).
   - No cgroups, no pid namespace. `RLIMIT_AS` shares its number with `RLIMIT_RSS` in XNU and is reported not to be enforced. `RLIMIT_DATA` rejects values below about 418 GB on Apple Silicon. `RLIMIT_NPROC` counts every process of the uid, the user's apps included. So set `CPU`, `NOFILE` and `FSIZE`, which have standard BSD semantics (inferred).
   - Memory: the watchdog.
-  - Teardown: start the build in its own process group and SIGKILL the group. A process that calls `setsid` escapes. It keeps its profile, which names only its own build dir, deleted by then, and its own proxy port, closed by then. So it has no files and no network, and `RLIMIT_CPU` ends it.
-- **Footprint watchdog (both, when there's no cgroup).** `serve` polls the build's processes every few hundred ms and kills the build past a threshold. On Linux that's the process group via `/proc/<pid>/status`. On macOS it's `proc_listpgrppids` plus `proc_pid_rusage` `ri_phys_footprint`. It's a soft limit: a fast spike can land between polls, and macOS swaps before it kills. It's still enough to stop a runaway recipe from taking the machine. The library offers `Cmd.Footprint()`, and the threshold is trmnl's.
+  - Teardown: start the build in its own process group and SIGKILL the group, and then every process that runs under the build's profile, which the stage finds by asking the kernel what each pid's profile allows (4.5). A process that leaves the group with `setpgid`, job control or `setsid`, or whose parent died, is ended with it, each signaled as the scan finds it, which stopped a process that re-forked every millisecond that a scan-then-signal pass missed. A fork bomb can still outpace the scan, and then `Wait` returns an error that says so. (The design had said that one that called `setsid` escaped and kept a profile with no files and no network. A review showed it was not so: `setpgid` was enough, and `NetworkHost` kept the network.) `RLIMIT_CPU` does not end a process: the hard limit sends no `SIGKILL` to a program that ignores `SIGXCPU`, which 4.5 explains.
+- **Footprint watchdog (both, when there's no cgroup).** `serve` polls the build's processes every few hundred ms and kills the build past a threshold. On Linux that's the process group via `/proc/<pid>/status`. On macOS it's the processes under the build's profile, found as for teardown, plus the process group, with `proc_pid_rusage`'s `ri_phys_footprint`. It's a soft limit: a fast spike can land between polls, and macOS swaps before it kills. It's still enough to stop a runaway recipe from taking the machine. The library offers `Cmd.Footprint()`, on both platforms, and the threshold is trmnl's.
 
 ### 3.6 Firefox under each backend
 
@@ -246,7 +246,7 @@ type Report struct {
     Backend         string             // "bubblewrap" or "seatbelt"
     Kernel          map[Kernel]Kernel  // level given per requested one, never lower; a level this host can't meet is absent
     TreeKill        bool               // killing the sandbox kills every descendant
-    PrivateLoopback bool               // loopback and abstract sockets private to the sandbox (macOS: true unless BroadLoopback)
+    PrivateLoopback bool               // loopback and abstract sockets private to the sandbox (macOS: false: Loopback ports are open on every address)
     Ignored         []string           // Spec fields this backend ignores, e.g. "Hostname"
     Container       string             // best effort: "docker", "podman", "lxc", "kubernetes", "systemd-unit", ""
     Checks          []Result           // each prerequisite, and what blocks it (6.3)
@@ -275,6 +275,7 @@ func (c *Cmd) Footprint() (bytes int64, err error) // for a watchdog when there'
 func Run(ctx context.Context, spec Spec) (int, error) // dedicated-process form, as legwork sandbox uses
 func (s *Spec) RegisterFlags(fs *flag.FlagSet)
 const SelfPath = ... // this binary as the command names it: /dev/sandbox-stage on Linux, its real path on macOS
+var ErrSurvivors error // macOS only in practice: Wait and Run match it when teardown could not confirm the sandbox empty (4.5)
 ```
 
 - **Fields across backends.** Every field is honored or harmlessly ignored on both backends, and ignored fields are listed in `Report`. The caller logs the report once at startup, and the library never logs.
@@ -282,7 +283,7 @@ const SelfPath = ... // this binary as the command names it: /dev/sandbox-stage 
 - **`Env` lives only on `Cmd`**, as on `exec.Cmd`.
   - It starts empty. The caller sets it after reading `ListenAddrs()`, which on macOS isn't known until `Command` has bound the port. `Start` then always sets the sandbox's `HOME`, `TMPDIR` and `XDG_*` over it, including `XDG_RUNTIME_DIR`. legwork's `commandEnv` misses that one, and the host's `/run/user/<uid>` leaked into Firefox (spikes.md L2).
   - On macOS it also sets `CFFIXED_USER_HOME` to the sandbox home. `$HOME` alone doesn't redirect where Cocoa looks for `~/Library` (Application Support, Caches). Without it, Firefox 152-157 hangs on the TCC-protected real `~/Library/Application Support/Firefox`, and later versions write into the real `~/Library` (spikes.md M2). CFPreferences still reads the real `~/Library/Preferences`, and the profile refuses that at no cost.
-  - A server that forgets to set it passes on nothing, so none of its tokens leak. `Run`, the standalone form, passes `os.Environ()` explicitly.
+  - A server that forgets to set it gives the command nothing of its own environment, but that does not keep its tokens from the command on macOS. The stage's parent is the caller, and `sysctl(KERN_PROCARGS2)` returns a same-uid process's environment whatever the profile says, so the command reads the caller's, and the arguments and environment of every other non-Apple process of the account. (The first draft said none of its tokens leak, which a review disproved on macOS.) A macOS caller must hold no secret in its environment at exec time: read it and re-exec with a scrubbed one, or take it from a file or a descriptor. On Linux it holds, since the pid namespace hides the caller. `Run`, the standalone form, passes `os.Environ()` explicitly.
   - Rejected: making every listener address known before `Command`. Linux listeners are bound inside the namespace, so the backends would diverge. Also rejected: a `SANDBOX_LISTEN_n` variable for the command to translate, since legwork execs its CLI directly and nothing would translate it.
 - **The uid.** `Command` and `Start` run as the sandbox's uid. They resolve paths, open bind sources by fd, read homes and write the passwd entry in the calling process, and switching uid at exec would leave all of that done as root. So `Command` refuses euid 0. There's no `Credential` option at all. legwork's root launcher switches uid in its own child, then calls the library, which matches one-binary's Root.
 - **`Cmd` wraps `exec.Cmd` instead of embedding it.** The `--args` body bakes in descriptor numbers, so a caller changing `ExtraFiles`, `SysProcAttr` or `Path` would break the sandbox or drop its parent-death handling. The fields above are trmnl's and legwork's whole need: stdio, `Env`, cancellation through `ctx` plus `WaitDelay`, and a cgroup. `Start` checks them, then does the path work. Sessions stay unset (2, "No `--new-session`").
@@ -301,16 +302,16 @@ const SelfPath = ... // this binary as the command names it: /dev/sandbox-stage 
 | `/etc` link targets under covers | rebound read-only | allowed read-only |
 | `Kernel` | strict, nested and open are different filters | all strict |
 | Environment | `Start` sets `HOME`, `TMPDIR`, `XDG_*` | the same, plus `CFFIXED_USER_HOME` (4.1) |
-| `Services` | ignored | extra `mach-lookup` groups. Firefox's needs only `launchservicesd`, `configd` and its own `org.mozilla.machname.*` register and lookup, with no `iokit-open` (spikes.md M2). |
+| `Services` | ignored | extra `mach-lookup` groups. Firefox's needs only `launchservicesd`, `configd` and its own `org.mozilla.machname.*` register and lookup, with no `iokit-open` (spikes.md M2). That namespace is shared with the user's own Firefox and every other sandbox given the group (4.5). |
 | `Network: NetworkNone` (zero value) | bubblewrap's `--unshare-net`: a namespace with only loopback, no new code. Abstract sockets become private too. | deny network, except the `Listen`/`Loopback` ports and the unix sockets the `Spec` names. Firefox renders a `file://` page with none, and one allowed port works (spikes.md M2). |
 | `Network: NetworkHost` (asked for explicitly) | host network | allow outbound, deny `localhost` |
-| `BroadLoopback` (opt-in) | ignored, since loopback is private | allow `localhost:*`, which also reaches the host's LAN address. No reliable per-port deny exists (4.3). |
+| `BroadLoopback` (opt-in) | ignored, since loopback is private | allow `localhost:*` to bind, accept and dial, TCP and UDP, which also reaches the host's LAN address and lets the command serve it. No reliable per-port deny exists (4.3). |
 | `Listen` | bound inside the namespace by the stage, handed to the parent | bound by the parent on `127.0.0.1:0`; the profile allows that port |
-| `Loopback` | private loopback; fixed ports returned | allocated by the parent; the profile allows bind and connect on exactly those |
+| `Loopback` | private loopback; fixed ports returned | allocated by the parent; the profile allows bind and connect on exactly those TCP port numbers, on every address the host has (4.3), so it is not private |
 | `Files`, `Rlimits` | through bubblewrap; set by pid 1 | through `sandbox-exec`; set by the stage before it execs |
 | Memory, tasks | caller's cgroup, or `Footprint` | `Footprint` |
-| Teardown | pid 1 dies, all die | process group; `setsid` escapes |
-| `TIOCSTI` | filter refuses | not refusable. The profile denies opening other ttys, and the macOS column of section 2 tests injection. |
+| Teardown | pid 1 dies, all die | every process under the profile, found by the profile's marker (4.5) |
+| `TIOCSTI` | filter refuses | not refusable. The profile denies opening any device but a few, and the macOS column of section 2 tests injection. |
 | `Hostname`, `ScratchSize` | supported | ignored; `TMPDIR` is in `Home` |
 
 ### 4.3 Egress brokered by the parent
@@ -322,12 +323,15 @@ Programs read `HTTP_PROXY` as a TCP `host:port`, so the proxy needs a TCP addres
 
 `Loopback` is for WebDriver. On Linux any port works, since loopback is private. On macOS a profile that allowed all of `localhost` would expose `serve`'s listeners and other local services. So the parent allocates two ports, and trmnlp starts geckodriver on `LoopbackPorts()[0]` with `--marionette-port LoopbackPorts()[1]`. That's a small trmnlp change, needed on macOS only.
 
+Those ports are not private on macOS, though, which an earlier draft of this section implied. A profile names a host only as `*` or `localhost`, and `localhost` is every address the host has. So with `NetworkNone` the command can bind a `Loopback` port on the LAN address or the wildcard, and a peer on the LAN that connects there gets a two-way channel to it. Seatbelt checks the remote address at connect and not at accept, and takes no host but those two, so nothing limits the peers: a `network-inbound` deny of every remote but `localhost` after the allow let a local connection through, and the same as the allow's own filter made `listen` fail. Any local process reaches the ports too, as it does a `Listen` port. The exposure is any host that can reach any address of this Mac, the LAN, a VPN or a routable IPv6 address. A command that takes an inherited socket needs no `Loopback` port: a listener the caller binds on `127.0.0.1` and passes in `Spec.Files` is on `127.0.0.1` only. The test connects from this host to its own LAN address, since the Linux host available could not route to the Mac at all (every port timed out with no sandbox), so a connection from a second machine is inferred, not seen. A caller that cannot accept the LAN being able to reach a command it gave a `Loopback` port should not give one, and a command that serves should bind `127.0.0.1`. `Report.PrivateLoopback` is false on macOS, and `Probe` lists the gap. The rules are TCP only, so a UDP socket on those ports is refused.
+
 Until trmnlp has that change, the caller can set `Spec.BroadLoopback`, and the profile then allows `localhost:*`.
 - It's an explicit opt-in, never automatic. For legwork it would reach `serve`'s listeners and loopback upstreams, past tool policy and the audit log, so legwork never sets it.
 - trmnl sets it on macOS until trmnlp takes fixed WebDriver ports, then drops it.
 
 What it opens, measured on macOS 27.0.1 (ran: spikes.md M1):
-- **Every TCP listener on any of the host's own addresses.** Seatbelt's `localhost` matched the Mac's LAN address too, not just `127.0.0.1` and `::1`.
+- **Every listener on any of the host's own addresses.** Seatbelt's `localhost` matched the Mac's LAN address too, not just `127.0.0.1` and `::1`.
+- **Bind and accept, on any port, on every interface, and UDP as well as TCP.** The measurement above was of dialing. The same allow lets the command squat a port a local client expects, serve the LAN, and send datagrams to local UDP services.
 - **`serve`'s API included.** Neither earlier mitigation works.
   - A `(deny network-outbound (remote ip "localhost:<port>"))` after the broad allow held for about half of all ports. The set it holds for is the same on every rerun, but no pattern was found, so it can't be relied on.
   - Moving `serve` to its LAN address is undone by the first point.
@@ -366,9 +370,48 @@ The proxy is the caller's: `renderproxy` with the `guard` dialer. legwork's plan
     - A parent that dies after bubblewrap makes pid 1 but before it reads `--info-fd` only costs bubblewrap a `SIGPIPE`, and pid 1 reads EOF anyway. Built and tested: the thread-exit test passes 20 of 20 alongside the parent-`SIGKILL` and lifeline-EOF tests.
 - **macOS.**
   - The same `Stage()` call runs outside the profile. It sets rlimits and the process group, closes stray descriptors, and starts `/usr/bin/sandbox-exec -f /dev/fd/N -- command`, so the profile isn't in argv.
-  - The stage stays alive outside the profile as a small supervisor instead of exec'ing. It holds the lifeline, kills the process group on EOF, and relays the exit status (inferred).
+  - The stage stays alive outside the profile as a small supervisor instead of exec'ing. It holds the lifeline, ends the sandbox on EOF (the process group, then every process under the profile, 4.5), and relays the exit status.
   - The parent binds the listeners, so there's no control socket. `Pid()` is the parent's own child, so it's taken from no message at all.
 - **On both,** the command can be the same binary (`[SelfPath, "render-child", ...]`), as one-binary's `turn` and `stdio` children are.
+
+### 4.5 Where the macOS backend departs from this design
+
+Written after building and running it on macOS 27.0.1 and 27.2.0. docs/sandbox.md has the mechanism, the findings and the tests.
+
+**Public API.**
+- `Cmd.Footprint() (int64, error)` is in the design (4.1) and was missing from the Linux code. It is now on both. macOS sums `ri_phys_footprint` over the processes under the profile, the command's group and its descendants; Linux sums resident sets over bubblewrap's descendants. No other signature changed.
+- `Service` has two constants, `ServiceFirefox` and `ServiceDirectory`. The example `ServiceFonts` is not defined, since Firefox renders text from `/System/Library/Fonts` with file reads alone, and a group needs evidence. `Command` refuses a name it does not know on macOS.
+- `SelfPath` is a variable on macOS (it already was off Linux), the binary's real path, and every profile lets the command read and run exactly that file.
+
+**The stage and teardown (4.4).**
+- The stage is a supervisor, as designed, but the command is in a process group of its own and the stage stays in the caller's. The design had the stage and command share a group that the stage then kills, which would kill the stage before it reported the status. `Pid()` is the stage's pid.
+- Settings, a reply and the lifeline are pipes: no control socket, since the parent binds the listeners. The profile goes to `sandbox-exec -f /dev/fd/N`, as designed, on a pipe, and `sandbox-exec` execs the command with that pipe open. The command holds one descriptor more than its own, at end of file. Closing it needed a second exec inside the profile.
+- If the stage is killed, `Wait` ends the sandbox as soon as the stage is gone, so a process it left holding the output does not keep `Wait` from returning. If the caller dies, the stage does, from the lifeline.
+- **Teardown does not rely on the process group.** The design, and the first build, ended the command's group and said a process that called `setsid` escaped with no files and no network. A review found that `setpgid`, including joining the caller's group, and a shell's job control (`set -m; sleep 600 &`) escaped too, that an escapee kept whatever the profile gave (all outbound network under `NetworkHost`, writes to Home and the `Write` paths), and that `Footprint` could not see it. The stage and `Footprint` now find the sandbox's processes by `sandbox_check`: each profile allows a Mach lookup of one random name and denies a lookup of another, and only a process under that profile answers that way. `sandbox_check` is reached without cgo through a trampoline, `golang.org/x/sys/unix` style (docs/sandbox.md). The first idea, a path, failed: a path that does not exist reads as denied for every process. The caller's last scan after `Wait` kills by the marker only, never by the group number, which the kernel may give to someone else once the group is empty.
+- **A sandbox cannot replace its own root.** The profile denies unlink and create at the literal path of Home and each `Write` path. A review removed Home and put a link to the caller's private directory there, which the caller then followed.
+- `Run` on a `SIGTERM` or `SIGHUP` ends the sandbox, as on Linux.
+- The command's `argv[0]` is the `PATH`-resolved path, since `sandbox-exec` takes the program and not a name for it.
+
+**Listeners and ports.** `Command` binds the `Listen` listeners and reserves the `Loopback` ports, since `ListenAddrs` and `LoopbackPorts` are known before `Start`. `Start` frees the reserved ports just before the command can bind them, which leaves a window another process could use. A `Cmd` that is never started gives its sockets back when its context ends.
+
+**Rules that did not behave as inferred.**
+- `process-info*` is not denied by `(deny default)`. It is denied by name, then allowed to `same-sandbox`.
+- `KERN_PROCARGS2` cannot be denied by any profile tried. This is a gap. 5.1's guidance, concurrency 1 and ending a build's processes after it, applies to macOS in-place mode too. It covers the caller's own environment as well (4.1), so a caller holds no secret there.
+- `fcntl(F_SETOWN)` with `O_ASYNC` makes the kernel send `SIGIO` and `SIGURG` to a process outside, which the signal hook is not asked about. A gap, shown by a test. They are ignored by default.
+- A `Cover` named through `/System/Volumes/Data` covered nothing, since Seatbelt matches the usual name. `prepare` maps it.
+- The sandbox reads with the caller's uid, so files of the account outside the four default covers are readable: `/opt/homebrew/var` and `etc`, `/usr/local` on an Intel Mac, user-owned directories under `/Library/Application Support`. A caller covers what it keeps there.
+- `Loopback` and `Listen` ports are open on every address of the host (4.3), and `PrivateLoopback` is false.
+- `RLIMIT_CPU` is advisory. `RLIMIT_AS` is refused by `Command`, and listed in `Report.Unsupported`.
+- The `localhost` deny under `NetworkHost` holds after an allow written for tcp and udp, and not after `(remote ip "*:*")`. It also refuses the host's LAN address. `BroadLoopback` stays a reported gap and works as 4.3 describes.
+- The command cannot call `setsid` (it leads its group), but its children can, and it can leave the group with `setpgid`. Neither matters to teardown now.
+- A unix socket in `Write` needs the connect rule, as the design says. The command cannot bind a unix socket anywhere, which Linux allows.
+- No device but `null`, `zero`, `random`, `urandom` and `/dev/fd/N` can be opened (a list of families missed `/dev/console` and `/dev/cu.*`), so `TIOCSTI` has no terminal to reach but the one handed in.
+- `/private/var/select` and `/private/var/db/timezone` are shown under the `/private/var` cover, for `/bin/sh` and `/etc/localtime`.
+- `NetworkHost` allows `mDNSResponder`, `configd`, `dnssd` and, from 27.2, `TrustEvaluationAgent` lookups.
+
+**Tests.** Every macOS cell in section 2's table has a test or a named gap (`TestGap...`), apart from these: the euid-0 refusal is driven through a variable and not by a real root; an APFS snapshot mount needs root; a replay of a real `launchservicesd` open request was not possible, so the raw-XPC test shows the lookup and that nothing opens from our message, and not that the server checks `lsopen`; and `syscall-unix` rules were not tried, since nothing here claims a syscall filter.
+
+**Packaging.** Probe maps every `Kernel` level to `strict`, reports the gaps as `NotEnforceable` checks, and reports `Container` as `app-sandbox` or `launchd-job`. Firefox makes `Library/Application Support` in the home with an ACL that denies deletion, so a caller that removes a build's home runs `chmod -RN` first.
 
 ## 5. Isolation modes
 
@@ -407,7 +450,7 @@ What operator mode doesn't give, which `Check` reports:
 
 - **Builds on one render side share a uid.**
   - Concurrent builds can read each other's `FIELD_*` through `/proc/<pid>/environ`.
-  - A process a build leaves behind (`setsid` escapes the group kill in `procgroup_unix.go`) sees later builds' variables and files.
+  - A process a build leaves behind (`setsid` or `setpgid` escapes the group kill in `procgroup_unix.go`) sees later builds' variables and files.
   - Fixes, any one of these:
     - concurrency 1 (the default), plus the render side killing every other process in its container after each build. It's alone there with the init, so it can (inferred).
     - the in-place sandbox inside the render container ("both").
@@ -482,10 +525,10 @@ func Check(ctx context.Context, spec *Spec, want Expect) ([]Result, error)
 | Running as uid 0 in the initial user namespace | `/proc/self/uid_map` | `getuid` |
 | Create a user namespace; mount a tmpfs; `io_uring_setup`; netfilter `setsockopt` replace; `bpf` | tried | `Skipped` (none exist) |
 | Under `kernel: nested`: unmount a cover, remount a read-only bind writable, mount from outside the view | tried, when `spec` says nested | `Skipped` |
-| Processes outside our tree: visible, signalable, traceable, environment readable | `/proc`, `kill(pid, 0)`, `/proc/<pid>/{mem,environ}` | `kill(pid, 0)`, `KERN_PROCARGS2` (it returns another same-uid process's environment unless the profile denies `process-info*`, inferred) |
-| Well-known host secrets readable: `~/.ssh`, `~/.aws`, `~/.config/gcloud`, `~/.kube/config`, `~/.docker/config.json`, `~/.netrc`, `~/.npmrc`, `~/.gem/credentials`, `/etc/shadow` | `open` | same, plus the user's Keychain files |
-| Well-known sockets reachable: Docker, Podman, containerd, D-Bus session and system bus, `SSH_AUTH_SOCK`, the systemd user manager, host abstract sockets | `connect` | same, minus abstract sockets |
-| Writes outside `Home` and `Write` | each `Read` path and `/`, when `spec` is given | same |
+| Processes outside our tree: visible, signalable, traceable, environment readable | `/proc`, `kill(pid, 0)`, `/proc/<pid>/{mem,environ}` | `kill(pid, 0)`, tried on the account's own processes first, and `KERN_PROCARGS2`, which returns another same-uid process's environment whatever the profile says |
+| Well-known host secrets readable: `~/.ssh`, `~/.aws`, `~/.config/gcloud`, `~/.kube/config`, `~/.docker/config.json`, `~/.netrc`, `~/.npmrc`, `~/.gem/credentials`, `/etc/shadow` | `open` | same, plus the user's Keychain files. The caller finds the ones that exist under its own home and every account's, and sends them, since the child's `HOME` is the sandbox's. None existing is a skip |
+| Well-known sockets reachable: Docker, Podman, containerd, D-Bus session and system bus, `SSH_AUTH_SOCK`, the systemd user manager, host abstract sockets | `connect` | same, minus abstract sockets. The caller finds the sockets that exist, with its own `SSH_AUTH_SOCK`, and sends them. None existing is a skip |
+| Writes outside `Home` and `Write` | each `Read` path and `/`, when `spec` is given | the directories outside the sandbox's own that the account can write (found with `access(2)` in the caller), and each `Read` path and `/`. None to try is a skip |
 | Anything under a cover readable | one entry per cover, when `spec` is given | same |
 | Snapshot dirs: each `Unreadable` path tried through `.zfs/snapshot` at its mount root and through `.snapshots` (sandbox.md, Limits) | tried | `Skipped` |
 | Direct egress: TCP to a public address, UDP DNS to a public resolver | tried | tried |
@@ -594,9 +637,9 @@ The API is settled against both backends (sections 4.1 and 4.2). This repo build
    - a CI job (Ubuntu 24.04, CGO on and off): `.github/workflows/test.yml`, which also vets arm64 and arm and builds on macOS. It has not run, since this repo has no GitHub remote yet; actionlint passes
    - a security review of the result.
 2. **macOS library, complete:**
-   - the Seatbelt backend: profile generation, the stage, `Services` groups
-   - tests for the macOS column of section 2, including a raw-XPC `lsopen` attempt
-   - a security review.
+   - the Seatbelt backend: profile generation, the stage, `Services` groups. Built.
+   - tests for the macOS column of section 2, including a raw-XPC `lsopen` attempt. Built, with the limits 4.5 gives for the XPC one.
+   - a security review, which is to come.
 3. **Adoption,** by each project's own sessions: trmnl on Linux, then on macOS, then legwork. Deny-log runs with real workloads (trmnlp, geckodriver, the recipe runtimes, legwork's CLIs) happen there, and fixes to the library come back here.
 
 Outside this repo, and not blocking it: trmnlp's fixed WebDriver ports, proposed upstream early, since macOS needs them to drop `BroadLoopback`.
@@ -616,10 +659,11 @@ Why this order: the Linux backend has a review record and tests behind it, and i
 9. **trmnlp changes:** headless, if `MOZ_HEADLESS` isn't enough, and fixed WebDriver ports for macOS (risk 2). Neither blocks. The `--headless` flag worked for `firefox --screenshot` (spikes.md L2). Neither `MOZ_HEADLESS` from the environment nor trmnlp's own WebDriver path was run.
 10. **Render drift** across host versions and fonts. Mitigations in 3.3.
 11. **Memory without a cgroup** is a polling watchdog: soft, but working.
-12. **macOS teardown gap:** an orphaned `setsid` process survives without files or network until `RLIMIT_CPU` ends it. A uid per sandbox (legwork's root launcher) closes it fully.
+12. **macOS teardown** ends every process under the profile, found by `sandbox_check` (4.5), where the first build ended only the process group and let `setpgid`, job control and `setsid` escape. What is left is a fork bomb that outpaces the scan, which nothing bounds (`RLIMIT_NPROC` counts the whole uid), and then `Wait` returns an error saying teardown could not confirm the sandbox empty and `Probe` lists it, and `RLIMIT_CPU`, which does not end a process. The `sandbox_check` call is a private-ABI trampoline that was run on arm64 and on amd64 under Rosetta 2 (the amd64 run is not native Intel hardware), so it is one more thing to rerun on each macOS release (risk 3).
 13. **Stage runs the caller's `init` with `CAP_SYS_ADMIN`** on Linux. Audit trmnl-byos's dependencies.
 14. **Fix coordination.** Tag releases, since legwork pins a version as an exception to its stdlib-then-`x` rule. Keep the moby profile pin, the Seatbelt service groups and the findings list in the library only.
 15. **Older bubblewrap.** Descriptor passthrough, `--info-fd` and the lifeline were confirmed on 0.12.0 only (spikes.md L1). legwork's floor is 0.8, so CI should run the oldest version it accepts.
+16. **macOS callers hold no secret in their environment.** The command reads it with `KERN_PROCARGS2` (4.1, 4.5). trmnl's `serve` must read its keys and re-exec, or take them from a file.
 
 Retired by the spikes: Firefox headless under `strict` on Linux (spikes.md L2), headless Firefox under a deny-default Seatbelt profile (M2), and descriptor passthrough on bubblewrap 0.12.0 (L1).
 

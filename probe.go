@@ -18,7 +18,10 @@ type Report struct {
 	// Kernel maps each requested level to the level given, never a lower
 	// one. A level this host can't meet is absent.
 	Kernel map[Kernel]Kernel
-	// TreeKill is true when killing the sandbox kills every descendant.
+	// TreeKill is true when killing the sandbox kills every descendant. On
+	// macOS it means every process it can find under the sandbox's profile: a
+	// process that forks faster than the teardown's scan can outlast it, and
+	// Wait then returns an error saying so (the probe.gap.tree-kill finding).
 	TreeKill bool
 	// PrivateLoopback is true when loopback and abstract sockets are
 	// private to the sandbox.

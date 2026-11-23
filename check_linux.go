@@ -329,6 +329,14 @@ func checkNested(e *checkEnv) []Result {
 	}
 }
 
+// platformSockets are the sockets of this platform that socketCandidates does
+// not list: none on Linux, whose list is the generic one.
+func platformSockets() []string { return nil }
+
+// platformHints is empty on Linux, where the child finds its own targets in the
+// view it is given.
+func platformHints(*Spec) checkHints { return checkHints{} }
+
 // foreignPIDs returns the pids in /proc that are neither this process nor
 // its descendants, the parent first.
 func foreignPIDs() ([]int, error) {

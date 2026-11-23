@@ -58,9 +58,20 @@ jobs:
           SBX_APPARMOR: "1"
           CGO: ${{ matrix.cgo }}
 
+  # The tests start real sandboxes with /usr/bin/sandbox-exec, as the runner's
+  # own user, so they need no setup. A runner is not inside a Seatbelt profile,
+  # which Probe would refuse. Firefox is on the runner image, so
+  # TestFirefoxScreenshot and TestFirefoxNetwork run, and skip where it is not.
+  # The race detector needs cgo on macOS, so only that leg runs it.
   macos:
-    name: build and vet macos
+    name: test macos cgo=${{ matrix.cgo }}
     runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cgo: ["0", "1"]
+    env:
+      CGO_ENABLED: ${{ matrix.cgo }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
@@ -68,3 +79,12 @@ jobs:
           go-version-file: go.mod
       - run: go build ./...
       - run: go vet ./...
+      # The other architecture, which the runner cannot run but must build.
+      - run: go vet ./...
+        env:
+          GOARCH: amd64
+      - name: Test
+        run: go test -v -count=1 -timeout 15m ./...
+      - name: Test with the race detector
+        if: matrix.cgo == '1'
+        run: go test -race -count=1 -timeout 25m ./...

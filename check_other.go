@@ -2,6 +2,11 @@
 
 package sandbox
 
+import (
+	"os"
+	"path/filepath"
+)
+
 // platformChecks are the checks that need Linux, which are skipped here, and
 // the limits, which nothing here can enforce.
 func platformChecks(*checkEnv) []Result {
@@ -20,14 +25,6 @@ func platformChecks(*checkEnv) []Result {
 	return res
 }
 
-func checkProcesses(*checkEnv) []Result {
-	var res []Result
-	for _, n := range []string{"proc.visible", "proc.signal", "proc.trace", "proc.environ"} {
-		res = append(res, skipped(n, "not implemented on this platform yet"))
-	}
-	return res
-}
-
 func checkSnapshots([]string) []Result {
 	return []Result{skipped("snapshots", "Linux only")}
 }
@@ -37,3 +34,16 @@ func initialUserNS() bool { return true }
 
 // grandchild has no modes here.
 func grandchild([]string) (int, bool) { return 0, false }
+
+// platformSockets are the sockets of the container runtimes that run on macOS
+// in a VM, and which a program that reaches can start anything as the user:
+// Docker Desktop's, and Colima's, OrbStack's, and Podman's.
+func platformSockets() []string {
+	socks := []string{"/var/run/docker.sock", "/private/var/run/docker.sock"}
+	if home, err := os.UserHomeDir(); err == nil {
+		for _, p := range []string{".docker/run/docker.sock", ".colima/default/docker.sock", ".orbstack/run/docker.sock", ".local/share/containers/podman/machine/podman.sock"} {
+			socks = append(socks, filepath.Join(home, p))
+		}
+	}
+	return socks
+}

@@ -1,0 +1,607 @@
+package sandbox
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"math"
+	"net"
+	"os"
+	"os/exec"
+	"os/signal"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
+	"time"
+
+	"golang.org/x/sys/unix"
+)
+
+// run is what a started Cmd holds.
+type run struct {
+	started, waited bool
+	cmd             *exec.Cmd
+	// group is the command's process group, which is its pid, and the one the
+	// stage ends. It is set from the stage's reply.
+	group int
+	// mark is the pair of names that tells the sandbox's processes from
+	// others, for teardown and Footprint.
+	mark marker
+	// lifeline is the write end of the pipe the stage watches. Only this
+	// process holds it, and it is close-on-exec, so when this process goes,
+	// however it goes, the stage reads EOF and ends the command's group.
+	lifeline     *os.File
+	closeLife    sync.Once
+	sent         <-chan error
+	listeners    []net.Listener
+	reservedPort []net.Listener
+	// keepOpen stops the close of the unstarted Cmd's sockets that ctx's end
+	// would make, and reports false if that close has begun.
+	keepOpen func() bool
+}
+
+// resources maps each Resource to its macOS number. ResourceAddressSpace has
+// none: RLIMIT_AS shares its number with RLIMIT_RSS in XNU, which nothing
+// enforces, so a limit that looks set would hold nothing.
+var resources = map[Resource]int{
+	ResourceCPU:       unix.RLIMIT_CPU,
+	ResourceFileSize:  unix.RLIMIT_FSIZE,
+	ResourceCore:      unix.RLIMIT_CORE,
+	ResourceOpenFiles: unix.RLIMIT_NOFILE,
+	ResourceProcesses: unix.RLIMIT_NPROC,
+}
+
+// geteuid is os.Geteuid, a variable so that a test can be root without being.
+var geteuid = os.Geteuid
+
+// tmpName is the directory in the home that TMPDIR and XDG_RUNTIME_DIR name,
+// since there is no private /tmp on macOS.
+const tmpName = "tmp"
+
+// selfPath is this binary's real path.
+func selfPath() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	if r, err := filepath.EvalSymlinks(exe); err == nil {
+		return r
+	}
+	return exe
+}
+
+// SelfPath is the path under which a sandbox's command names this binary, for
+// a command that runs it again: Spec.Command = []string{SelfPath, "mode"}. The
+// binary must call Stage first in main, which handles the mode's marker or
+// returns false so main can. On macOS it is the binary's real path, found at
+// start-up, which every profile lets the command read and run. It is empty if
+// the path cannot be found. Callers must not change it.
+var SelfPath = selfPath()
+
+// Command returns a Cmd that will run spec's command under a Seatbelt profile
+// that /usr/bin/sandbox-exec applies. It checks what needs no look at the host
+// and starts nothing; Start does the rest. ctx kills the sandbox when it is
+// done, once Start has been called. It binds the Listen listeners and
+// reserves the Loopback ports now, so that ListenAddrs and LoopbackPorts have
+// answers before Start.
+//
+// It refuses to run as root, as on Linux, and there is no way to ask for
+// another account. It refuses a Service it does not know, and a resource limit
+// macOS does not enforce: ResourceAddressSpace.
+func Command(ctx context.Context, spec Spec) (*Cmd, error) {
+	if geteuid() == 0 {
+		return nil, errors.New("the sandbox will not run as root: switch to the sandbox's own uid first")
+	}
+	if err := spec.checkRequest(); err != nil {
+		return nil, err
+	}
+	if spec.Kernel == "" {
+		spec.Kernel = KernelStrict
+	}
+	if err := spec.Kernel.Set(string(spec.Kernel)); err != nil {
+		return nil, err
+	}
+	for _, s := range spec.Services {
+		if _, ok := serviceRules[s]; !ok {
+			return nil, fmt.Errorf("unknown service %q", s)
+		}
+	}
+	for _, r := range spec.Rlimits {
+		if _, ok := resources[r.Resource]; !ok {
+			return nil, fmt.Errorf("macOS does not enforce limit %d: RLIMIT_AS is the same number as RLIMIT_RSS there, which nothing enforces", int(r.Resource))
+		}
+	}
+	spec.Command = slices.Clone(spec.Command)
+	spec.Files = slices.Clone(spec.Files)
+	spec.Rlimits = slices.Clone(spec.Rlimits)
+	spec.Services = slices.Clone(spec.Services)
+	c := &Cmd{ctx: ctx, spec: spec, CgroupFD: -1}
+	closeAll := func() {
+		for _, l := range slices.Concat(c.run.listeners, c.run.reservedPort) {
+			_ = l.Close()
+		}
+	}
+	var lc net.ListenConfig
+	for range spec.Listen {
+		l, err := lc.Listen(ctx, "tcp", "127.0.0.1:0")
+		if err != nil {
+			closeAll()
+			return nil, fmt.Errorf("bind a listener: %w", err)
+		}
+		c.run.listeners = append(c.run.listeners, l)
+	}
+	for range spec.Loopback {
+		l, err := lc.Listen(ctx, "tcp", "127.0.0.1:0")
+		if err != nil {
+			closeAll()
+			return nil, fmt.Errorf("reserve a loopback port: %w", err)
+		}
+		c.run.reservedPort = append(c.run.reservedPort, l)
+	}
+	// A Cmd that is never started would hold its sockets for good, so ctx's
+	// end closes them, until Start takes them over.
+	c.run.keepOpen = context.AfterFunc(ctx, closeAll)
+	return c, nil
+}
+
+// ListenAddrs returns the addresses of the Listen listeners, which the command
+// reaches. The parent binds them on 127.0.0.1 in Command, so they are known
+// before Start, and the profile lets the command connect to exactly those
+// ports.
+func (c *Cmd) ListenAddrs() []string {
+	var addrs []string
+	for _, l := range c.run.listeners {
+		addrs = append(addrs, l.Addr().String())
+	}
+	return addrs
+}
+
+// LoopbackPorts returns the Loopback ports the command may bind and dial.
+// macOS has no private loopback, so Command picks free ports, and the profile
+// allows the command exactly those. Another process could take one between
+// Start closing its reservation and the command binding it.
+func (c *Cmd) LoopbackPorts() []int {
+	var ports []int
+	for _, l := range c.run.reservedPort {
+		ports = append(ports, l.Addr().(*net.TCPAddr).Port)
+	}
+	return ports
+}
+
+// Listeners returns the Listen listeners, in order, once Start has returned.
+// The caller serves them, and closes them when it is done.
+func (c *Cmd) Listeners() []net.Listener {
+	if !c.run.started || c.run.cmd == nil {
+		return nil
+	}
+	return c.run.listeners
+}
+
+// Pid returns the pid of the stage, after Start, which is this process's own
+// child and the sandbox's top process. The command is its child, in a process
+// group of its own.
+func (c *Cmd) Pid() int {
+	if c.run.cmd == nil {
+		return 0
+	}
+	return c.run.cmd.Process.Pid
+}
+
+// stop closes the lifeline, which makes the stage end the command's group
+// with SIGKILL and exit.
+func (c *Cmd) stop() {
+	c.run.closeLife.Do(func() {
+		if c.run.lifeline != nil {
+			_ = c.run.lifeline.Close()
+		}
+	})
+}
+
+// Start resolves the spec's paths, writes the profile, and starts the stage,
+// which runs sandbox-exec. It returns once the stage has started the command,
+// or has failed to, and before the command's own start, so a command that
+// fails to run shows in Wait's status.
+func (c *Cmd) Start() error {
+	if c.run.started {
+		return errors.New("sandbox: already started")
+	}
+	c.run.started = true
+	if !c.run.keepOpen() {
+		return fmt.Errorf("sandbox: %w", context.Cause(c.ctx))
+	}
+	spec := c.spec
+	releasePorts := func() {
+		for _, l := range c.run.reservedPort {
+			_ = l.Close()
+		}
+	}
+	listeners := c.run.listeners
+	ok := false
+	defer func() {
+		if !ok {
+			releasePorts()
+			for _, l := range listeners {
+				_ = l.Close()
+			}
+		}
+	}()
+	if fi, err := os.Stat(sandboxExec); err != nil || fi.Mode()&0o111 == 0 {
+		return fmt.Errorf("find %s, which the sandbox needs on macOS: %v", sandboxExec, err)
+	}
+	self := selfPath()
+	if self == "" {
+		return errors.New("find this binary, which the stage runs")
+	}
+	homes, err := hostHomes()
+	if err != nil {
+		return err
+	}
+	// The account the program runs as may live in a directory service that
+	// /etc/passwd does not list.
+	if home, err := os.UserHomeDir(); err == nil {
+		homes = append(homes, home)
+	}
+	if spec.Dir == "" {
+		spec.Dir = spec.Home
+	}
+	spec, err = prepare(spec, homes, os.DirFS("/"), nil)
+	if err != nil {
+		return err
+	}
+	mark, err := newMarker()
+	if err != nil {
+		return err
+	}
+	in := profileInput{
+		Marker: mark,
+		Home:   spec.Home, Write: spec.Write, Read: spec.Read, Cover: spec.Cover,
+		Self: self, Network: spec.Network, BroadLoopback: spec.BroadLoopback,
+		Services: spec.Services, Loopback: c.LoopbackPorts(),
+	}
+	for _, l := range listeners {
+		in.Listen = append(in.Listen, l.Addr().(*net.TCPAddr).Port)
+	}
+	for _, w := range spec.Write {
+		if fi, err := os.Lstat(w); err == nil && fi.Mode()&os.ModeSocket != 0 {
+			in.Sockets = append(in.Sockets, w)
+		}
+	}
+	prof, err := profile(in)
+	if err != nil {
+		return err
+	}
+	settings := stageSettings{Profile: prof, Marker: mark, Files: len(spec.Files)}
+	for _, r := range spec.Rlimits {
+		lim, err := rlimitFor(r)
+		if err != nil {
+			return err
+		}
+		settings.Rlimits = append(settings.Rlimits, lim)
+	}
+	body, err := json.Marshal(settings)
+	if err != nil {
+		return err
+	}
+	// TMPDIR is in the home, since there is no private /tmp here.
+	if err := os.Mkdir(filepath.Join(spec.Home, tmpName), 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+		return fmt.Errorf("make the sandbox's temporary directory: %w", err)
+	}
+
+	// What the stage keeps is closed once it has them, and what this process
+	// keeps is closed on any failure below.
+	var parent, child []*os.File
+	defer func() {
+		for _, f := range child {
+			_ = f.Close()
+		}
+		if !ok {
+			for _, f := range parent {
+				_ = f.Close()
+			}
+		}
+	}()
+	pipe := func() (r, w *os.File, err error) {
+		r, w, err = os.Pipe()
+		return
+	}
+	lifeR, lifeW, err := pipe()
+	if err != nil {
+		return err
+	}
+	child, parent = append(child, lifeR), append(parent, lifeW)
+	setR, setW, err := pipe()
+	if err != nil {
+		return err
+	}
+	child = append(child, setR)
+	statR, statW, err := pipe()
+	if err != nil {
+		return err
+	}
+	child, parent = append(child, statW), append(parent, statR)
+	// The settings wait in the pipe until the stage reads them, written from
+	// here in the background, since a profile may be longer than a pipe holds.
+	// If the stage never starts, closing its end ends the write.
+	sent := make(chan error, 1)
+	go func() {
+		_, err := setW.Write(body)
+		sent <- errors.Join(err, setW.Close())
+	}()
+	extra := []*os.File{lifeR, setR, statW}
+	for _, f := range spec.Files {
+		d, err := dupFile(f)
+		if err != nil {
+			return err
+		}
+		child = append(child, d)
+		extra = append(extra, d)
+	}
+	releasePorts()
+	cmd := exec.CommandContext(c.ctx, self, append([]string{stageArg, "--"}, spec.Command...)...) //nolint:gosec // Running the configured command in the sandbox is its job, and the stage is this binary.
+	cmd.Args[0] = "sandbox-stage"
+	cmd.Dir = spec.Dir
+	cmd.Env = commandEnv(c.Env, spec)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = c.Stdin, c.Stdout, c.Stderr
+	cmd.WaitDelay = c.WaitDelay
+	cmd.ExtraFiles = extra
+	// Cancelling ctx closes the lifeline, so that the stage ends the command's
+	// whole group. A stage that has not gone a little later is killed.
+	cmd.Cancel = func() error {
+		c.stop()
+		time.AfterFunc(5*time.Second, func() { _ = cmd.Process.Kill() })
+		return nil
+	}
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start the stage: %w", err)
+	}
+	child = nil
+	for _, f := range extra {
+		_ = f.Close()
+	}
+	c.run.lifeline = lifeW
+	// From here the sandbox may be running, so a failure ends it.
+	fail := func(err error) error {
+		abortStart(c, cmd, mark, sent)
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			return fmt.Errorf("the sandbox did not start: %v", ee)
+		}
+		return err
+	}
+	var reply stageReply
+	if err := json.NewDecoder(io.LimitReader(statR, 1<<16)).Decode(&reply); err != nil {
+		return fail(errors.New("the sandbox ended during setup"))
+	}
+	_ = statR.Close()
+	if reply.Error != "" {
+		return fail(errors.New(reply.Error))
+	}
+	c.run.cmd, c.run.group, c.run.sent, c.run.mark = cmd, reply.Group, sent, mark
+	ok = true
+	parent = nil
+	return nil
+}
+
+// abortStart ends a sandbox that Start could not finish: it closes the
+// lifeline, kills the stage, and then ends whatever runs under the profile,
+// since the stage may have died before it read the lifeline, with a command
+// already running, and nothing else would end that. It waits for the stage and
+// for the settings writer.
+func abortStart(c *Cmd, cmd *exec.Cmd, mark marker, sent <-chan error) {
+	c.stop()
+	_ = cmd.Process.Kill()
+	mark.kill(time.Second)
+	_ = cmd.Wait()
+	<-sent
+}
+
+// rlimitFor returns r as a macOS limit. A limit of none is the most this
+// process may set: RLIM_INFINITY there is 2^63-1 and not 2^64-1, an unprivileged
+// process cannot raise a hard limit, and an open-file limit above what the
+// kernel allows per process is refused outright. The stage inherits this
+// process's limits, so what this process holds is what it can set.
+func rlimitFor(r Rlimit) (stageLimit, error) {
+	res, ok := resources[r.Resource]
+	if !ok {
+		return stageLimit{}, fmt.Errorf("macOS does not enforce limit %d", int(r.Resource))
+	}
+	var cur unix.Rlimit
+	if err := unix.Getrlimit(res, &cur); err != nil {
+		return stageLimit{}, fmt.Errorf("read limit %d: %w", res, err)
+	}
+	conv := func(v uint64) uint64 {
+		switch {
+		case v == math.MaxUint64:
+			v = cur.Max
+		case v > math.MaxInt64:
+			v = math.MaxInt64
+		}
+		if res == unix.RLIMIT_NOFILE {
+			if most, err := unix.SysctlUint32("kern.maxfilesperproc"); err == nil && v > uint64(most) {
+				v = uint64(most)
+			}
+		}
+		return v
+	}
+	lim := stageLimit{Resource: res, Soft: conv(r.Soft), Hard: conv(r.Hard)}
+	// A soft limit of none under a hard one is the hard one.
+	lim.Soft = min(lim.Soft, lim.Hard)
+	return lim, nil
+}
+
+// Wait waits for the sandbox to exit and returns what exec's Wait does for the
+// stage, whose exit status is the command's. It closes the lifeline. If the
+// stage was itself killed, it ends the sandbox, which the stage could not. It
+// scans for processes under the profile again after the stage has gone, and
+// if it cannot confirm that none is left, which a process that forks again
+// before each signal lands can bring about, the error matches [ErrSurvivors]
+// with errors.Is, and wraps the command's own result, so errors.As still finds
+// its *exec.ExitError. It also waits, as exec's Wait does, for the command's
+// output streams to close, which a process left running holds open, so a
+// caller that must not wait on one sets WaitDelay.
+func (c *Cmd) Wait() error {
+	if c.run.cmd == nil {
+		return errors.New("sandbox: not started")
+	}
+	if c.run.waited {
+		return errors.New("sandbox: Wait was already called")
+	}
+	c.run.waited = true
+	// A stage that was killed ended nothing, and a process it left behind may
+	// hold the command's output open, which keeps the wait below from
+	// returning. So this ends them as soon as the stage is gone.
+	stopWatch := c.watchStage()
+	err := c.run.cmd.Wait()
+	stopWatch()
+	// The stage ends the sandbox when the command does, and this looks again,
+	// from outside the profile, whether the stage did or was killed. Only the
+	// profile's marker names the processes: the command's process group is a
+	// number that the kernel may have given to someone else by now.
+	if !c.run.mark.kill(teardownBudget) {
+		err = &survivorsError{err}
+	}
+	c.stop()
+	if serr := <-c.run.sent; serr != nil && err == nil {
+		err = serr
+	}
+	return err
+}
+
+// survivorsError is Wait's error when teardown could not confirm that no
+// process still runs under the sandbox's profile. A process that forks again
+// before each signal lands can outlast the scan, and Wait cannot say more than
+// that one may be left. It wraps what Wait would have returned, so the
+// command's exit status is still found with errors.As, and it matches
+// ErrSurvivors with errors.Is.
+type survivorsError struct{ cause error }
+
+func (e *survivorsError) Error() string {
+	msg := ErrSurvivors.Error()
+	if e.cause != nil {
+		msg += " (" + e.cause.Error() + ")"
+	}
+	return msg
+}
+
+func (e *survivorsError) Unwrap() error { return e.cause }
+
+// Is makes the error match ErrSurvivors, which Unwrap alone would not, since
+// it leads to the cause.
+func (e *survivorsError) Is(target error) bool { return target == ErrSurvivors }
+
+// watchStage ends the sandbox's processes once the stage has exited, which is
+// when the stage did not, as when it was killed, and is harmless when it did.
+// It returns a function that stops the watch.
+func (c *Cmd) watchStage() func() {
+	pid := c.run.cmd.Process.Pid
+	done := make(chan struct{})
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		tick := time.NewTicker(50 * time.Millisecond)
+		defer tick.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-tick.C:
+			}
+			// The stage is this process's child, so it stays listed as a zombie
+			// until Wait reaps it.
+			if p, err := unix.SysctlKinfoProc("kern.proc.pid", pid); err == nil && p.Proc.P_stat != stateZombie {
+				continue
+			}
+			// Marker only: the group's number may be someone else's by now.
+			// Keep at it while Wait still waits, since a survivor may hold
+			// the command's output open.
+			for !c.run.mark.kill(teardownBudget) {
+				select {
+				case <-done:
+					return
+				default:
+				}
+			}
+			return
+		}
+	}()
+	return func() {
+		close(done)
+		<-finished
+	}
+}
+
+// Run runs spec's command in a sandbox, with this process's own standard
+// streams and environment, and returns its exit status. A status from a
+// signal is 128 plus the signal's number, as a shell reports it. It is for a
+// process that does nothing else: SIGTERM and SIGHUP end the sandbox, and an
+// empty Dir means the working directory. Spec's Listen is refused, since
+// nothing here serves a listener. Like Wait, it returns an error that matches [ErrSurvivors] when
+// teardown could not confirm the sandbox empty, with the status still returned.
+func Run(ctx context.Context, spec Spec) (int, error) {
+	if spec.Listen > 0 {
+		return 0, errors.New("Run cannot serve listeners; use Command")
+	}
+	if spec.Dir == "" {
+		dir, err := os.Getwd()
+		if err != nil {
+			return 0, fmt.Errorf("find working directory: %w", err)
+		}
+		spec.Dir = dir
+	}
+	c, err := Command(ctx, spec)
+	if err != nil {
+		return 0, err
+	}
+	c.Env = os.Environ()
+	c.Stdin, c.Stdout, c.Stderr = os.Stdin, os.Stdout, os.Stderr
+	if err := c.Start(); err != nil {
+		return 0, err
+	}
+	// A SIGTERM or SIGHUP to this process ends the sandbox, whose command
+	// gets no chance to save its state, as on Linux. Relaying rather than
+	// dying lets Run still wait for it and return its status.
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, unix.SIGTERM, unix.SIGHUP)
+	defer signal.Stop(sigs)
+	go func() {
+		if _, ok := <-sigs; ok {
+			c.stop()
+		}
+	}()
+	err = c.Wait()
+	code, serr := exitStatus(err)
+	if se := new(survivorsError); serr == nil && errors.As(err, &se) {
+		serr = se
+	}
+	return code, serr
+}
+
+// commandEnv returns env with the sandbox's home and its own temporary
+// directory in the variables programs read them from. CFFIXED_USER_HOME is
+// what Cocoa resolves ~/Library from, which $HOME alone does not move: without
+// it Firefox 152 to 157 hangs on the TCC-protected real ~/Library, and later
+// versions write into it (docs/spikes.md, M2).
+func commandEnv(env []string, spec Spec) []string {
+	tmp := filepath.Join(spec.Home, tmpName)
+	set := [][2]string{
+		{"HOME", spec.Home},
+		{"CFFIXED_USER_HOME", spec.Home},
+		{"TMPDIR", tmp},
+		{"XDG_RUNTIME_DIR", tmp},
+		{"XDG_CONFIG_HOME", filepath.Join(spec.Home, ".config")},
+		{"XDG_CACHE_HOME", filepath.Join(spec.Home, ".cache")},
+		{"XDG_DATA_HOME", filepath.Join(spec.Home, ".local", "share")},
+		{"XDG_STATE_HOME", filepath.Join(spec.Home, ".local", "state")},
+	}
+	out := slices.DeleteFunc(slices.Clone(env), func(kv string) bool {
+		name, _, _ := strings.Cut(kv, "=")
+		return slices.ContainsFunc(set, func(p [2]string) bool { return p[0] == name })
+	})
+	for _, p := range set {
+		out = append(out, p[0]+"="+p[1])
+	}
+	return out
+}

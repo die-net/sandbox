@@ -20,7 +20,10 @@ type Spec struct {
 	// without a slash is looked up on PATH inside the sandbox.
 	Command []string `json:"command"`
 	// Home is the sandbox's own directory. It is writable, and it is the
-	// command's HOME.
+	// command's HOME. On macOS a path through /System/Volumes/Data that a
+	// firmlink also names is refused, with the usual name, in Home and Write,
+	// and mapped to it in Read, Cover and Dir, since Seatbelt matches the
+	// usual name and a rule for the other matches nothing.
 	Home string `json:"home"`
 	// Dir is the command's working directory. Empty means Home, except
 	// that Run uses the directory it is called from, so a caller that
@@ -46,7 +49,11 @@ type Spec struct {
 	// NetworkNone.
 	Network Network `json:"network,omitempty"`
 	// Services and BroadLoopback only mean something on macOS, and Linux
-	// ignores them.
+	// ignores them. BroadLoopback is an opt-in gap: it lets the command bind,
+	// accept on and dial any port, over TCP and UDP, on every address the
+	// host has, the caller's own listeners and the user's other local
+	// services included, and so serve the LAN as well. See docs/design.md
+	// section 4.3.
 	Services      []Service `json:"services,omitempty"`
 	BroadLoopback bool      `json:"broad_loopback,omitempty"`
 	// Listen is how many TCP listeners the caller serves for the command,
@@ -58,7 +65,11 @@ type Spec struct {
 	// Loopback is how many loopback TCP ports the command may bind and dial
 	// itself, which LoopbackPorts gives. On Linux the loopback is private
 	// to the sandbox under NetworkNone, and the ports are fixed, from 4444
-	// up. It may not exceed maxListen either.
+	// up. On macOS it is not: the ports are chosen free, and a profile names
+	// an address only as every one the host has, so the command can bind
+	// one on the LAN address too, and a peer on the LAN can connect to it,
+	// as can any local process (docs/sandbox.md, Limits). It may not exceed
+	// maxListen either.
 	Loopback int `json:"loopback,omitempty"`
 	// Files are the descriptors the command gets as 3, 4, and so on. The
 	// caller keeps them open, and closes them when it likes after Start.
@@ -72,7 +83,11 @@ type Spec struct {
 	// not a file.
 	Files []*os.File `json:"-"`
 	// Rlimits are the resource limits pid 1 sets before it starts the
-	// command, and so holds itself as well.
+	// command, and so holds itself as well. On macOS the stage that
+	// supervises the command sets them, and holds them too. ResourceAddressSpace
+	// is refused there, since nothing enforces RLIMIT_AS. A CPU limit is a
+	// SIGXCPU, which a program can ignore, and the hard limit does not end it.
+	// A process limit counts every process of the uid.
 	Rlimits []Rlimit `json:"rlimits,omitempty"`
 	// Hostname is the sandbox's hostname on Linux. Empty means "sandbox".
 	Hostname string `json:"hostname,omitempty"`
@@ -127,8 +142,26 @@ func (n *Network) Set(v string) error {
 }
 
 // Service is a reviewed group of macOS Mach services a sandbox may look up.
-// None are defined yet, and Linux ignores the field.
+// Linux ignores the field. macOS refuses a name it does not know, so a typo
+// cannot quietly leave a service out or put one in. Adding a group is a
+// reviewed change to this package, as adding a system call to the Linux
+// filter is.
 type Service string
+
+const (
+	// ServiceFirefox is what headless Firefox needs beyond the base profile:
+	// the Mach ports its own processes register and look each other up by
+	// (org.mozilla.machname.*), and LaunchServices' and configd's lookups,
+	// which it aborts or crashes without. The lookup of LaunchServices does
+	// not let a process open an app or a URL, since that is the lsopen
+	// operation, which no profile here ever allows (docs/spikes.md, M3).
+	ServiceFirefox Service = "firefox"
+	// ServiceDirectory lets the command look accounts up through Directory
+	// Services (getpwuid, getpwnam). Without it those find nothing, since the
+	// sandbox has no passwd entry of its own on macOS. It also lets the command list every
+	// account on the host.
+	ServiceDirectory Service = "directory"
+)
 
 // Resource is a limit Rlimit sets.
 type Resource int
@@ -389,7 +422,10 @@ const maxLinks = 40
 // resolve returns p, an absolute path, with every link in it followed, as
 // host shows the host's root. It refuses to follow a link that lies inside
 // one of writable, rather than resolve to wherever the link leads. A path
-// that does not exist gives an error that wraps [fs.ErrNotExist].
+// that does not exist gives an error that wraps [fs.ErrNotExist]. On macOS a
+// name through /System/Volumes/Data that a firmlink also gives is returned by
+// the name the sandbox matches, since a rule for the other name would match
+// nothing.
 func resolve(host fs.FS, p string, writable []string) (string, error) {
 	if !filepath.IsAbs(p) {
 		return "", fmt.Errorf("path %q is not absolute", p)

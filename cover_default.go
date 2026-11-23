@@ -1,3 +1,5 @@
+//go:build !darwin
+
 package sandbox
 
 // defaultCover lists the host paths every sandbox has hidden: people's homes,

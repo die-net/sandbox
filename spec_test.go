@@ -95,7 +95,18 @@ func TestResolve(t *testing.T) {
 	}
 }
 
+// withLinuxCovers makes the default covers Linux's for a test whose fake host
+// is a Linux one, whatever the platform the test runs on.
+func withLinuxCovers(t *testing.T) {
+	t.Helper()
+	oldCover, oldAliases := defaultCover, coverAliases
+	defaultCover = []string{"/home", "/root", "/run", "/tmp", "/var", "/mnt", "/media", "/dev/shm", "/.snapshots", "/sysroot"}
+	coverAliases = nil
+	t.Cleanup(func() { defaultCover, coverAliases = oldCover, oldAliases })
+}
+
 func TestPrepare(t *testing.T) {
+	withLinuxCovers(t)
 	host := fakeHost(
 		[]string{
 			"/home", "/root", "/run", "/tmp", "/var", "/mnt", "/dev/shm", "/srv/app/state/servers/a",

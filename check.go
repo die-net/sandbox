@@ -102,8 +102,26 @@ const netTimeout = 2 * time.Second
 
 // checkInput is what the runner hands the child, as JSON on payloadFD.
 type checkInput struct {
-	Want Expect `json:"want"`
-	Spec *Spec  `json:"spec,omitempty"`
+	Want  Expect     `json:"want"`
+	Spec  *Spec      `json:"spec,omitempty"`
+	Hints checkHints `json:"hints"`
+}
+
+// checkHints are targets the caller works out for the child, where the child
+// cannot. A sandbox gives the child its own HOME and an empty environment, so
+// what it would build from them, such as the user's ~/.ssh or the socket in
+// SSH_AUTH_SOCK, names nothing of the caller's, and a check that tries those
+// passes without trying anything. Set is false where the child finds its own,
+// as on Linux.
+type checkHints struct {
+	Set bool `json:"set,omitempty"`
+	// Secrets are well-known secret paths that exist, and Sockets well-known
+	// sockets that exist. WriteTargets are directories outside the sandbox's
+	// own that the caller can write, so that a refusal in the child is the
+	// sandbox's and not the permissions'.
+	Secrets      []string `json:"secrets,omitempty"`
+	Sockets      []string `json:"sockets,omitempty"`
+	WriteTargets []string `json:"write_targets,omitempty"`
 }
 
 // Check runs the suite in a child of this binary and returns the results,
@@ -114,7 +132,7 @@ type checkInput struct {
 // The child is started as the current binary with checkArg as its first
 // argument, so the program must call Stage first in main.
 func Check(ctx context.Context, spec *Spec, want Expect) ([]Result, error) {
-	in := checkInput{Want: want}
+	in := checkInput{Want: want, Hints: platformHints(spec)}
 	if spec != nil {
 		c := *spec
 		c.Command = nil
@@ -207,7 +225,7 @@ func checkStage() int {
 	}
 	defer out.Close()
 	enc := json.NewEncoder(out)
-	for _, res := range runChecks(&checkEnv{want: in.Want, spec: in.Spec}) {
+	for _, res := range runChecks(&checkEnv{want: in.Want, spec: in.Spec, hints: in.Hints}) {
 		if err := enc.Encode(res); err != nil {
 			fmt.Fprintf(os.Stderr, "sandbox check: %v\n", err)
 			return checkFailed
@@ -219,8 +237,9 @@ func checkStage() int {
 // checkEnv is what each check sees: the caller's Expect, and the Spec the
 // child runs under, nil when it runs as it is.
 type checkEnv struct {
-	want Expect
-	spec *Spec
+	want  Expect
+	spec  *Spec
+	hints checkHints
 }
 
 // checkFn runs one check, or a group of them, and returns its results.
@@ -348,13 +367,26 @@ func readable(path string) bool {
 	return true
 }
 
-func checkSecrets(*checkEnv) []Result {
-	var worked []string
+// secretPathsFor returns the secret paths to try to read: those the caller
+// found, or else the well-known ones under every home this process can name.
+func secretPathsFor(hints checkHints) []string {
+	if hints.Set {
+		return hints.Secrets
+	}
 	tried := slices.Clone(secretPaths)
 	for _, h := range homeDirs() {
 		for _, s := range secretFiles {
 			tried = append(tried, filepath.Join(h, s))
 		}
+	}
+	return tried
+}
+
+func checkSecrets(e *checkEnv) []Result {
+	var worked []string
+	tried := secretPathsFor(e.hints)
+	if e.hints.Set && len(tried) == 0 {
+		return []Result{skipped("secrets.readable", "none of the well-known secret paths exists on this host, so there is nothing to try to read")}
 	}
 	for _, p := range tried {
 		if readable(p) {
@@ -379,14 +411,21 @@ func socketCandidates() []string {
 			socks = append(socks, p)
 		}
 	}
+	socks = append(socks, platformSockets()...)
 	socks = slices.DeleteFunc(socks, func(s string) bool { return s == "" })
 	slices.Sort(socks)
 	return slices.Compact(socks)
 }
 
-func checkSockets(*checkEnv) []Result {
+func checkSockets(e *checkEnv) []Result {
 	var worked []string
 	socks := socketCandidates()
+	if e.hints.Set {
+		socks = e.hints.Sockets
+		if len(socks) == 0 {
+			return []Result{skipped("sockets.reachable", "none of the well-known sockets exists on this host, so there is nothing to try to connect to")}
+		}
+	}
 	for _, s := range socks {
 		if out, _ := tryDial("unix", s, netTimeout); out == connected {
 			worked = append(worked, s)
@@ -595,7 +634,14 @@ func checkWrites(e *checkEnv) []Result {
 	}
 	allowed := append([]string{e.spec.Home}, e.spec.Write...)
 	var tried, worked []string
-	for _, p := range append([]string{"/"}, e.spec.Read...) {
+	candidates := append([]string{"/"}, e.spec.Read...)
+	if e.hints.Set {
+		if len(e.hints.WriteTargets) == 0 {
+			return []Result{skipped(name, "this account can write no directory outside the sandbox's own that is known to try")}
+		}
+		candidates = slices.Concat(e.hints.WriteTargets, candidates)
+	}
+	for _, p := range candidates {
 		if slices.ContainsFunc(allowed, func(a string) bool { return under(p, a) }) {
 			continue
 		}
