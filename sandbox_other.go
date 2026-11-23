@@ -46,6 +46,9 @@ func (c *Cmd) LoopbackPorts() []int { return nil }
 // Listeners is empty where there is no backend yet.
 func (c *Cmd) Listeners() []net.Listener { return nil }
 
+// Footprint is not supported where there is no backend yet.
+func (c *Cmd) Footprint() (int64, error) { return 0, errors.ErrUnsupported }
+
 // Run is not supported off Linux yet.
 func Run(context.Context, Spec) (int, error) {
 	return 0, errors.ErrUnsupported

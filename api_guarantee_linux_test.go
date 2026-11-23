@@ -1417,3 +1417,48 @@ func TestAPIBubblewrapDiscovery(t *testing.T) {
 		}
 	})
 }
+
+func init() {
+	escChecks["alloc"] = func(e *escT, a []string) {
+		mb, _ := strconv.Atoi(a[0])
+		buf := make([]byte, mb<<20)
+		for i := 0; i < len(buf); i += 4096 {
+			buf[i] = 1
+		}
+		fmt.Println("touched", len(buf))
+		time.Sleep(time.Minute)
+	}
+}
+
+// TestAPIFootprint checks that Footprint counts the resident memory of the
+// sandbox's processes, which a watchdog polls where there is no cgroup.
+func TestAPIFootprint(t *testing.T) {
+	c, stdout, _ := escCmd(t, t.Context(), Spec{}, "esc", "alloc", "200")
+	if _, err := c.Footprint(); err == nil {
+		t.Error("Footprint before Start succeeded")
+	}
+	if err := c.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.run.lifeline.Close(); _ = c.Wait() }()
+	eventually(t, 20*time.Second, "the command did not touch its memory", func() bool { return strings.Contains(stdout.String(), "touched") })
+	fp, err := c.Footprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fp < 150<<20 || fp > 2<<30 {
+		t.Errorf("Footprint = %d MiB, want about 200", fp>>20)
+	}
+}
+
+// eventually polls cond until it is true, and fails the test after d.
+func eventually(t testing.TB, d time.Duration, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("after %v: %s", d, what)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
