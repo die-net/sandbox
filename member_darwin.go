@@ -93,16 +93,82 @@ func lookupAllowed(pid int, name string) (allowed, ok bool) {
 	return false, false
 }
 
+// kernelFinds reports whether the kernel still finds pid, which a sandbox_check
+// of an operation that does not exist answers: -1 (EINVAL) for a process it
+// finds, whether or not it is sandboxed, and 1 for a pid it does not find, such
+// as one that has gone, a zombie, or a process that has begun to exit. (The
+// answers were measured; Sandbox.kext is not public.) A lookup that answers 1
+// answers it for those too, so it cannot tell them from a denial.
+func kernelFinds(pid int) bool {
+	op, err := unix.BytePtrFromString("no-such-operation")
+	if err != nil {
+		return false
+	}
+	r, _, _ := syscall_syscall9(libc_sandbox_check_trampoline_addr,
+		uintptr(pid), uintptr(unsafe.Pointer(op)), noReport, 0,
+		0, 0, 0, 0, 0)
+	return int32(r) == -1
+}
+
+// lookup is what a check of one pid found.
+type lookup struct {
+	// In is whether the process runs under the profile that the marker belongs to.
+	In bool
+	// Known is false if the answer cannot be relied on: the kernel would not say,
+	// or a 1 came for a pid it no longer finds (kernelFinds), as for a process
+	// that is gone, a zombie, or one that is exiting. In is then false too.
+	Known bool
+	// Free is whether the process was found under no profile: its lookup of the
+	// name that the profile denies was allowed. A process in a sandbox, this one
+	// or another, is never free, and no process in one can make a free one.
+	Free bool
+}
+
+// look checks pid against m's profile.
+//
+// Out is asked first, then In, and a process is a member only for "denied, then
+// allowed". sandbox-exec applies its profile to itself in place, so a process
+// can be unsandboxed at the first call and under another profile at the second,
+// and that profile, any deny-default one, denies both names. Asked In then Out,
+// that process answered "allowed, then denied", the member pattern, and a scan
+// killed it. Asked Out then In, it answers "allowed" at the first call, which
+// is not a member's answer. A process cannot leave a profile or swap it for
+// another, so "denied, then allowed" cannot come from a change between the two
+// calls, and an allowed answer is only given for a process the kernel found.
+func (m marker) look(pid int) lookup {
+	if m.In == "" || pid <= 1 {
+		return lookup{Known: true}
+	}
+	out, ok := lookupAllowed(pid, m.Out)
+	if !ok {
+		return lookup{}
+	}
+	if out {
+		return lookup{Known: true, Free: true}
+	}
+	in, ok := lookupAllowed(pid, m.In)
+	if !ok {
+		return lookup{}
+	}
+	if in {
+		return lookup{In: true, Known: true}
+	}
+	// Denied twice: a process under another profile, or a pid the kernel does
+	// not find, which answers the same.
+	return lookup{Known: kernelFinds(pid)}
+}
+
+// member reports whether pid runs under the profile that m belongs to, and
+// whether that answer can be relied on (see lookup).
+func (m marker) member(pid int) (in, known bool) {
+	l := m.look(pid)
+	return l.In, l.Known
+}
+
 // inSandbox reports whether pid runs under the profile that m belongs to.
 func (m marker) inSandbox(pid int) bool {
-	if m.In == "" || pid <= 1 {
-		return false
-	}
-	if allowed, ok := lookupAllowed(pid, m.In); !ok || !allowed {
-		return false
-	}
-	allowed, ok := lookupAllowed(pid, m.Out)
-	return ok && !allowed
+	in, _ := m.member(pid)
+	return in
 }
 
 // processes returns the pids of every process that runs under m's profile.
@@ -123,64 +189,47 @@ func (m marker) processes() ([]int, error) {
 	return out, nil
 }
 
-// settleScans is how many scans in a row must find nothing before kill
-// believes the sandbox is empty. A process that forks and exits again within
-// a millisecond is missing from a scan that listed its parent, so one empty
-// scan proves little.
-const settleScans = 5
+// testProberHook and testIgnoreStageReport are set by tests, to make a
+// teardown that cannot prove the sandbox empty without a process that keeps
+// ahead of it. They are nil and false in a program.
+var (
+	testProberHook        func(*prober)
+	testIgnoreStageReport bool
+)
 
-// teardownBudget is how long a teardown keeps scanning for processes that keep
-// forking before it gives up and says it could not confirm the sandbox empty.
-// It is a variable so that a test can give it none.
-var teardownBudget = 5 * time.Second
-
-// sweep scans every process of this account once, and signals each that runs
-// under m's profile at the moment it is found, not after the scan, so the time
-// between seeing a process and ending it is one check, not a whole scan.
-// Only this account's processes are asked, since a sandbox cannot run as
-// another uid (a setuid program does not run in a profile), which halves the
-// calls. It returns how many it signalled.
-func (m marker) sweep() (int, error) {
-	procs, err := unix.SysctlKinfoProcSlice("kern.proc.all")
-	if err != nil {
-		return 0, fmt.Errorf("list processes: %w", err)
-	}
+// prober returns the scan's view of the system for m: the account's pids
+// from proc_listpids in one atomic list (procinfo_darwin.go), sandbox_check, and
+// the process's bsdinfo.
+func (m marker) prober(execPid int) prober {
 	uid := uint32(os.Geteuid())
-	n := 0
-	for _, p := range procs {
-		if p.Proc.P_stat == stateZombie || p.Eproc.Ucred.Uid != uid {
-			continue
-		}
-		if pid := int(p.Proc.P_pid); m.inSandbox(pid) {
-			_ = syscall.Kill(pid, syscall.SIGKILL)
-			n++
-		}
+	p := prober{
+		execPid: execPid,
+		list:    func() ([]int, error) { return listUIDPids(uid) },
+		look:    m.look,
+		stat:    statPid,
+		// This signals a number, after the check that found it. The number would
+		// have to leave the process that was checked and be given to another
+		// within the microseconds between the two, and forkproc hands pids out in
+		// sequence, skipping any in use (see killGroup in stage_darwin.go).
+		kill:  func(pid int) { _ = syscall.Kill(pid, syscall.SIGKILL) },
+		now:   time.Now,
+		sleep: time.Sleep,
 	}
-	return n, nil
+	if testProberHook != nil {
+		testProberHook(&p)
+	}
+	return p
 }
 
-// kill ends every process that runs under m's profile, and keeps scanning until
-// settleScans scans in a row find none, or budget has passed. It reports
-// whether it saw the sandbox empty. False means a process may still run: one
-// that forks again before each signal lands can keep ahead of the scan for as
-// long as it likes, and so can a process the kernel will not end. At least one
-// scan is made, whatever the budget.
-func (m marker) kill(budget time.Duration) bool {
-	deadline := time.Now().Add(budget)
-	for empty := 0; ; {
-		n, err := m.sweep()
-		switch {
-		case err != nil:
-			return false
-		case n > 0:
-			empty = 0
-		default:
-			if empty++; empty >= settleScans {
-				return true
-			}
-		}
-		if !time.Now().Before(deadline) {
-			return false
-		}
-	}
+// kill ends every process that runs under m's profile and keeps scanning until
+// a scan proves the profile empty (scan_darwin.go), or budget has passed.
+// execPid is the pid of the sandbox-exec that was started to apply the profile,
+// or 0 if the caller does not have it (prober.execPid). It
+// returns how many scans it made, and whether it proved the sandbox empty.
+// False means a process may still run: one that forks again before each signal
+// lands can keep ahead of the scan for as long as it likes, and so can a
+// process the kernel will not end. At least one scan is made, whatever the
+// budget.
+func (m marker) kill(budget time.Duration, execPid int) (scans int, out endKind) {
+	return m.prober(execPid).run(budget)
 }

@@ -15,6 +15,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -30,6 +31,15 @@ type run struct {
 	// mark is the pair of names that tells the sandbox's processes from
 	// others, for teardown and Footprint.
 	mark marker
+	// status is the read end of the stage's pipe, and statusDec reads its
+	// messages. The stage's first is the reply Start reads, and its last, sent
+	// as it exits, says whether its teardown proved the sandbox empty.
+	status    *os.File
+	statusDec *json.Decoder
+	// stageScans is how many scans the stage's teardown made, and callerScans
+	// how many the caller's have, which tests read.
+	stageScans  int
+	callerScans atomic.Int64
 	// lifeline is the write end of the pipe the stage watches. Only this
 	// process holds it, and it is close-on-exec, so when this process goes,
 	// however it goes, the stage reads EOF and ends the command's group.
@@ -371,15 +381,17 @@ func (c *Cmd) Start() error {
 		}
 		return err
 	}
-	var reply stageReply
-	if err := json.NewDecoder(io.LimitReader(statR, 1<<16)).Decode(&reply); err != nil {
+	dec := json.NewDecoder(io.LimitReader(statR, 1<<16))
+	reply, err := readReply(dec)
+	if err != nil {
 		return fail(errors.New("the sandbox ended during setup"))
 	}
-	_ = statR.Close()
 	if reply.Error != "" {
 		return fail(errors.New(reply.Error))
 	}
+	// The pipe stays open: the stage's last message comes on it.
 	c.run.cmd, c.run.group, c.run.sent, c.run.mark = cmd, reply.Group, sent, mark
+	c.run.status, c.run.statusDec = statR, dec
 	ok = true
 	parent = nil
 	return nil
@@ -393,7 +405,9 @@ func (c *Cmd) Start() error {
 func abortStart(c *Cmd, cmd *exec.Cmd, mark marker, sent <-chan error) {
 	c.stop()
 	_ = cmd.Process.Kill()
-	mark.kill(time.Second)
+	// The command is not known here, so a sandbox-exec of any pid may be the one
+	// that has yet to apply the profile.
+	mark.kill(time.Second, 0)
 	_ = cmd.Wait()
 	<-sent
 }
@@ -434,10 +448,12 @@ func rlimitFor(r Rlimit) (stageLimit, error) {
 
 // Wait waits for the sandbox to exit and returns what exec's Wait does for the
 // stage, whose exit status is the command's. It closes the lifeline. If the
-// stage was itself killed, it ends the sandbox, which the stage could not. It
-// scans for processes under the profile again after the stage has gone, and
-// if it cannot confirm that none is left, which a process that forks again
-// before each signal lands can bring about, the error matches [ErrSurvivors]
+// stage was itself killed, it ends the sandbox, which the stage could not. The
+// stage says before it exits whether a scan proved no process was left under
+// the profile, and Wait takes its word. If the stage was killed or could not
+// prove it, Wait scans itself after the stage has gone, until a scan does. If
+// none can in the time allowed, which a process that forks again before each
+// signal lands can bring about, the error matches [ErrSurvivors]
 // with errors.Is, and wraps the command's own result, so errors.As still finds
 // its *exec.ExitError. It also waits, as exec's Wait does, for the command's
 // output streams to close, which a process left running holds open, so a
@@ -456,18 +472,50 @@ func (c *Cmd) Wait() error {
 	stopWatch := c.watchStage()
 	err := c.run.cmd.Wait()
 	stopWatch()
-	// The stage ends the sandbox when the command does, and this looks again,
-	// from outside the profile, whether the stage did or was killed. Only the
-	// profile's marker names the processes: the command's process group is a
-	// number that the kernel may have given to someone else by now.
-	if !c.run.mark.kill(teardownBudget) {
+	// The stage ends the sandbox when the command does, and says so when a scan
+	// proved it empty, which nothing can undo: nothing under the profile can
+	// start again. If it did not, because it was killed or could not prove it,
+	// this scans, from outside the profile. Only the profile's marker names the
+	// processes: the command's process group is a number that the kernel may
+	// have given to someone else by now.
+	done, reported := c.stageReport()
+	switch {
+	case reported && done.Empty:
+	case reported && done.Members:
+		// The stage scanned until members kept turning up, and gave up. Another
+		// budget would go the same way.
 		err = &survivorsError{err}
+	default:
+		scans, end := c.run.mark.kill(teardownBudget, c.run.group)
+		c.run.callerScans.Add(int64(scans))
+		if end != endEmpty {
+			err = &survivorsError{err}
+		}
 	}
 	c.stop()
 	if serr := <-c.run.sent; serr != nil && err == nil {
 		err = serr
 	}
 	return err
+}
+
+// stageReport reads the stage's last message, which is there if the stage has
+// exited on its own and not been killed, and reports whether there was one. The
+// stage has exited, so the pipe holds the message and then ends, unless
+// something else holds its write end, so the read is bounded. It closes the
+// pipe.
+func (c *Cmd) stageReport() (done stageDone, ok bool) {
+	defer c.run.status.Close()
+	if testIgnoreStageReport {
+		return stageDone{}, false
+	}
+	_ = c.run.status.SetReadDeadline(time.Now().Add(time.Second))
+	done, err := readDone(c.run.statusDec)
+	if err != nil {
+		return stageDone{}, false
+	}
+	c.run.stageScans = done.Scans
+	return done, true
 }
 
 // survivorsError is Wait's error when teardown could not confirm that no
@@ -517,14 +565,21 @@ func (c *Cmd) watchStage() func() {
 			// Marker only: the group's number may be someone else's by now.
 			// Keep at it while Wait still waits, since a survivor may hold
 			// the command's output open.
-			for !c.run.mark.kill(teardownBudget) {
+			for {
+				scans, end := c.run.mark.kill(teardownBudget, c.run.group)
+				c.run.callerScans.Add(int64(scans))
+				if end == endEmpty {
+					return
+				}
+				// Keep at it, but not flat out: a teardown that gave up on members
+				// stands for a process that forks against it, and the ones that
+				// ran out of time for noise.
 				select {
 				case <-done:
 					return
-				default:
+				case <-time.After(50 * time.Millisecond):
 				}
 			}
-			return
 		}
 	}()
 	return func() {
