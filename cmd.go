@@ -12,8 +12,8 @@ import (
 // sandbox's profile. A process that forks again before each signal lands can
 // keep ahead of the scan that looks for the sandbox's processes, so one may
 // be left running with the access the profile gave it. Teardown gives up on
-// that after about a tenth of a second, once scan after scan has found a
-// process it had signaled to be replaced, and says so at once; it never returns
+// that after about a second, once scans keep finding processes and the number
+// has stopped falling, and says so at once; it never returns
 // nil while a process of the sandbox may still run. Nothing lists the
 // survivors, so a caller that sees this should treat the host as dirty. The
 // error wraps what Wait would otherwise have returned, so errors.As still

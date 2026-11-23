@@ -279,39 +279,51 @@ type endKind int
 
 const (
 	// endBudget is that the time ran out with pids still unaccounted for,
-	// and no member found in the last few scans: noise, as when the account's
+	// and no member found for long: noise, as when the account's
 	// processes start and exit faster than a scan can read them.
 	endBudget endKind = iota
 	// endEmpty is that a scan proved the sandbox empty.
 	endEmpty
-	// endMembers is that the teardown gave up because scan after scan found
-	// members of the sandbox again after it had signaled the ones before: a
-	// process of it keeps forking against the teardown.
+	// endMembers is that the teardown gave up because scans kept finding members
+	// of the sandbox after it had signaled the ones before, and for giveUpAfter
+	// the number they found had not fallen: a process of it keeps forking against
+	// the teardown.
 	endMembers
 )
 
 // The teardown waits between scans, from backoffStart doubling to backoffMax, so
 // that the processes it signaled can finish exiting and be reaped, and the
 // account's own processes have the processors. The first scan is not delayed.
-// It gives up on members after giveUpScans scans have found any. A program that
-// shuts down normally has its processes found in the first scan, or a second for
-// what they forked as they died, and a third for the children of those at most;
-// scans that find members in giveUpScans of them are a process forking on
-// purpose. They are variables so that a test can change them.
+//
+// It gives up on members when scans keep finding them and the number they find
+// has stopped falling. A program that shuts down normally has fewer members to
+// signal in each scan than in the one before, because each signal ends a process
+// before it forks again, and how many scans that takes depends on how fast the
+// machine is: eight chains of forking processes took 3 to 5 scans on a fast
+// machine and more than 10 on a three core runner. A process that forks on
+// purpose, to stay ahead of the signals, does not make the count fall for long.
+// So the teardown gives up when giveUpAfter has passed since the scan that found
+// the fewest members so far, and that scan found some. It does not count scans,
+// which a slow machine makes more of. They are variables so that a test can
+// change them.
 var (
 	backoffStart = time.Millisecond
 	backoffMax   = 25 * time.Millisecond
-	giveUpScans  = 10
+	giveUpAfter  = time.Second
 )
 
 // run scans until one proves the sandbox empty, until members have been found
-// by giveUpScans scans, or until budget has passed, and says which. It returns
-// how many scans it made. At least one scan is made, whatever the budget.
+// for giveUpAfter without their number falling, or until budget has passed, and
+// says which. It returns how many scans it made. At least one scan is made,
+// whatever the budget.
 func (p prober) run(budget time.Duration) (scans int, out endKind) {
 	deadline := p.now().Add(budget)
 	var mem memory
 	wait := backoffStart
-	memberScans := 0
+	// fewest is the smallest number of members a scan has found, and fewestAt
+	// when that scan ended. A scan that found none does not count.
+	var fewest int
+	var fewestAt time.Time
 	for {
 		scans++
 		clean, next, err := p.scan(mem)
@@ -321,14 +333,16 @@ func (p prober) run(budget time.Duration) (scans int, out endKind) {
 		case clean:
 			return scans, endEmpty
 		}
+		now := p.now()
 		if next.killed > 0 {
-			memberScans++
-			if memberScans >= giveUpScans {
+			if fewest == 0 || next.killed < fewest {
+				fewest, fewestAt = next.killed, now
+			} else if now.Sub(fewestAt) >= giveUpAfter {
 				return scans, endMembers
 			}
 		}
 		mem = next
-		left := deadline.Sub(p.now())
+		left := deadline.Sub(now)
 		if left <= 0 {
 			return scans, endBudget
 		}
