@@ -8,6 +8,7 @@ import (
 )
 
 func TestRegisterFlags(t *testing.T) {
+	t.Parallel()
 	var spec Spec
 	fs := flag.NewFlagSet("test", flag.ContinueOnError)
 	spec.RegisterFlags(fs)
@@ -30,6 +31,7 @@ func TestRegisterFlags(t *testing.T) {
 }
 
 func TestNetworkFlag(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		args []string
 		want Network
@@ -52,6 +54,7 @@ func TestNetworkFlag(t *testing.T) {
 }
 
 func TestKernelFlag(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		value string
 		ok    bool

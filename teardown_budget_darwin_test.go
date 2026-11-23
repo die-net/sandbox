@@ -15,6 +15,7 @@ import (
 // ------------------------------------------------------------------ the waits
 
 func TestRunBackoff(t *testing.T) {
+	t.Parallel()
 	// A pid that is never settled, so that no scan is clean.
 	f := newFake([]int{10, 20})
 	f.stat = func(_, pid int) (procStat, error) {
@@ -49,6 +50,7 @@ func TestRunBackoff(t *testing.T) {
 }
 
 func TestRunDoesNotWaitBeforeTheFirstScanOrAfterTheLast(t *testing.T) {
+	t.Parallel()
 	f := newFake([]int{10, 20})
 	if scans, out := f.prober().run(time.Second); scans != 1 || out != endEmpty || len(f.slept) != 0 {
 		t.Errorf("scans = %d, out = %v, waits = %v; want one scan, clean, no wait", scans, out, f.slept)
@@ -63,6 +65,7 @@ func TestRunDoesNotWaitBeforeTheFirstScanOrAfterTheLast(t *testing.T) {
 
 // A wait never goes past the deadline.
 func TestRunWaitStopsAtTheDeadline(t *testing.T) {
+	t.Parallel()
 	f := newFake([]int{10, 20})
 	f.stat = func(_, pid int) (procStat, error) {
 		if pid == 20 {
@@ -108,6 +111,7 @@ func membersByScan(f *fakeSystem, p *prober, count func(scan int) int) (changedA
 // Scans that keep finding as many members as they did, after they were signaled,
 // are a process forking against the teardown, and the teardown stops early.
 func TestRunGivesUpOnMembersThatKeepTurningUp(t *testing.T) {
+	t.Parallel()
 	f := newFake()
 	p := f.prober()
 	membersByScan(f, &p, func(int) int { return 3 })
@@ -125,6 +129,7 @@ func TestRunGivesUpOnMembersThatKeepTurningUp(t *testing.T) {
 // not after the first one that found any: a number that is still falling is a
 // program that is ending, however many scans that takes.
 func TestRunGivesUpGiveUpAfterTheLastFall(t *testing.T) {
+	t.Parallel()
 	f := newFake()
 	p := f.prober()
 	// 5 members for the first 30 scans, then 4 for the rest.
@@ -150,6 +155,7 @@ func TestRunGivesUpGiveUpAfterTheLastFall(t *testing.T) {
 // Scans between the ones that find members, which find none, do not start the
 // window again.
 func TestRunGivesUpThroughScansThatFindNoMember(t *testing.T) {
+	t.Parallel()
 	f := newFake()
 	p := f.prober()
 	membersByScan(f, &p, func(scan int) int { return 3 * (scan % 2) })
@@ -170,6 +176,7 @@ func TestRunGivesUpThroughScansThatFindNoMember(t *testing.T) {
 // seconds: this is what a slow machine's teardown of a program that forks as it
 // dies looks like.
 func TestRunKeepsTryingWhileTheMembersFall(t *testing.T) {
+	t.Parallel()
 	f := newFake()
 	p := f.prober()
 	// One member fewer in each scan, for as long as the budget allows. With the
@@ -189,6 +196,7 @@ func TestRunKeepsTryingWhileTheMembersFall(t *testing.T) {
 // What a slow machine does to the shutdown of a program: members found again for
 // a while at each number, but never for as long as the window.
 func TestRunDoesNotGiveUpOnASlowShutdown(t *testing.T) {
+	t.Parallel()
 	f := newFake()
 	p := f.prober()
 	counts := []int{17, 17, 9, 9, 9, 6, 6, 6, 6, 2, 2, 1, 1, 1, 1, 1, 0}
@@ -202,6 +210,7 @@ func TestRunDoesNotGiveUpOnASlowShutdown(t *testing.T) {
 // Scans that find no member and only pids they cannot account for are noise, and
 // the teardown keeps trying for the whole budget.
 func TestRunKeepsTryingThroughNoise(t *testing.T) {
+	t.Parallel()
 	for name, stat := range map[string]func(f *fakeSystem) func(int, int) (procStat, error){
 		"vanished pids": func(f *fakeSystem) func(int, int) (procStat, error) {
 			return func(_, pid int) (procStat, error) {
@@ -223,6 +232,7 @@ func TestRunKeepsTryingThroughNoise(t *testing.T) {
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
+			t.Parallel()
 			f := newFake([]int{10, 20})
 			f.stat = stat(f)
 			budget := 5 * time.Second
@@ -241,6 +251,7 @@ func TestRunKeepsTryingThroughNoise(t *testing.T) {
 // and what they forked as they died in a few more, and then it is gone, however
 // many scans that is, so long as they are well within the time for giving up.
 func TestRunDoesNotGiveUpOnANormalShutdown(t *testing.T) {
+	t.Parallel()
 	for _, member := range []int{1, 2, 3, 9} {
 		lists := make([][]int, member+1)
 		f := newFake()
@@ -274,6 +285,7 @@ func TestRunDoesNotGiveUpOnANormalShutdown(t *testing.T) {
 // --------------------------------------------------- the whole path, for real
 
 func TestTeardownGivesUpOnMembersItCannotEnd(t *testing.T) {
+	t.Parallel()
 	// The member leaves the command's group, so the stage's signal to the group
 	// misses it, and the stage's scan signals nothing, so it finds it again each
 	// time, as it would a process that forks faster than it is signaled.
@@ -308,6 +320,7 @@ close $w; sysread($r, my $b, 1); _exit(0);`
 // A stage that was killed says nothing, and the caller's own teardown gives up
 // on members in the same way. Its signals are taken away here, in this process.
 func TestWaitGivesUpOnMembersItCannotEnd(t *testing.T) {
+	t.Parallel()
 	c, err := Command(t.Context(), Spec{Home: realTemp(t), Command: []string{"/bin/sleep", "30"}})
 	if err != nil {
 		t.Fatal(err)
@@ -316,8 +329,8 @@ func TestWaitGivesUpOnMembersItCannotEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	endAtCleanup(t, c) // runs last, with the hook gone
-	testProberHook = func(p *prober) { p.kill = func(int) {} }
-	t.Cleanup(func() { testProberHook = nil })
+	c.run.proberHook = func(p *prober) { p.kill = func(int) {} }
+	t.Cleanup(func() { c.run.proberHook = nil })
 	eventually(t, 5*time.Second, "the command did not start under the profile", func() bool {
 		in, _ := c.run.mark.member(c.run.group)
 		return in
@@ -342,6 +355,7 @@ func TestWaitGivesUpOnMembersItCannotEnd(t *testing.T) {
 // does not give up on them and Wait returns nil. This is what normal programs
 // that fork while they die look like, at their worst.
 func TestTeardownDoesNotGiveUpOnShortChains(t *testing.T) {
+	t.Parallel()
 	const chains = 8
 	script := `use POSIX qw(setsid _exit); use Time::HiRes qw(time);
 my $end = time + 3;
@@ -372,6 +386,7 @@ _exit(0);`
 // the ones that were: each of them is a process that can have been a member and
 // can vanish before it is read.
 func TestScanChecksNewPidsBeforeRememberedOnes(t *testing.T) {
+	t.Parallel()
 	f := newFake([]int{10, 20, 30, 40, 50})
 	p := f.prober()
 	p.execPid = 99 // no process is asked about twice
@@ -393,6 +408,7 @@ func TestScanChecksNewPidsBeforeRememberedOnes(t *testing.T) {
 // The remembered ones still get their stat. A cleared pid is the same process
 // only if its start time is, and a number that was reused may be a member now.
 func TestScanDoesNotTrustARememberedNumberAlone(t *testing.T) {
+	t.Parallel()
 	f := newFake([]int{10, 20})
 	f.members = map[int]bool{20: true}
 	old := f.t0.Add(-time.Hour).UnixMicro()

@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -51,6 +52,22 @@ const stageNoKillEnv = "SANDBOX_TEST_STAGE_NO_KILL"
 // TestMain lets the test binary be each part of a sandbox: the process that
 // starts it, its stage, and the command inside it.
 func TestMain(m *testing.M) {
+	registerAPIModes()
+	registerAPIResourceChecks()
+	registerEscapeChecks()
+	registerDialInSession()
+	registerDaemonChild()
+	registerSignalsFromFile()
+	registerEscParent()
+	registerReviewChecks()
+	registerServeChecks()
+	registerProcargsParent()
+	registerDevOK()
+	registerInheritServe()
+	registerRootsChecks()
+	registerProbeMode()
+	registerSleepForever()
+	registerEscMode()
 	var hooks []func(*prober)
 	if os.Getenv(stageOrphanZombiesEnv) != "" {
 		hooks = append(hooks, func(p *prober) {
@@ -95,6 +112,21 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
+// listen is net.Listen with a context that is never canceled, for the same
+// reason.
+func listen(network, addr string) (net.Listener, error) {
+	var lc net.ListenConfig
+	return lc.Listen(context.Background(), network, addr)
+}
+
+// listenPacket is net.ListenPacket with a context that is never canceled, for
+// the helpers and the processes the tests run inside a sandbox, which have no
+// context of their own to give.
+func listenPacket(network, addr string) (net.PacketConn, error) {
+	var lc net.ListenConfig
+	return lc.ListenPacket(context.Background(), network, addr)
+}
+
 // shellPath is what a shell script in a sandbox finds its tools by, since the
 // sandbox's environment starts empty.
 const shellPath = "PATH=/usr/bin:/bin:/usr/sbin:/sbin"
@@ -113,7 +145,7 @@ func realTemp(t testing.TB) string {
 func mkdirs(t testing.TB, parts ...string) string {
 	t.Helper()
 	p := filepath.Join(parts...)
-	if err := os.MkdirAll(p, 0o755); err != nil {
+	if err := os.MkdirAll(p, 0o750); err != nil {
 		t.Fatal(err)
 	}
 	return p
@@ -123,7 +155,7 @@ func mkdirs(t testing.TB, parts ...string) string {
 func writeFile(t testing.TB, content string, parts ...string) string {
 	t.Helper()
 	p := filepath.Join(parts...)
-	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	return p
@@ -181,9 +213,9 @@ func sh(t testing.TB, spec Spec, script string, args ...string) result {
 
 // shOK is sh that fails the test unless the script exits 0, and returns its
 // standard output.
-func shOK(t testing.TB, spec Spec, script string, args ...string) string {
+func shOK(t testing.TB, spec Spec, script string) string {
 	t.Helper()
-	r := sh(t, spec, script, args...)
+	r := sh(t, spec, script)
 	if r.code != 0 {
 		t.Fatalf("script failed: %s", r)
 	}
@@ -216,7 +248,7 @@ func self(t testing.TB) string {
 // escT collects what an in-sandbox check finds wrong.
 type escT struct{ failed bool }
 
-func (e *escT) fail(format string, a ...any) {
+func (e *escT) failf(format string, a ...any) {
 	e.failed = true
 	fmt.Fprintf(os.Stderr, format+"\n", a...)
 }
@@ -226,7 +258,7 @@ func (e *escT) fail(format string, a ...any) {
 func (e *escT) is(name string, got error, want ...error) {
 	if len(want) == 0 {
 		if got != nil {
-			e.fail("%s: %v, want success", name, got)
+			e.failf("%s: %v, want success", name, got)
 		}
 		return
 	}
@@ -235,13 +267,13 @@ func (e *escT) is(name string, got error, want ...error) {
 			return
 		}
 	}
-	e.fail("%s: %v, want one of %v", name, got, want)
+	e.failf("%s: %v, want one of %v", name, got, want)
 }
 
 // escChecks are the checks the test binary runs inside a sandbox.
 var escChecks = map[string]func(e *escT, args []string){}
 
-func init() {
+func registerEscMode() {
 	childModes["esc"] = func(args []string) int {
 		if len(args) == 0 || escChecks[args[0]] == nil {
 			fmt.Fprintln(os.Stderr, "no such check", args)
@@ -258,7 +290,7 @@ func init() {
 
 // escCmd returns a Cmd, made by Command, that runs this binary in a sandbox
 // from spec as `esc check args...`. An empty Home is a fresh directory.
-func escCmd(t testing.TB, ctx context.Context, spec Spec, check string, args ...string) *Cmd {
+func escCmd(ctx context.Context, t testing.TB, spec Spec, check string, args ...string) *Cmd {
 	t.Helper()
 	if spec.Home == "" {
 		spec.Home = realTemp(t)
@@ -275,7 +307,7 @@ func escCmd(t testing.TB, ctx context.Context, spec Spec, check string, args ...
 // exits 0, and returns its standard output.
 func escRun(t testing.TB, spec Spec, check string, args ...string) string {
 	t.Helper()
-	r := execute(t, escCmd(t, t.Context(), spec, check, args...))
+	r := execute(t, escCmd(t.Context(), t, spec, check, args...))
 	if r.code != 0 {
 		t.Fatalf("%s: %s", check, r)
 	}
@@ -285,7 +317,7 @@ func escRun(t testing.TB, spec Spec, check string, args ...string) string {
 // escResult is escRun that does not require success.
 func escResult(t testing.TB, spec Spec, check string, args ...string) result {
 	t.Helper()
-	return execute(t, escCmd(t, t.Context(), spec, check, args...))
+	return execute(t, escCmd(t.Context(), t, spec, check, args...))
 }
 
 // eventually polls cond until it is true, and fails the test after d.
@@ -310,7 +342,7 @@ func alive(pid int) bool {
 // as ps lists them, not counting ps itself.
 func pids(t testing.TB, substr string) []int {
 	t.Helper()
-	out, err := exec.Command("/bin/ps", "-axww", "-o", "pid=,command=").Output()
+	out, err := exec.CommandContext(context.Background(), "/bin/ps", "-axww", "-o", "pid=,command=").Output()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -353,7 +385,7 @@ func jsonUnmarshal(s string, v any) error { return json.Unmarshal([]byte(s), v) 
 // and returns its pid.
 func newTestProcess(t *testing.T, dir string, env []string) int {
 	t.Helper()
-	cmd := exec.Command(self(t), "canary", dir)
+	cmd := exec.CommandContext(t.Context(), self(t), "canary", dir) //nolint:gosec // G204: the test binary or a tool the test names, run as the test's own child.
 	cmd.Env = env
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
@@ -374,13 +406,14 @@ func tree(t testing.TB, root int) []int {
 	in := map[int]bool{root: true}
 	for grew := true; grew; {
 		grew = false
-		for _, p := range procs {
+		for i := range procs {
+			p := &procs[i]
 			if pid, ppid := int(p.Proc.P_pid), int(p.Eproc.Ppid); !in[pid] && in[ppid] {
 				in[pid], grew = true, true
 			}
 		}
 	}
-	var out []int
+	out := make([]int, 0, len(in))
 	for pid := range in {
 		out = append(out, pid)
 	}
@@ -392,7 +425,7 @@ func args(t testing.TB, pids []int) []string {
 	t.Helper()
 	var out []string
 	for _, pid := range pids {
-		b, err := exec.Command("/bin/ps", "-ww", "-o", "command=", "-p", fmt.Sprint(pid)).Output()
+		b, err := exec.CommandContext(context.Background(), "/bin/ps", "-ww", "-o", "command=", "-p", fmt.Sprint(pid)).Output() //nolint:gosec // G204: the test binary or a tool the test names, run as the test's own child.
 		if err == nil {
 			out = append(out, strings.TrimSpace(string(b)))
 		}

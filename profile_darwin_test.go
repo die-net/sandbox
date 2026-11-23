@@ -6,6 +6,7 @@ import (
 )
 
 func TestQuote(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		in, want string
 	}{
@@ -51,6 +52,7 @@ func indexOf(p, sub string) int {
 }
 
 func TestProfileBasics(t *testing.T) {
+	t.Parallel()
 	p, err := profile(profileInput{Home: "/h"})
 	if err != nil {
 		t.Fatal(err)
@@ -66,7 +68,7 @@ func TestProfileBasics(t *testing.T) {
 	}
 	// The home is allowed after the broad read and after the covers, and the
 	// process-info deny comes before its allow.
-	if !(indexOf(p, `(subpath "/"))`) < indexOf(p, `(subpath "/h")`)) {
+	if indexOf(p, `(subpath "/"))`) >= indexOf(p, `(subpath "/h")`) {
 		t.Error("the home comes before the broad allow")
 	}
 	if indexOf(p, "(deny process-info*)") > indexOf(p, "(allow process-info*") {
@@ -81,6 +83,7 @@ func TestProfileBasics(t *testing.T) {
 }
 
 func TestProfileOrder(t *testing.T) {
+	t.Parallel()
 	p, err := profile(profileInput{
 		Home:  "/Users/a/home",
 		Cover: []string{"/Users", "/Users/a/tool/secrets", "/private/var"},
@@ -123,6 +126,7 @@ func TestProfileOrder(t *testing.T) {
 }
 
 func TestProfileNetwork(t *testing.T) {
+	t.Parallel()
 	has := func(p, want string) bool { return indexOf(p, want) >= 0 }
 	none, err := profile(profileInput{Home: "/h", Listen: []int{4001}, Loopback: []int{4002, 4003}, Sockets: []string{"/w/mcp.sock"}})
 	if err != nil {
@@ -175,6 +179,7 @@ func TestProfileNetwork(t *testing.T) {
 }
 
 func TestProfileServices(t *testing.T) {
+	t.Parallel()
 	p, err := profile(profileInput{Home: "/h", Services: []Service{ServiceFirefox, ServiceFirefox, ServiceDirectory}})
 	if err != nil {
 		t.Fatal(err)
@@ -201,6 +206,7 @@ func TestProfileServices(t *testing.T) {
 }
 
 func TestProfileRefusesPaths(t *testing.T) {
+	t.Parallel()
 	for _, in := range []profileInput{
 		{Home: "/h\n(allow default)"},
 		{Home: "/h", Read: []string{"/r\x00"}},
@@ -217,6 +223,7 @@ func TestProfileRefusesPaths(t *testing.T) {
 }
 
 func TestDepth(t *testing.T) {
+	t.Parallel()
 	for p, want := range map[string]int{"/": 0, "/a": 1, "/a/b": 2, "/a/b/c": 3} {
 		if got := depth(p); got != want {
 			t.Errorf("depth(%s) = %d, want %d", p, got, want)
@@ -225,6 +232,7 @@ func TestDepth(t *testing.T) {
 }
 
 func TestRlimitFor(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		r       Rlimit
 		wantErr bool

@@ -3,6 +3,8 @@ package sandbox
 import (
 	"errors"
 	"fmt"
+	"math"
+	"os"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -34,7 +36,18 @@ type bsdInfo struct {
 	Name                               [32]byte
 	NFiles, PGID, PJobC, ETDev, ETPGID uint32
 	Nice                               int32
-	StartSec, StartUsec                uint64
+	StartSec, StartUsec                int64
+}
+
+// euid returns the process's effective uid as the kernel's unsigned type.
+// A uid is never negative, and if it were, the all-ones value that -1 stands
+// for is a uid no process has.
+func euid() uint32 {
+	id := os.Geteuid()
+	if id < 0 || id > math.MaxUint32 {
+		return math.MaxUint32
+	}
+	return uint32(id)
 }
 
 // listCall is one proc_info(PROC_INFO_CALL_LISTPIDS) call for a uid: with no
@@ -54,9 +67,9 @@ func listUIDPids(uid uint32) ([]int, error) {
 	return listPids(func(buf []int32) (int, error) {
 		var p unsafe.Pointer
 		if len(buf) > 0 {
-			p = unsafe.Pointer(&buf[0])
+			p = unsafe.Pointer(&buf[0]) //nolint:gosec // G103: the kernel fills the buffer during the call, and the pointer goes straight into it.
 		}
-		n, _, errno := unix.Syscall6(unix.SYS_PROC_INFO, procInfoListPids, procUIDOnly, uintptr(uid), 0, uintptr(p), uintptr(len(buf)*4))
+		n, _, errno := unix.Syscall6(unix.SYS_PROC_INFO, procInfoListPids, procUIDOnly, uintptr(uid), 0, uintptr(p), uintptr(len(buf)*4)) //nolint:staticcheck // SA1019: Syscall6 passes the number to libc's syscall(2), and libproc's wrapper has no binding without cgo.
 		if errno != 0 {
 			return 0, fmt.Errorf("list processes: %w", errno)
 		}
@@ -113,7 +126,7 @@ func listPids(call listCall) ([]int, error) {
 // left proc_find's reach and not yet reached proc_find_zombref, are ESRCH.
 func readBSD(pid int) (bsdInfo, error) {
 	var b bsdInfo
-	n, _, errno := unix.Syscall6(unix.SYS_PROC_INFO, procInfoPidInfo, uintptr(pid), procPidTBSDInfo, 1, uintptr(unsafe.Pointer(&b)), unsafe.Sizeof(b))
+	n, _, errno := unix.Syscall6(unix.SYS_PROC_INFO, procInfoPidInfo, uintptr(pid), procPidTBSDInfo, 1, uintptr(unsafe.Pointer(&b)), unsafe.Sizeof(b)) //nolint:gosec,staticcheck // G103: the kernel fills b during the call. SA1019: Syscall6 passes the number to libc's syscall(2), and libproc's wrapper has no binding without cgo.
 	if errno != 0 {
 		return bsdInfo{}, errno
 	}
@@ -138,7 +151,7 @@ func procStatOf(b bsdInfo) procStat {
 		Forking: b.Status == stateForking,
 		Zombie:  b.Status == stateZombie,
 		Exiting: b.Flags&flagInExit != 0,
-		Start:   int64(b.StartSec)*1_000_000 + int64(b.StartUsec),
+		Start:   b.StartSec*1_000_000 + b.StartUsec,
 		Comm:    unix.ByteSliceToString(b.Comm[:]),
 		PPid:    int(b.PPid),
 	}

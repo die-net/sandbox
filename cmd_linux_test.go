@@ -42,7 +42,7 @@ type report struct {
 	Ifaces   []string          `json:"ifaces"`
 	Fds      map[int]string    `json:"fds"`
 	Limits   map[string]Rlimit `json:"limits"`
-	Uid      int               `json:"uid"`
+	UID      int               `json:"uid"`
 }
 
 // openFds returns every descriptor from 3 up that the process holds, by
@@ -71,7 +71,7 @@ func openFds() map[int]string {
 
 // reportMode prints a report of what the command can see of itself.
 func reportMode([]string) int {
-	r := report{Env: os.Environ(), Fds: openFds(), Limits: map[string]Rlimit{}, Uid: os.Getuid()}
+	r := report{Env: os.Environ(), Fds: openFds(), Limits: map[string]Rlimit{}, UID: os.Getuid()}
 	r.Dir, _ = os.Getwd()
 	r.Hostname, _ = os.Hostname()
 	if dev, err := os.ReadFile("/proc/net/dev"); err == nil {
@@ -127,30 +127,33 @@ func sleepMode([]string) int {
 // dials it, as a command does with its own loopback port.
 func dialListenMode(args []string) int {
 	if len(args) == 2 {
-		ln, err := net.Listen("tcp", args[1])
+		ln, err := listenTCP(args[1])
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			return 1
 		}
 		go func() {
 			if c, err := ln.Accept(); err == nil {
-				c.Close()
+				c.Close() //nolint:gosec // G104: nothing can be done about a failed close here, and the test is over or has what it needs.
 			}
 		}()
-		c, err := net.Dial("tcp", args[1])
+		c, err := dialTimeout("tcp", args[1], 5*time.Second)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			return 1
 		}
-		c.Close()
+		c.Close() //nolint:gosec // G104: nothing can be done about a failed close here, and the test is over or has what it needs.
 	}
-	c, err := net.Dial("tcp", args[0])
+	c, err := dialTimeout("tcp", args[0], 5*time.Second)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
 	defer c.Close()
-	fmt.Fprintln(c, "hello")
+	if _, err := fmt.Fprintln(c, "hello"); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
 	line, err := bufio.NewReader(c).ReadString('\n')
 	if err != nil || line != "world\n" {
 		fmt.Fprintf(os.Stderr, "reply %q: %v\n", line, err)
@@ -196,7 +199,7 @@ func startAndHangMode(args []string) int {
 // args, which starts in spec's home. The test binary's directory is
 // readable, since it is under the host's covered /tmp. Env is a minimal
 // one, and Stdout and Stderr collect into the returned buffers.
-func testCmd(t *testing.T, ctx context.Context, spec Spec, mode string, args ...string) (*Cmd, *bytes.Buffer, *bytes.Buffer) {
+func testCmd(ctx context.Context, t *testing.T, spec Spec, mode string) (*Cmd, *bytes.Buffer, *bytes.Buffer) {
 	t.Helper()
 	exe, err := os.Executable()
 	if err != nil {
@@ -205,7 +208,7 @@ func testCmd(t *testing.T, ctx context.Context, spec Spec, mode string, args ...
 	if spec.Home == "" {
 		spec.Home = t.TempDir()
 	}
-	spec.Command = append([]string{exe, mode}, args...)
+	spec.Command = []string{exe, mode}
 	spec.Read = append(spec.Read, filepath.Dir(exe))
 	c, err := Command(ctx, spec)
 	if err != nil {
@@ -220,7 +223,7 @@ func testCmd(t *testing.T, ctx context.Context, spec Spec, mode string, args ...
 // what it reported.
 func runReport(t *testing.T, spec Spec, env []string) report {
 	t.Helper()
-	c, stdout, stderr := testCmd(t, t.Context(), spec, "report")
+	c, stdout, stderr := testCmd(t.Context(), t, spec, "report")
 	c.Env = env
 	if err := c.Start(); err != nil {
 		t.Fatal(err)
@@ -236,8 +239,10 @@ func runReport(t *testing.T, spec Spec, env []string) report {
 }
 
 func TestCommandEnv(t *testing.T) {
+	t.Parallel()
 	home := t.TempDir()
 	t.Run("nil means empty", func(t *testing.T) {
+		t.Parallel()
 		r := runReport(t, Spec{Home: home}, nil)
 		// Set by Start, and nothing of the caller's, but for the PWD
 		// bubblewrap sets to the working directory.
@@ -258,6 +263,7 @@ func TestCommandEnv(t *testing.T) {
 		}
 	})
 	t.Run("the sandbox's own wins", func(t *testing.T) {
+		t.Parallel()
 		r := runReport(t, Spec{Home: home}, []string{
 			"FOO=bar", "HOME=/evil", "TMPDIR=/evil", "XDG_RUNTIME_DIR=/run/user/1000", "XDG_DATA_HOME=/evil",
 		})
@@ -275,6 +281,7 @@ func TestCommandEnv(t *testing.T) {
 }
 
 func TestCommandDefaults(t *testing.T) {
+	t.Parallel()
 	home := t.TempDir()
 	r := runReport(t, Spec{Home: home}, nil)
 	if r.Dir != home {
@@ -288,8 +295,11 @@ func TestCommandDefaults(t *testing.T) {
 	}
 }
 
-func TestCommandRefusesRoot(t *testing.T) {
-	cmd := exec.CommandContext(t.Context(), "/proc/self/exe", "refuses-root")
+// runAsNamespaceRoot runs this binary's child mode in a user namespace where
+// the caller is uid 0, and fails the test unless the mode exits with 0.
+func runAsNamespaceRoot(t *testing.T, mode string) {
+	t.Helper()
+	cmd := exec.CommandContext(t.Context(), "/proc/self/exe", mode) //nolint:gosec // G204: the test binary or a tool the test names, run as the test's own child.
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Cloneflags:  unix.CLONE_NEWUSER,
 		UidMappings: []syscall.SysProcIDMap{{ContainerID: 0, HostID: os.Getuid(), Size: 1}},
@@ -300,7 +310,13 @@ func TestCommandRefusesRoot(t *testing.T) {
 	}
 }
 
+func TestCommandRefusesRoot(t *testing.T) {
+	t.Parallel()
+	runAsNamespaceRoot(t, "refuses-root")
+}
+
 func TestCommandRefusals(t *testing.T) {
+	t.Parallel()
 	f, err := os.Open(os.DevNull)
 	if err != nil {
 		t.Fatal(err)
@@ -332,6 +348,7 @@ func TestCommandRefusals(t *testing.T) {
 // refuses it, and never starts a weaker one. kernelFilterBuilds says whether
 // this architecture has a system call list.
 func TestCommandKernel(t *testing.T) {
+	t.Parallel()
 	for _, level := range []Kernel{"", KernelStrict, KernelNested, KernelOpen} {
 		c, err := Command(t.Context(), Spec{Command: []string{"true"}, Home: "/h", Kernel: level})
 		if level != KernelOpen && !kernelFilterBuilds {
@@ -355,6 +372,7 @@ func TestCommandKernel(t *testing.T) {
 }
 
 func TestCommandFiles(t *testing.T) {
+	t.Parallel()
 	in, err := os.CreateTemp(t.TempDir(), "in")
 	if err != nil {
 		t.Fatal(err)
@@ -368,7 +386,7 @@ func TestCommandFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer pr.Close()
-	c, stdout, stderr := testCmd(t, t.Context(), Spec{Files: []*os.File{in, pw}}, "files")
+	c, stdout, stderr := testCmd(t.Context(), t, Spec{Files: []*os.File{in, pw}}, "files")
 	if err := c.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -405,6 +423,7 @@ func TestCommandFiles(t *testing.T) {
 }
 
 func TestCommandHoldsNoSetupDescriptors(t *testing.T) {
+	t.Parallel()
 	r := runReport(t, Spec{}, nil)
 	if len(r.Fds) != 0 {
 		t.Errorf("the command holds descriptors from 3 up: %v", r.Fds)
@@ -413,9 +432,9 @@ func TestCommandHoldsNoSetupDescriptors(t *testing.T) {
 
 // startSleeper starts a sandbox whose command waits to be killed, once it
 // has said so.
-func startSleeper(t *testing.T, ctx context.Context) *Cmd {
+func startSleeper(ctx context.Context, t *testing.T) *Cmd {
 	t.Helper()
-	c, _, stderr := testCmd(t, ctx, Spec{}, "sleep")
+	c, _, stderr := testCmd(ctx, t, Spec{}, "sleep")
 	if err := c.Start(); err != nil {
 		t.Fatalf("%v: %s", err, stderr)
 	}
@@ -433,9 +452,10 @@ func gone(pid int) bool {
 }
 
 func TestCommandPid(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	c := startSleeper(t, ctx)
+	c := startSleeper(ctx, t)
 	pid := c.Pid()
 	if pid <= 0 || pid == c.run.cmd.Process.Pid {
 		t.Fatalf("Pid = %d, bubblewrap is %d", pid, c.run.cmd.Process.Pid)
@@ -458,12 +478,13 @@ func TestCommandPid(t *testing.T) {
 	cancel()
 	_ = c.Wait()
 	if !gone(pid) {
-		t.Errorf("pid 1 (%d) outlived the cancelled context", pid)
+		t.Errorf("pid 1 (%d) outlived the canceled context", pid)
 	}
 }
 
 func TestCommandLifeline(t *testing.T) {
-	c := startSleeper(t, t.Context())
+	t.Parallel()
+	c := startSleeper(t.Context(), t)
 	pid := c.Pid()
 	// Only the lifeline's close can end it: bubblewrap and the parent are
 	// both running.
@@ -481,6 +502,7 @@ func TestCommandLifeline(t *testing.T) {
 // TestCommandParentKilled checks that a parent killed without a chance to
 // clean up takes its sandbox with it.
 func TestCommandParentKilled(t *testing.T) {
+	t.Parallel()
 	exe, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
@@ -489,7 +511,7 @@ func TestCommandParentKilled(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	parent := exec.CommandContext(t.Context(), "/proc/self/exe", "start-and-hang", string(body))
+	parent := exec.CommandContext(t.Context(), "/proc/self/exe", "start-and-hang", string(body)) //nolint:gosec // G204: the test binary or a tool the test names, run as the test's own child.
 	out, err := parent.StdoutPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -515,19 +537,21 @@ func TestCommandParentKilled(t *testing.T) {
 }
 
 func TestCommandContext(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithCancel(t.Context())
-	c := startSleeper(t, ctx)
+	c := startSleeper(ctx, t)
 	pid := c.Pid()
 	cancel()
 	if err := c.Wait(); err == nil {
-		t.Error("Wait returned no error for a cancelled sandbox")
+		t.Error("Wait returned no error for a canceled sandbox")
 	}
 	if !gone(pid) {
-		t.Errorf("pid 1 (%d) outlived the cancelled context", pid)
+		t.Errorf("pid 1 (%d) outlived the canceled context", pid)
 	}
 }
 
 func TestNetworkNone(t *testing.T) {
+	t.Parallel()
 	r := runReport(t, Spec{}, nil)
 	if !slices.Equal(r.Ifaces, []string{"lo"}) {
 		t.Errorf("interfaces = %q, want only lo", r.Ifaces)
@@ -535,7 +559,8 @@ func TestNetworkNone(t *testing.T) {
 }
 
 func TestListen(t *testing.T) {
-	c, _, stderr := testCmd(t, t.Context(), Spec{Listen: 2, Loopback: 1}, "dial-listen")
+	t.Parallel()
+	c, _, stderr := testCmd(t.Context(), t, Spec{Listen: 2, Loopback: 1}, "dial-listen")
 	if want := []string{"127.0.0.1:3128", "127.0.0.1:3129"}; !slices.Equal(c.ListenAddrs(), want) {
 		t.Fatalf("ListenAddrs = %q, want %q", c.ListenAddrs(), want)
 	}
@@ -558,14 +583,14 @@ func TestListen(t *testing.T) {
 		if ln.Addr().String() != c.ListenAddrs()[i] {
 			t.Errorf("listener %d is on %s, want %s", i, ln.Addr(), c.ListenAddrs()[i])
 		}
-		defer ln.Close()
+		t.Cleanup(func() { _ = ln.Close() })
 	}
 	// The listeners are the sandbox's, not the host's: nothing on the host
 	// answers on the same address.
-	if conn, err := net.DialTimeout("tcp", c.ListenAddrs()[0], time.Second); err == nil {
+	if conn, err := dialTimeout("tcp", c.ListenAddrs()[0], time.Second); err == nil {
 		// Only the sandbox's own network namespace has it, and the caller's
 		// listener answers there. Reaching it from here means it is not private.
-		conn.Close()
+		conn.Close() //nolint:gosec // G104: nothing can be done about a failed close here, and the test is over or has what it needs.
 		t.Errorf("the host reached %s", c.ListenAddrs()[0])
 	}
 	served := make(chan string, 1)
@@ -577,7 +602,10 @@ func TestListen(t *testing.T) {
 		}
 		defer conn.Close()
 		line, _ := bufio.NewReader(conn).ReadString('\n')
-		fmt.Fprintln(conn, "world")
+		if _, err := fmt.Fprintln(conn, "world"); err != nil {
+			served <- err.Error()
+			return
+		}
 		served <- line
 	}()
 	if err := c.Wait(); err != nil {
@@ -589,7 +617,8 @@ func TestListen(t *testing.T) {
 }
 
 func TestStartFailureIsReported(t *testing.T) {
-	c, _, _ := testCmd(t, t.Context(), Spec{Listen: 1}, "sleep")
+	t.Parallel()
+	c, _, _ := testCmd(t.Context(), t, Spec{Listen: 1}, "sleep")
 	c.spec.Command = []string{"/nonexistent/command"}
 	err := c.Start()
 	if err == nil || !strings.Contains(err.Error(), "/nonexistent/command") {
@@ -604,6 +633,7 @@ func TestStartFailureIsReported(t *testing.T) {
 }
 
 func TestRlimits(t *testing.T) {
+	t.Parallel()
 	r := runReport(t, Spec{Rlimits: []Rlimit{
 		{ResourceCore, 0, 4096},
 		{ResourceFileSize, 1 << 20, 1 << 21},
@@ -623,7 +653,8 @@ func TestRlimits(t *testing.T) {
 }
 
 func TestCmdOptions(t *testing.T) {
-	c, _, _ := testCmd(t, t.Context(), Spec{}, "sleep")
+	t.Parallel()
+	c, _, _ := testCmd(t.Context(), t, Spec{}, "sleep")
 	if c.CgroupFD != -1 {
 		t.Errorf("CgroupFD = %d, want -1", c.CgroupFD)
 	}
@@ -655,7 +686,7 @@ func TestCmdOptions(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer dir.Close()
-	c, _, _ = testCmd(t, t.Context(), Spec{}, "sleep")
+	c, _, _ = testCmd(t.Context(), t, Spec{}, "sleep")
 	c.CgroupFD = int(dir.Fd())
 	if err := c.Start(); err == nil {
 		t.Error("Start in a cgroup that is /: no error")

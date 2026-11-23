@@ -3,7 +3,6 @@ package sandbox
 import (
 	"bufio"
 	"context"
-	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,11 +13,11 @@ import (
 // fakeProxy answers CONNECT to ok with 200 and anything else with 403.
 func fakeProxy(t *testing.T, ok string) string {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := listenLocal()
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { ln.Close() })
+	t.Cleanup(func() { ln.Close() }) //nolint:gosec // G104: nothing can be done about a failed close here, and the test is over or has what it needs.
 	go func() {
 		for {
 			c, err := ln.Accept()
@@ -31,10 +30,14 @@ func fakeProxy(t *testing.T, ok string) string {
 				if err != nil {
 					return
 				}
+				reply := "HTTP/1.1 403 Forbidden\r\n\r\n"
 				if strings.Fields(line)[1] == ok {
-					c.Write([]byte("HTTP/1.1 200 Connection established\r\n\r\n"))
-				} else {
-					c.Write([]byte("HTTP/1.1 403 Forbidden\r\n\r\n"))
+					reply = "HTTP/1.1 200 Connection established\r\n\r\n"
+				}
+				// A reply that is not sent leaves the client's check without
+				// the answer it expects, which that check reports.
+				if _, err := c.Write([]byte(reply)); err != nil {
+					return
 				}
 			}()
 		}
@@ -58,22 +61,23 @@ func byName(t *testing.T, res []Result) map[string]Result {
 // operator's container would, and checks the caller's Expect results and the
 // results that hold on any plain host.
 func TestCheckNil(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	secret := filepath.Join(dir, "secret")
 	if err := os.WriteFile(secret, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	listener, err := listenLocal()
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer listener.Close()
-	closed, err := net.Listen("tcp", "127.0.0.1:0")
+	closed, err := listenLocal()
 	if err != nil {
 		t.Fatal(err)
 	}
 	closedAddr := closed.Addr().String()
-	closed.Close()
+	closed.Close() //nolint:gosec // G104: nothing can be done about a failed close here, and the test is over or has what it needs.
 
 	want := Expect{
 		Unreadable:  []string{secret, filepath.Join(dir, "absent")},
@@ -134,6 +138,7 @@ func TestCheckNil(t *testing.T) {
 }
 
 func TestCheckNilTimeoutIsPass(t *testing.T) {
+	t.Parallel()
 	// A black hole: a listener whose backlog is full would do, but the
 	// documented targets are enough to see the wording. Only the format of
 	// a timeout is tested here.
@@ -141,12 +146,13 @@ func TestCheckNilTimeoutIsPass(t *testing.T) {
 	if out == timedOut && !strings.Contains(d, "timed out") {
 		t.Errorf("timeout detail %q does not say so", d)
 	}
-	if r := reachResult("x", "y", out, d, false); out != connected && r.Status != Pass {
+	if r := reachResult("x", "y", out, d); out != connected && r.Status != Pass {
 		t.Errorf("outcome %v gave %v", out, r.Status)
 	}
 }
 
 func TestCheckSpecRefusesBadSpec(t *testing.T) {
+	t.Parallel()
 	// An empty Spec has no home, so it is refused, before Command exists or after.
 	if _, err := Check(context.Background(), &Spec{}, Expect{}); err == nil {
 		t.Error("Check accepted an empty Spec")
@@ -154,6 +160,7 @@ func TestCheckSpecRefusesBadSpec(t *testing.T) {
 }
 
 func TestStatusString(t *testing.T) {
+	t.Parallel()
 	for st, want := range map[Status]string{Pass: "pass", Fail: "fail", NotEnforceable: "not-enforceable", Skipped: "skipped", 9: "status(9)"} {
 		if st.String() != want {
 			t.Errorf("%d = %q, want %q", st, st.String(), want)
@@ -162,6 +169,7 @@ func TestStatusString(t *testing.T) {
 }
 
 func TestUnder(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		p, root string
 		want    bool
@@ -174,10 +182,11 @@ func TestUnder(t *testing.T) {
 
 // TestSpecDrivenChecks runs the checks that read the Spec, without a sandbox.
 func TestSpecDrivenChecks(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	mk := func(p ...string) string {
 		path := filepath.Join(append([]string{dir}, p...)...)
-		if err := os.MkdirAll(path, 0o755); err != nil {
+		if err := os.MkdirAll(path, 0o750); err != nil {
 			t.Fatal(err)
 		}
 		return path

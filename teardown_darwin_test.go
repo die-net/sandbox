@@ -19,6 +19,7 @@ import (
 // needs two scans always never gets there. None of the runs may have the
 // caller scan, whatever the load, since the stage has its whole budget.
 func TestTeardownOneScanInTheStageAndNoneInTheCaller(t *testing.T) {
+	t.Parallel()
 	home := realTemp(t)
 	const tries, most = 60, 5
 	hits, ran := 0, 0
@@ -55,7 +56,7 @@ func TestTeardownOneScanInTheStageAndNoneInTheCaller(t *testing.T) {
 // process's own children that other tests left unreaped.
 func foreignZombies(t *testing.T) []int {
 	t.Helper()
-	pids, err := listUIDPids(uint32(syscall.Geteuid()))
+	pids, err := listUIDPids(euid())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,6 +73,7 @@ func foreignZombies(t *testing.T) []int {
 // unknown and no scan after it: the sandbox is still proved empty, the caller
 // does not scan, and Wait neither fails nor stalls.
 func TestTeardownLingeringZombie(t *testing.T) {
+	t.Parallel()
 	z := zombieChild(t)
 	c, err := Command(t.Context(), Spec{Home: realTemp(t), Command: []string{"/usr/bin/true"}})
 	if err != nil {
@@ -108,6 +110,7 @@ func TestTeardownLingeringZombie(t *testing.T) {
 // proof to the caller, which ends a chain of processes that is still forking,
 // and Wait does not report survivors.
 func TestTeardownStageKilledMidTeardown(t *testing.T) {
+	t.Parallel()
 	delay := 150 * time.Millisecond
 	for range 5 {
 		c, err := Command(t.Context(), Spec{Home: realTemp(t), Command: []string{"/usr/bin/perl", "-e", reforkScript, "10"}})

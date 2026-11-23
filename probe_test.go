@@ -9,6 +9,7 @@ import (
 )
 
 func TestParseVersion(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		in           string
 		major, minor int
@@ -48,6 +49,7 @@ func lastCheck(t *testing.T, f probeFacts) Result {
 }
 
 func TestDiagnose(t *testing.T) {
+	t.Parallel()
 	ok := goodFacts()
 	res := diagnose(ok)
 	for _, r := range res {
@@ -106,6 +108,7 @@ func TestDiagnose(t *testing.T) {
 		}), "probe.userns-sysctl", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			r := lastCheck(t, tc.facts)
 			if r.Name != tc.want || r.Status != Fail {
 				t.Fatalf("last finding = %s %v, want a failed %s: %s", r.Name, r.Status, tc.want, r.Detail)
@@ -123,6 +126,7 @@ type fakeErr struct{ error }
 func (e *fakeErr) Unwrap() error { return e.error }
 
 func TestMasked(t *testing.T) {
+	t.Parallel()
 	// The mounts Docker makes around /proc.
 	const mi = `1 0 0:1 / / rw - overlay overlay rw
 2 1 0:5 / /proc rw - proc proc rw
@@ -142,6 +146,7 @@ func TestMasked(t *testing.T) {
 }
 
 func TestApparmorProfile(t *testing.T) {
+	t.Parallel()
 	p, name, err := apparmorProfile("/opt/app/server")
 	if err != nil {
 		t.Fatal(err)
@@ -170,6 +175,7 @@ func TestApparmorProfile(t *testing.T) {
 }
 
 func TestDetectContainer(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name string
 		f    containerFacts
@@ -199,6 +205,7 @@ func TestDetectContainer(t *testing.T) {
 // scripts/apparmor.sh uses it, so the profile the suite runs under is the
 // one the library prints.
 func TestWriteApparmorProfile(t *testing.T) {
+	t.Parallel()
 	dir := os.Getenv("SBX_APPARMOR_OUT")
 	if dir == "" {
 		t.Skip("SBX_APPARMOR_OUT is not set")
@@ -214,7 +221,7 @@ func TestWriteApparmorProfile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, name), []byte(p), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(p), 0o600); err != nil { //nolint:gosec // G703: the test touches only paths it made, or was passed, to see whether a sandbox allows it.
 		t.Fatal(err)
 	}
 }

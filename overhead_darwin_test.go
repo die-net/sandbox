@@ -12,6 +12,8 @@ import (
 // Wait for /usr/bin/true. It is skipped unless SANDBOX_OVERHEAD names the
 // number of runs, since it is a measurement and not a check. It prints the
 // median and the 90th percentile after three warm-up runs.
+//
+//nolint:paralleltest // measures the machine: the start overhead, which other tests' load would change.
 func TestOverheadTrue(t *testing.T) {
 	n, _ := strconv.Atoi(os.Getenv("SANDBOX_OVERHEAD"))
 	if n <= 0 {

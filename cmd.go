@@ -1,7 +1,6 @@
 package sandbox
 
 import (
-	"context"
 	"errors"
 	"io"
 	"time"
@@ -82,7 +81,7 @@ type Cmd struct {
 	// Cmd that was not made by Command still has none.
 	CgroupFD int
 
-	ctx  context.Context
-	spec Spec
-	run  run
+	// backend is what the platform's implementation holds in a Cmd, which is
+	// nothing where there is no backend.
+	backend
 }

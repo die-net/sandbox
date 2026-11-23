@@ -14,25 +14,22 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// unprovable makes the caller's teardown unable to prove the sandbox empty, and
-// ignore the stage's report that it did: the scan lists a pid that is never
-// there, so no scan is clean. With a budget of none, the teardown makes one
-// scan and gives up, which stands for a chain of processes that kept ahead of
-// the scan until the budget ran out. Only the caller's scans are affected, not
-// the stage's, which is another process.
-func unprovable(t *testing.T, on bool) {
-	t.Helper()
-	testIgnoreStageReport, testProberHook = on, nil
-	if on {
-		testProberHook = func(p *prober) {
-			list := p.list
-			p.list = func() ([]int, error) {
-				pids, err := list()
-				return append(pids, math.MaxInt32), err
-			}
+// unprovable makes the caller's teardown of c unable to prove the sandbox
+// empty, and ignore the stage's report that it did: the scan lists a pid that
+// is never there, so no scan is clean. With a budget of none, which the test
+// sets in c.run.budget, the teardown makes one scan and gives up, which stands
+// for a chain of processes that kept ahead of the scan until the budget ran
+// out. Only the caller's scans of c are affected, not the stage's, which is
+// another process, and not another Cmd's.
+func unprovable(c *Cmd) {
+	c.run.ignoreStageReport = true
+	c.run.proberHook = func(p *prober) {
+		list := p.list
+		p.list = func() ([]int, error) {
+			pids, err := list()
+			return append(pids, math.MaxInt32), err
 		}
 	}
-	t.Cleanup(func() { testIgnoreStageReport, testProberHook = false, nil })
 }
 
 // ------------------------------------------------- the scan's logic, with fakes
@@ -102,6 +99,7 @@ func newFake(lists ...[]int) *fakeSystem {
 var errGone = errors.New("no such process")
 
 func TestScanCleanFirstScanEnds(t *testing.T) {
+	t.Parallel()
 	f := newFake([]int{10, 20, 30})
 	scans, empty := f.prober().teardown(time.Second)
 	if scans != 1 || !empty || len(f.killed) != 0 {
@@ -112,8 +110,9 @@ func TestScanCleanFirstScanEnds(t *testing.T) {
 // A pid that vanished between the list and its read may have been a member
 // with children that the list does not hold.
 func TestScanVanishedPidForcesAnotherScan(t *testing.T) {
+	t.Parallel()
 	f := newFake([]int{10, 20, 30}, []int{10, 30})
-	f.stat = func(scan, pid int) (procStat, error) {
+	f.stat = func(_, pid int) (procStat, error) {
 		if pid == 20 {
 			return procStat{}, errGone
 		}
@@ -127,6 +126,7 @@ func TestScanVanishedPidForcesAnotherScan(t *testing.T) {
 // A pid that started at or after T may be a reuse of one the list held for
 // another process, so what the check said may be about the wrong process.
 func TestScanReusedPidForcesAnotherScan(t *testing.T) {
+	t.Parallel()
 	for _, after := range []time.Duration{0, time.Microsecond, time.Second} {
 		f := newFake([]int{10, 20})
 		f.step = 0 // so that T is t0 exactly
@@ -151,6 +151,7 @@ func TestScanReusedPidForcesAnotherScan(t *testing.T) {
 
 // A process that fork is still making has no label to check yet.
 func TestScanForkingPidForcesAnotherScan(t *testing.T) {
+	t.Parallel()
 	f := newFake([]int{10, 20})
 	f.stat = func(scan, pid int) (procStat, error) {
 		return procStat{Forking: pid == 20 && scan == 1, Start: f.t0.Add(-time.Second).UnixMicro()}, nil
@@ -163,6 +164,7 @@ func TestScanForkingPidForcesAnotherScan(t *testing.T) {
 // member says it is not known for a process that is gone, a zombie, or one that
 // has begun to exit (kernelFinds), which the real prober does produce.
 func TestScanUnknownMembershipForcesAnotherScan(t *testing.T) {
+	t.Parallel()
 	f := newFake([]int{10, 20})
 	f.unknown = map[int]bool{20: true}
 	p := f.prober()
@@ -183,6 +185,7 @@ func TestScanUnknownMembershipForcesAnotherScan(t *testing.T) {
 // One that the previous scan already saw as a zombie was dead before this
 // scan's snapshot and forks nothing.
 func TestScanZombies(t *testing.T) {
+	t.Parallel()
 	const start = 1_699_999_000_000_000
 	zombie := func(f *fakeSystem, startOf func(scan int) int64) {
 		f.stat = func(scan, pid int) (procStat, error) {
@@ -193,6 +196,7 @@ func TestScanZombies(t *testing.T) {
 		}
 	}
 	t.Run("new", func(t *testing.T) {
+		t.Parallel()
 		f := newFake([]int{10, 20})
 		zombie(f, func(int) int64 { return start })
 		if scans, empty := f.prober().teardown(time.Second); scans != 2 || !empty {
@@ -200,6 +204,7 @@ func TestScanZombies(t *testing.T) {
 		}
 	})
 	t.Run("old", func(t *testing.T) {
+		t.Parallel()
 		f := newFake([]int{10, 20})
 		zombie(f, func(int) int64 { return start })
 		clean, next, err := f.prober().scan(memory{dying: map[int]int64{20: start}})
@@ -208,6 +213,7 @@ func TestScanZombies(t *testing.T) {
 		}
 	})
 	t.Run("same pid, another process", func(t *testing.T) {
+		t.Parallel()
 		// The zombie that was there before was reaped, and its number given
 		// to a process that has now exited too.
 		f := newFake([]int{10, 20})
@@ -218,12 +224,13 @@ func TestScanZombies(t *testing.T) {
 		}
 	})
 	t.Run("a zombie's membership is unknown", func(t *testing.T) {
+		t.Parallel()
 		// The kernel does not find a zombie (kernelFinds), so member says it is
 		// unknown, as TestMemberOfGonePids shows, and an old zombie is cleared
 		// all the same. PROC_FLAG_INEXIT stays set on a zombie too.
 		f := newFake([]int{10, 20})
 		f.unknown = map[int]bool{20: true}
-		f.stat = func(scan, pid int) (procStat, error) {
+		f.stat = func(_, pid int) (procStat, error) {
 			if pid == 20 {
 				return procStat{Zombie: true, Exiting: true, Start: start}, nil
 			}
@@ -235,6 +242,7 @@ func TestScanZombies(t *testing.T) {
 		}
 	})
 	t.Run("a zombie never started before T", func(t *testing.T) {
+		t.Parallel()
 		f := newFake([]int{10, 20})
 		zombie(f, func(int) int64 { return f.t0.UnixMicro() })
 		clean, _, _ := f.prober().scan(memory{dying: map[int]int64{20: f.t0.UnixMicro()}})
@@ -243,6 +251,7 @@ func TestScanZombies(t *testing.T) {
 		}
 	})
 	t.Run("remembered between scans only", func(t *testing.T) {
+		t.Parallel()
 		// A zombie seen in one scan and gone from the next must not excuse a
 		// new one with the same number two scans later.
 		f := newFake([]int{10, 20}, []int{10}, []int{10, 20})
@@ -261,6 +270,7 @@ func TestScanZombies(t *testing.T) {
 // old, and sandbox_check answers it as a denial. It may have been a member that
 // forked after the snapshot.
 func TestScanExitingPidForcesAnotherScan(t *testing.T) {
+	t.Parallel()
 	f := newFake([]int{10, 20})
 	f.stat = func(scan, pid int) (procStat, error) {
 		return procStat{Exiting: pid == 20 && scan == 1, Start: f.t0.Add(-time.Second).UnixMicro()}, nil
@@ -273,6 +283,7 @@ func TestScanExitingPidForcesAnotherScan(t *testing.T) {
 // A sandbox-exec that is not a member has not applied its profile yet, and will
 // be the sandbox when it has. One that is a member is killed as any is.
 func TestScanSandboxExecThatHasNotAppliedItsProfile(t *testing.T) {
+	t.Parallel()
 	f := newFake([]int{10, 20})
 	f.stat = func(scan, pid int) (procStat, error) {
 		st := procStat{Start: f.t0.Add(-time.Second).UnixMicro()}
@@ -286,7 +297,7 @@ func TestScanSandboxExecThatHasNotAppliedItsProfile(t *testing.T) {
 	}
 	// A process of another name is nothing special.
 	f = newFake([]int{10, 20})
-	f.stat = func(scan, pid int) (procStat, error) {
+	f.stat = func(_, _ int) (procStat, error) {
 		return procStat{Comm: "sandbox-exec2", Start: f.t0.Add(-time.Second).UnixMicro()}, nil
 	}
 	if scans, _ := f.prober().teardown(time.Second); scans != 1 {
@@ -299,8 +310,9 @@ func TestScanSandboxExecThatHasNotAppliedItsProfile(t *testing.T) {
 // make a scan unclean. Neither does a process of that name under no profile when
 // the caller has the pid of the one it started, and it is another.
 func TestScanSandboxExecThatCannotBeTheOne(t *testing.T) {
+	t.Parallel()
 	named := func(f *fakeSystem) {
-		f.stat = func(scan, pid int) (procStat, error) {
+		f.stat = func(_, pid int) (procStat, error) {
 			st := procStat{Start: f.t0.Add(-time.Second).UnixMicro()}
 			if pid == 20 {
 				st.Comm = sandboxExecName
@@ -309,6 +321,7 @@ func TestScanSandboxExecThatCannotBeTheOne(t *testing.T) {
 		}
 	}
 	t.Run("under another profile", func(t *testing.T) {
+		t.Parallel()
 		f := newFake([]int{10, 20})
 		f.other = map[int]bool{20: true}
 		named(f)
@@ -317,6 +330,7 @@ func TestScanSandboxExecThatCannotBeTheOne(t *testing.T) {
 		}
 	})
 	t.Run("another pid than the one started", func(t *testing.T) {
+		t.Parallel()
 		f := newFake([]int{10, 20})
 		named(f)
 		p := f.prober()
@@ -326,6 +340,7 @@ func TestScanSandboxExecThatCannotBeTheOne(t *testing.T) {
 		}
 	})
 	t.Run("the pid that was started", func(t *testing.T) {
+		t.Parallel()
 		f := newFake([]int{10, 20})
 		f.stat = func(scan, pid int) (procStat, error) {
 			st := procStat{Start: f.t0.Add(-time.Second).UnixMicro()}
@@ -341,6 +356,7 @@ func TestScanSandboxExecThatCannotBeTheOne(t *testing.T) {
 		}
 	})
 	t.Run("no pid known", func(t *testing.T) {
+		t.Parallel()
 		f := newFake([]int{10, 20})
 		named(f)
 		f.step = time.Second
@@ -354,6 +370,7 @@ func TestScanSandboxExecThatCannotBeTheOne(t *testing.T) {
 // applied the profile and started the command by the time its name is read, and
 // have another name. It is asked about again.
 func TestScanProcessThatAppliedTheProfileBetweenTheCheckAndTheRead(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name  string
 		after lookup
@@ -364,8 +381,9 @@ func TestScanProcessThatAppliedTheProfileBetweenTheCheckAndTheRead(t *testing.T)
 		{"not known now", lookup{}, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			f := newFake([]int{10, 20})
-			f.stat = func(scan, pid int) (procStat, error) {
+			f.stat = func(_, _ int) (procStat, error) {
 				return procStat{Comm: "sh", Start: f.t0.Add(-time.Second).UnixMicro()}, nil
 			}
 			p := f.prober()
@@ -399,6 +417,7 @@ func TestScanProcessThatAppliedTheProfileBetweenTheCheckAndTheRead(t *testing.T)
 // and what becomes of it later costs nothing. A process that is not the same one
 // (another start time) is asked about, and a pid that has gone is unknown.
 func TestScanRemembersWhatItCleared(t *testing.T) {
+	t.Parallel()
 	f := newFake([]int{10, 20})
 	p := f.prober()
 	old := f.t0.Add(-time.Second).UnixMicro()
@@ -418,13 +437,13 @@ func TestScanRemembersWhatItCleared(t *testing.T) {
 			t.Errorf("%s: clean = %v, looks = %v, cleared = %v; want a clean scan that asks about no one", name, clean, f.looks, next.cleared)
 		}
 	}
-	f.stat = func(_, pid int) (procStat, error) {
+	f.stat = func(_, _ int) (procStat, error) {
 		return procStat{Exiting: true, Start: old + 1}, nil
 	}
 	if clean, _, _ := p.scan(mem); clean {
 		t.Error("an exiting process that started at another time than the one cleared was taken as it")
 	}
-	f.stat = func(_, pid int) (procStat, error) { return procStat{}, errGone }
+	f.stat = func(_, _ int) (procStat, error) { return procStat{}, errGone }
 	if clean, _, _ := p.scan(mem); clean {
 		t.Error("a pid that has gone was taken as cleared: whether it is the same process is not known")
 	}
@@ -433,6 +452,7 @@ func TestScanRemembersWhatItCleared(t *testing.T) {
 // A process that may become a member is never remembered as one that cannot, and
 // nor is a member.
 func TestScanDoesNotRememberWhatMayStillBeAMember(t *testing.T) {
+	t.Parallel()
 	f := newFake([]int{10, 20, 30})
 	f.members = map[int]bool{30: true}
 	f.stat = func(_, pid int) (procStat, error) {
@@ -458,6 +478,7 @@ func TestScanDoesNotRememberWhatMayStillBeAMember(t *testing.T) {
 // its parent is one that was found not to be a member: fork gives a child its
 // parent's profile.
 func TestScanDyingChildOfAClearedParent(t *testing.T) {
+	t.Parallel()
 	const parent, kid = 10, 20
 	old := func(f *fakeSystem) int64 { return f.t0.Add(-time.Hour).UnixMicro() }
 	young := func(f *fakeSystem) int64 { return f.t0.Add(-time.Minute).UnixMicro() }
@@ -470,38 +491,74 @@ func TestScanDyingChildOfAClearedParent(t *testing.T) {
 		members []int
 		want    bool
 	}{
-		{"parent listed after the child", [][]int{{kid, parent}}, nil,
+		{
+			"parent listed after the child",
+			[][]int{{kid, parent}},
+			nil,
 			func(f *fakeSystem) procStat { return procStat{Zombie: true, PPid: parent, Start: young(f)} },
-			func(f *fakeSystem) procStat { return procStat{Start: old(f)} }, nil, true},
-		{"exiting, not a zombie", [][]int{{kid, parent}}, nil,
+			func(f *fakeSystem) procStat { return procStat{Start: old(f)} }, nil, true,
+		},
+		{
+			"exiting, not a zombie",
+			[][]int{{kid, parent}},
+			nil,
 			func(f *fakeSystem) procStat { return procStat{Exiting: true, PPid: parent, Start: young(f)} },
-			func(f *fakeSystem) procStat { return procStat{Start: old(f)} }, nil, true},
-		{"parent cleared by an earlier scan", [][]int{{kid, parent}},
+			func(f *fakeSystem) procStat { return procStat{Start: old(f)} }, nil, true,
+		},
+		{
+			"parent cleared by an earlier scan",
+			[][]int{{kid, parent}},
 			func(f *fakeSystem) memory { return memory{cleared: map[int]int64{parent: old(f)}} },
 			func(f *fakeSystem) procStat { return procStat{Zombie: true, PPid: parent, Start: young(f)} },
-			func(f *fakeSystem) procStat { return procStat{Start: old(f)} }, nil, true},
-		{"parent is launchd", [][]int{{kid, 1}}, nil,
+			func(f *fakeSystem) procStat { return procStat{Start: old(f)} }, nil, true,
+		},
+		{
+			"parent is launchd",
+			[][]int{{kid, 1}},
+			nil,
 			func(f *fakeSystem) procStat { return procStat{Zombie: true, PPid: 1, Start: young(f)} },
-			func(f *fakeSystem) procStat { return procStat{Start: old(f)} }, nil, false},
-		{"parent not known to the scan", [][]int{{kid}}, nil,
+			func(f *fakeSystem) procStat { return procStat{Start: old(f)} }, nil, false,
+		},
+		{
+			"parent not known to the scan",
+			[][]int{{kid}},
+			nil,
 			func(f *fakeSystem) procStat { return procStat{Zombie: true, PPid: 99, Start: young(f)} },
-			func(f *fakeSystem) procStat { return procStat{Start: old(f)} }, nil, false},
-		{"parent is a member", [][]int{{kid, parent}}, nil,
+			func(f *fakeSystem) procStat { return procStat{Start: old(f)} }, nil, false,
+		},
+		{
+			"parent is a member",
+			[][]int{{kid, parent}},
+			nil,
 			func(f *fakeSystem) procStat { return procStat{Zombie: true, PPid: parent, Start: young(f)} },
-			func(f *fakeSystem) procStat { return procStat{Start: old(f)} }, []int{parent}, false},
-		{"parent is younger than the child", [][]int{{kid, parent}}, nil,
+			func(f *fakeSystem) procStat { return procStat{Start: old(f)} },
+			[]int{parent},
+			false,
+		},
+		{
+			"parent is younger than the child",
+			[][]int{{kid, parent}},
+			nil,
 			func(f *fakeSystem) procStat { return procStat{Zombie: true, PPid: parent, Start: old(f)} },
-			func(f *fakeSystem) procStat { return procStat{Start: young(f)} }, nil, false},
-		{"parent's number is a younger process now", [][]int{{kid, parent}},
+			func(f *fakeSystem) procStat { return procStat{Start: young(f)} }, nil, false,
+		},
+		{
+			"parent's number is a younger process now",
+			[][]int{{kid, parent}},
 			func(f *fakeSystem) memory { return memory{cleared: map[int]int64{parent: old(f)}} },
 			func(f *fakeSystem) procStat { return procStat{Zombie: true, PPid: parent, Start: young(f)} },
-			func(f *fakeSystem) procStat { return procStat{Start: young(f) + 5} }, nil, false},
-		{"parent is gone", [][]int{{kid, parent}},
+			func(f *fakeSystem) procStat { return procStat{Start: young(f) + 5} }, nil, false,
+		},
+		{
+			"parent is gone",
+			[][]int{{kid, parent}},
 			func(f *fakeSystem) memory { return memory{cleared: map[int]int64{parent: old(f)}} },
 			func(f *fakeSystem) procStat { return procStat{Zombie: true, PPid: parent, Start: young(f)} },
-			nil, nil, false},
+			nil, nil, false,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			f := newFake(tc.lists...)
 			f.members = map[int]bool{}
 			for _, m := range tc.members {
@@ -537,6 +594,7 @@ func TestScanDyingChildOfAClearedParent(t *testing.T) {
 // is a zombie by then, was exiting before the second snapshot and forks nothing.
 // This is what stops one that is stuck in exit from holding every scan.
 func TestScanExitingPidSeenBeforeIsSettled(t *testing.T) {
+	t.Parallel()
 	const start = 1_699_999_000_000_000
 	f := newFake([]int{10, 20})
 	f.stat = func(_, pid int) (procStat, error) {
@@ -574,6 +632,7 @@ func TestScanExitingPidSeenBeforeIsSettled(t *testing.T) {
 }
 
 func TestScanKillsMembersAndScansAgain(t *testing.T) {
+	t.Parallel()
 	f := newFake([]int{10, 20, 30}, []int{10, 40}, []int{10})
 	f.members = map[int]bool{20: true, 30: true, 40: true}
 	scans, empty := f.prober().teardown(time.Second)
@@ -586,6 +645,7 @@ func TestScanKillsMembersAndScansAgain(t *testing.T) {
 }
 
 func TestScanBudget(t *testing.T) {
+	t.Parallel()
 	// A pid that is never settled, with a clock that moves a second each time
 	// it is read.
 	stuck := func() *fakeSystem {
@@ -617,6 +677,7 @@ func TestScanBudget(t *testing.T) {
 }
 
 func TestScanListFailureIsNotEmpty(t *testing.T) {
+	t.Parallel()
 	p := newFake().prober()
 	p.list = func() ([]int, error) { return nil, errGone }
 	if scans, empty := p.teardown(time.Second); scans != 1 || empty {
@@ -627,6 +688,7 @@ func TestScanListFailureIsNotEmpty(t *testing.T) {
 // ------------------------------------------------------- the system calls
 
 func TestBSDInfoLayout(t *testing.T) {
+	t.Parallel()
 	if got := unsafe.Sizeof(bsdInfo{}); got != 136 {
 		t.Errorf("sizeof(bsdInfo) = %d, want 136, PROC_PIDTBSDINFO_SIZE", got)
 	}
@@ -639,7 +701,7 @@ func TestBSDInfoLayout(t *testing.T) {
 // the test ends, and returns its pid once it is a zombie.
 func zombieChild(t *testing.T) int {
 	t.Helper()
-	cmd := exec.Command("/usr/bin/true")
+	cmd := exec.CommandContext(t.Context(), "/usr/bin/true")
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -653,7 +715,8 @@ func zombieChild(t *testing.T) int {
 }
 
 func TestListAndStatSeeProcessesAndZombies(t *testing.T) {
-	uid := uint32(os.Geteuid())
+	t.Parallel()
+	uid := euid()
 	pids, err := listUIDPids(uid)
 	if err != nil {
 		t.Fatal(err)
@@ -681,7 +744,7 @@ func TestListAndStatSeeProcessesAndZombies(t *testing.T) {
 	}
 
 	// Reaped, it is gone: ESRCH.
-	cmd := exec.Command("/usr/bin/true")
+	cmd := exec.CommandContext(t.Context(), "/usr/bin/true")
 	if err := cmd.Run(); err != nil {
 		t.Fatal(err)
 	}
@@ -696,6 +759,7 @@ func TestListAndStatSeeProcessesAndZombies(t *testing.T) {
 // A scan of the real system, with a lingering zombie, finds the sandbox empty
 // in the second scan, and the zombie is what the first one waited for.
 func TestRealScanSettlesOnAnOldZombie(t *testing.T) {
+	t.Parallel()
 	m, err := newMarker()
 	if err != nil {
 		t.Fatal(err)
@@ -734,6 +798,7 @@ func TestRealScanSettlesOnAnOldZombie(t *testing.T) {
 // With the real kernel: a zombie whose parent is a process that is not a member
 // is not unknown, and one with another parent is, until the scan after.
 func TestRealScanExcusesAZombieOfANonMember(t *testing.T) {
+	t.Parallel()
 	m, err := newMarker()
 	if err != nil {
 		t.Fatal(err)

@@ -115,7 +115,9 @@ import "time"
 
 // teardownBudget is how long a teardown keeps scanning, for processes that keep
 // being found or pids that stay unknown, before it gives up and says it could
-// not confirm the sandbox empty. It is a variable so that a test can change it.
+// not confirm the sandbox empty. Command gives each Cmd this budget, and a test
+// changes run.budget of its own Cmd. The stage has no Cmd, so it reads this
+// variable, which only a test binary's TestMain sets, once, before the tests run.
 var teardownBudget = 5 * time.Second
 
 // sandboxExecName is the name of the process that applies a profile to itself.

@@ -18,7 +18,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -34,8 +33,9 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func init() {
+func registerAPIModes() {
 	childModes["esc-run"] = escRunMode
+	childModes["leak"] = leakMode
 	escChecks["pwd"] = func(e *escT, _ []string) { wd, err := os.Getwd(); e.is("getwd", err); fmt.Println(wd) }
 	escChecks["gate-read-fds"] = func(e *escT, a []string) { _, _ = io.Copy(io.Discard, os.Stdin); readFds(e, a) }
 	escChecks["dial-each"] = dialEach
@@ -63,14 +63,147 @@ func escRunMode(args []string) int {
 // dialEach dials each address in args and tells it its index.
 func dialEach(e *escT, args []string) {
 	for i, a := range args {
-		c, err := net.DialTimeout("tcp", a, 3*time.Second)
+		c, err := dialTimeout("tcp", a, 3*time.Second)
 		if err != nil {
-			e.fail("dial %s: %v", a, err)
+			e.failf("dial %s: %v", a, err)
 			continue
 		}
-		fmt.Fprintln(c, i)
+		if _, err := fmt.Fprintln(c, i); err != nil {
+			e.failf("tell %s its index: %v", a, err)
+		}
 		_ = c.Close()
 	}
+}
+
+// leakScenario is what a leak child runs.
+type leakScenario struct {
+	// Kind is "command" (Command alone), "failed-start" (a Start that must
+	// fail with Want in its error), "canceled-start" (a Start after the
+	// context ended) or "closed-file" (a Start with a closed file in Files).
+	Kind string
+	Spec Spec
+	Want string
+}
+
+// leakCheck runs sc in a fresh process, and fails the test with what it says
+// unless it finds no leak. A test cannot count its own process's descriptors
+// and children while others run in it, since they open and close their own,
+// so each count is made by a child that runs one scenario alone.
+func leakCheck(t *testing.T, sc leakScenario) {
+	t.Helper()
+	exe, _ := escBinary(t)
+	cmd := exec.CommandContext(t.Context(), exe, "leak", jsonArg(t, sc)) //nolint:gosec // G204: the test binary or a tool the test names, run as the test's own child.
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Errorf("%v: %s", err, out)
+	}
+}
+
+// leakMode runs the leakScenario in args[0] and exits with 0, or with 1 and
+// what it found on standard error.
+func leakMode(args []string) (code int) {
+	var sc leakScenario
+	if err := json.Unmarshal([]byte(args[0]), &sc); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
+	}
+	fail := func(format string, a ...any) int {
+		fmt.Fprintf(os.Stderr, format+"\n", a...)
+		return 1
+	}
+	before, fds := children(), fdCount()
+	// settled waits for the processes and descriptors a failed Start left to
+	// go, and reports whether they are as they were.
+	settled := func() bool {
+		for range 50 {
+			if len(children()) == len(before) && fdCount() == fds {
+				return true
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		return false
+	}
+	home, err := os.MkdirTemp("", "sbx-leak")
+	if err != nil {
+		return fail("%v", err)
+	}
+	defer func() {
+		if err := os.RemoveAll(home); err != nil && code == 0 {
+			code = fail("remove %s: %v", home, err)
+		}
+	}()
+	ctx := context.Background()
+	switch sc.Kind {
+	case "command":
+		if _, err := Command(ctx, sc.Spec); err != nil {
+			return fail("Command: %v", err)
+		}
+		if got := children(); !slices.Equal(got, before) {
+			return fail("Command started processes: %v", got)
+		}
+		if fdCount() != fds {
+			return fail("Command holds descriptors: %d, want %d", fdCount(), fds)
+		}
+	case "failed-start":
+		c, err := Command(ctx, sc.Spec)
+		if err != nil {
+			return fail("Command: %v", err)
+		}
+		err = c.Start()
+		if err == nil {
+			_ = c.run.lifeline.Close()
+			_ = c.Wait()
+			return fail("Start succeeded")
+		}
+		if !strings.Contains(strings.ToLower(err.Error()), sc.Want) {
+			return fail("Start = %q, want it to mention %q", err, sc.Want)
+		}
+		if c.Pid() != 0 || c.Listeners() != nil {
+			return fail("a failed Start left a pid or listeners")
+		}
+		if err := c.Wait(); err == nil {
+			return fail("Wait after a failed Start returned nil")
+		}
+		if !settled() {
+			return fail("a failed Start left processes %v (before %v) or descriptors %d (before %d)", children(), before, fdCount(), fds)
+		}
+	case "canceled-start":
+		cctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		c, err := Command(cctx, Spec{Home: home, Command: []string{"/bin/true"}})
+		if err != nil {
+			return fail("Command: %v", err)
+		}
+		cancel()
+		before, fds = children(), fdCount()
+		if err := c.Start(); err == nil {
+			_ = c.Wait()
+			return fail("Start with a canceled context returned nil")
+		}
+		if !settled() {
+			return fail("a refused Start left processes %v or descriptors %d (before %v, %d)", children(), fdCount(), before, fds)
+		}
+	case "closed-file":
+		f, err := os.Open(os.DevNull)
+		if err != nil {
+			return fail("%v", err)
+		}
+		_ = f.Close()
+		c, err := Command(ctx, Spec{Home: home, Command: []string{"/bin/true"}, Files: []*os.File{f}})
+		if err != nil {
+			return fail("Command: %v", err)
+		}
+		before, fds = children(), fdCount()
+		if err := c.Start(); err == nil {
+			_ = c.Wait()
+			return fail("Start accepted a closed file")
+		}
+		if !settled() {
+			return fail("a refused Start leaked a process or descriptor")
+		}
+	default:
+		return fail("unknown scenario %q", sc.Kind)
+	}
+	return 0
 }
 
 // children returns the pids of this process's child processes.
@@ -107,11 +240,12 @@ func baseSpec() Spec {
 
 // Command: its refusals, with what each says.
 func TestAPICommandErrors(t *testing.T) {
+	t.Parallel()
 	f, err := os.Open(os.DevNull)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
+	t.Cleanup(func() { _ = f.Close() })
 	mod := func(f func(*Spec)) Spec { s := baseSpec(); f(&s); return s }
 	for _, tc := range []struct {
 		name string
@@ -144,7 +278,7 @@ func TestAPICommandErrors(t *testing.T) {
 				t.Fatalf("Command returned %v and no error", c)
 			}
 			if c != nil {
-				t.Errorf("Command returned a Cmd with its error")
+				t.Error("Command returned a Cmd with its error")
 			}
 			if !strings.Contains(strings.ToLower(err.Error()), strings.ToLower(tc.want)) {
 				t.Errorf("error %q does not mention %q", err, tc.want)
@@ -171,6 +305,7 @@ func TestAPICommandErrors(t *testing.T) {
 		{"no Home, which Start checks", mod(func(s *Spec) { s.Home = "" })},
 	} {
 		t.Run("accepts "+tc.name, func(t *testing.T) {
+			t.Parallel()
 			if _, err := Command(t.Context(), tc.spec); err != nil {
 				t.Errorf("Command: %v", err)
 			}
@@ -180,19 +315,14 @@ func TestAPICommandErrors(t *testing.T) {
 
 // Command does not start anything, and copies the slices it is given.
 func TestAPICommandStartsNothingAndCopies(t *testing.T) {
-	before, fds := children(), fdCount()
+	t.Parallel()
 	spec := baseSpec()
 	spec.Command = []string{"/bin/true", "arg"}
 	spec.Rlimits = []Rlimit{{ResourceCore, 0, 0}}
+	leakCheck(t, leakScenario{Kind: "command", Spec: spec})
 	c, err := Command(t.Context(), spec)
 	if err != nil {
 		t.Fatal(err)
-	}
-	if got := children(); !slices.Equal(got, before) {
-		t.Errorf("Command started processes: %v", got)
-	}
-	if fdCount() != fds {
-		t.Errorf("Command holds descriptors: %d, want %d", fdCount(), fds)
 	}
 	spec.Command[0], spec.Command[1] = "/bin/false", "changed"
 	spec.Rlimits[0].Soft = 99
@@ -212,6 +342,7 @@ func TestAPICommandStartsNothingAndCopies(t *testing.T) {
 
 // Start's refusals of a Spec that Command accepted.
 func TestAPIStartErrors(t *testing.T) {
+	t.Parallel()
 	home := t.TempDir()
 	for _, tc := range []struct {
 		name string
@@ -226,48 +357,19 @@ func TestAPIStartErrors(t *testing.T) {
 		{"a hostname too long", Spec{Command: []string{"/bin/true"}, Home: home, Hostname: strings.Repeat("h", 100)}, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			before, fds := children(), fdCount()
-			c, err := Command(t.Context(), tc.spec)
-			if err != nil {
-				t.Fatal(err)
-			}
-			err = c.Start()
-			if err == nil {
-				_ = c.run.lifeline.Close()
-				_ = c.Wait()
-				t.Fatal("Start succeeded")
-			}
-			if !strings.Contains(strings.ToLower(err.Error()), tc.want) {
-				t.Errorf("Start = %q, want it to mention %q", err, tc.want)
-			}
-			if c.Pid() != 0 || c.Listeners() != nil {
-				t.Error("a failed Start left a pid or listeners")
-			}
-			if err := c.Wait(); err == nil {
-				t.Error("Wait after a failed Start returned nil")
-			}
-			// Nothing leaks: no process and no descriptor.
-			for range 50 {
-				if len(children()) == len(before) && fdCount() == fds {
-					break
-				}
-				time.Sleep(20 * time.Millisecond)
-			}
-			if got := children(); len(got) != len(before) {
-				t.Errorf("a failed Start left processes %v (before %v)", got, before)
-			}
-			if fdCount() != fds {
-				t.Errorf("a failed Start leaked descriptors: %d, want %d", fdCount(), fds)
-			}
+			t.Parallel()
+			leakCheck(t, leakScenario{Kind: "failed-start", Spec: tc.spec, Want: tc.want})
 		})
 	}
 }
 
 // Cmd used wrongly: Wait before Start, Start twice, Wait twice, a zero Cmd,
-// and a cancelled context.
+// and a canceled context.
 func TestAPICmdMisuse(t *testing.T) {
+	t.Parallel()
 	t.Run("Wait before Start", func(t *testing.T) {
-		c, _, _ := escCmd(t, t.Context(), Spec{}, "esc", "env")
+		t.Parallel()
+		c, _, _ := escCmd(t.Context(), t, Spec{}, "esc", "env")
 		if err := c.Wait(); err == nil {
 			t.Error("Wait before Start returned nil")
 		}
@@ -280,7 +382,8 @@ func TestAPICmdMisuse(t *testing.T) {
 		}
 	})
 	t.Run("Start twice", func(t *testing.T) {
-		c, stdout, stderr := escCmd(t, t.Context(), Spec{}, "esc", "env")
+		t.Parallel()
+		c, stdout, stderr := escCmd(t.Context(), t, Spec{}, "esc", "env")
 		if err := c.Start(); err != nil {
 			t.Fatal(err)
 		}
@@ -303,7 +406,8 @@ func TestAPICmdMisuse(t *testing.T) {
 		}
 	})
 	t.Run("Wait twice", func(t *testing.T) {
-		c, _, _ := escCmd(t, t.Context(), Spec{}, "esc", "env")
+		t.Parallel()
+		c, _, _ := escCmd(t.Context(), t, Spec{}, "esc", "env")
 		if err := c.Start(); err != nil {
 			t.Fatal(err)
 		}
@@ -315,6 +419,7 @@ func TestAPICmdMisuse(t *testing.T) {
 		}
 	})
 	t.Run("a Cmd that Command did not make", func(t *testing.T) {
+		t.Parallel()
 		c := &Cmd{}
 		if err := c.Start(); err == nil {
 			t.Error("Start of a zero Cmd returned nil")
@@ -327,20 +432,12 @@ func TestAPICmdMisuse(t *testing.T) {
 		}
 	})
 	t.Run("a context done before Start", func(t *testing.T) {
-		ctx, cancel := context.WithCancel(t.Context())
-		c, _, _ := escCmd(t, ctx, Spec{}, "esc", "env")
-		cancel()
-		before, fds := children(), fdCount()
-		if err := c.Start(); err == nil {
-			_ = c.Wait()
-			t.Fatal("Start with a cancelled context returned nil")
-		}
-		if got := children(); len(got) != len(before) || fdCount() != fds {
-			t.Errorf("a refused Start left processes %v or descriptors %d (before %v, %d)", got, fdCount(), before, fds)
-		}
+		t.Parallel()
+		leakCheck(t, leakScenario{Kind: "canceled-start"})
 	})
 	t.Run("options changed after Start do nothing", func(t *testing.T) {
-		c, stdout, stderr := escCmd(t, t.Context(), Spec{}, "esc", "both")
+		t.Parallel()
+		c, stdout, stderr := escCmd(t.Context(), t, Spec{}, "esc", "both")
 		if err := c.Start(); err != nil {
 			t.Fatal(err)
 		}
@@ -358,8 +455,10 @@ func TestAPICmdMisuse(t *testing.T) {
 // Stdin, Stdout, Stderr: the streams are the command's 0, 1 and 2, and nil
 // means /dev/null.
 func TestAPIStdio(t *testing.T) {
+	t.Parallel()
 	t.Run("stdin to stdout", func(t *testing.T) {
-		c, stdout, stderr := escCmd(t, t.Context(), Spec{}, "esc", "cat")
+		t.Parallel()
+		c, stdout, stderr := escCmd(t.Context(), t, Spec{}, "esc", "cat")
 		in := strings.Repeat("0123456789abcdef", 1<<16) // 1 MiB
 		c.Stdin = strings.NewReader(in)
 		if err := c.Start(); err != nil {
@@ -373,7 +472,8 @@ func TestAPIStdio(t *testing.T) {
 		}
 	})
 	t.Run("separate stdout and stderr", func(t *testing.T) {
-		c, stdout, stderr := escCmd(t, t.Context(), Spec{}, "esc", "both")
+		t.Parallel()
+		c, stdout, stderr := escCmd(t.Context(), t, Spec{}, "esc", "both")
 		if err := c.Start(); err != nil {
 			t.Fatal(err)
 		}
@@ -385,12 +485,13 @@ func TestAPIStdio(t *testing.T) {
 		}
 	})
 	t.Run("files", func(t *testing.T) {
+		t.Parallel()
 		r, w, err := os.Pipe()
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer r.Close()
-		c, _, _ := escCmd(t, t.Context(), Spec{}, "esc", "both")
+		c, _, _ := escCmd(t.Context(), t, Spec{}, "esc", "both")
 		c.Stdout, c.Stderr = w, w
 		if err := c.Start(); err != nil {
 			t.Fatal(err)
@@ -405,7 +506,8 @@ func TestAPIStdio(t *testing.T) {
 		}
 	})
 	t.Run("nil is /dev/null", func(t *testing.T) {
-		c, _, _ := escCmd(t, t.Context(), Spec{}, "esc", "cat")
+		t.Parallel()
+		c, _, _ := escCmd(t.Context(), t, Spec{}, "esc", "cat")
 		c.Stdin, c.Stdout, c.Stderr = nil, nil, nil
 		if err := c.Start(); err != nil {
 			t.Fatal(err)
@@ -424,12 +526,14 @@ func TestAPIStdio(t *testing.T) {
 }
 
 // Env: nil means empty, never the caller's; Start's variables win.
+//
+//nolint:paralleltest // uses t.Setenv, which t.Parallel forbids, so its subtests, which share what it sets, are serial too.
 func TestAPIEnv(t *testing.T) {
 	t.Setenv("SANDBOX_API_LEAK", "leaked")
 	t.Setenv("SSH_AUTH_SOCK", "/tmp/agent")
 	run := func(t *testing.T, spec Spec, env []string) []string {
 		t.Helper()
-		c, stdout, stderr := escCmd(t, t.Context(), spec, "esc", "env")
+		c, stdout, stderr := escCmd(t.Context(), t, spec, "esc", "env")
 		c.Env = env
 		if err := c.Start(); err != nil {
 			t.Fatal(err)
@@ -458,7 +562,7 @@ func TestAPIEnv(t *testing.T) {
 			"KEEP=me", "PATH=/usr/bin:/bin", "XDG_DATA_DIRS=/usr/share",
 		}
 		before := slices.Clone(given)
-		c, stdout, stderr := escCmd(t, t.Context(), Spec{Home: home}, "esc", "env")
+		c, stdout, stderr := escCmd(t.Context(), t, Spec{Home: home}, "esc", "env")
 		c.Env = given
 		if err := c.Start(); err != nil {
 			t.Fatal(err)
@@ -507,6 +611,7 @@ func TestAPIEnv(t *testing.T) {
 // Spec.Command: a name without a slash is looked up on the PATH inside the
 // sandbox, which is the one Env gives, so with a nil Env nothing is found.
 func TestAPICommandLookup(t *testing.T) {
+	t.Parallel()
 	home := t.TempDir()
 	c, err := Command(t.Context(), Spec{Command: []string{"true"}, Home: home})
 	if err != nil {
@@ -544,8 +649,9 @@ func TestAPICommandLookup(t *testing.T) {
 // Wait returns the command's status as an *exec.ExitError, and a command that
 // cannot be run shows there too, not in Start.
 func TestAPIWaitStatus(t *testing.T) {
+	t.Parallel()
 	for _, code := range []int{1, 3, 42} {
-		c, _, _ := escCmd(t, t.Context(), Spec{}, "esc", "exit", strconv.Itoa(code))
+		c, _, _ := escCmd(t.Context(), t, Spec{}, "esc", "exit", strconv.Itoa(code))
 		if err := c.Start(); err != nil {
 			t.Fatal(err)
 		}
@@ -555,7 +661,8 @@ func TestAPIWaitStatus(t *testing.T) {
 		}
 	}
 	t.Run("killed by a signal", func(t *testing.T) {
-		c, _, _ := escCmd(t, t.Context(), Spec{}, "esc", "selfkill", strconv.Itoa(int(unix.SIGKILL)))
+		t.Parallel()
+		c, _, _ := escCmd(t.Context(), t, Spec{}, "esc", "selfkill", strconv.Itoa(int(unix.SIGKILL)))
 		if err := c.Start(); err != nil {
 			t.Fatal(err)
 		}
@@ -565,9 +672,10 @@ func TestAPIWaitStatus(t *testing.T) {
 		}
 	})
 	t.Run("a file that cannot be executed", func(t *testing.T) {
+		t.Parallel()
 		home := t.TempDir()
 		bad := filepath.Join(home, "bad")
-		if err := os.WriteFile(bad, []byte("not a program\n"), 0o755); err != nil {
+		if err := os.WriteFile(bad, []byte("not a program\n"), 0o700); err != nil { //nolint:gosec // G306: the file is a program the test runs, which needs its owner to execute it.
 			t.Fatal(err)
 		}
 		c, err := Command(t.Context(), Spec{Command: []string{bad}, Home: home})
@@ -586,10 +694,11 @@ func TestAPIWaitStatus(t *testing.T) {
 
 // Hostname: the sandbox's own, "sandbox" when empty.
 func TestAPIHostname(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct{ name, want string }{
 		{"", "sandbox"}, {"box", "box"}, {strings.Repeat("h", 63), strings.Repeat("h", 63)},
 	} {
-		c, stdout, stderr := escCmd(t, t.Context(), Spec{Hostname: tc.name}, "esc", "hostname")
+		c, stdout, stderr := escCmd(t.Context(), t, Spec{Hostname: tc.name}, "esc", "hostname")
 		if err := c.Start(); err != nil {
 			t.Fatalf("%q: %v", tc.name, err)
 		}
@@ -605,9 +714,10 @@ func TestAPIHostname(t *testing.T) {
 // Dir: empty means Home; it may be a subdirectory of Home, a Write or Read
 // path, or a directory no cover hides.
 func TestAPIDir(t *testing.T) {
+	t.Parallel()
 	home, write, read := t.TempDir(), t.TempDir(), t.TempDir()
 	sub := filepath.Join(home, "sub")
-	if err := os.Mkdir(sub, 0o755); err != nil {
+	if err := os.Mkdir(sub, 0o750); err != nil {
 		t.Fatal(err)
 	}
 	for _, tc := range []struct{ name, dir, want string }{
@@ -618,7 +728,8 @@ func TestAPIDir(t *testing.T) {
 		{"a directory nothing covers", "/usr/share", "/usr/share"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			c, stdout, stderr := escCmd(t, t.Context(), Spec{Home: home, Dir: tc.dir, Write: []string{write}, Read: []string{read}}, "esc", "pwd")
+			t.Parallel()
+			c, stdout, stderr := escCmd(t.Context(), t, Spec{Home: home, Dir: tc.dir, Write: []string{write}, Read: []string{read}}, "esc", "pwd")
 			if err := c.Start(); err != nil {
 				t.Fatal(err)
 			}
@@ -635,8 +746,10 @@ func TestAPIDir(t *testing.T) {
 // Files: numbered from 3, in order, however many; the caller may close its
 // own copies once Start returns; a closed one is refused.
 func TestAPIFiles(t *testing.T) {
+	t.Parallel()
 	t.Run("many, closed after Start", func(t *testing.T) {
-		var files []*os.File
+		t.Parallel()
+		files := make([]*os.File, 0, 6)
 		var want strings.Builder
 		for i := range 6 {
 			f, err := os.CreateTemp(t.TempDir(), "f")
@@ -654,7 +767,7 @@ func TestAPIFiles(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer pr.Close()
-		c, stdout, stderr := escCmd(t, t.Context(), Spec{Files: files}, "esc", "gate-read-fds", "6")
+		c, stdout, stderr := escCmd(t.Context(), t, Spec{Files: files}, "esc", "gate-read-fds", "6")
 		c.Stdin = pr
 		if err := c.Start(); err != nil {
 			t.Fatal(err)
@@ -676,29 +789,18 @@ func TestAPIFiles(t *testing.T) {
 		}
 	})
 	t.Run("a closed file", func(t *testing.T) {
-		f, err := os.Open(os.DevNull)
-		if err != nil {
-			t.Fatal(err)
-		}
-		_ = f.Close()
-		before, fds := children(), fdCount()
-		c, _, _ := escCmd(t, t.Context(), Spec{Files: []*os.File{f}}, "esc", "env")
-		if err := c.Start(); err == nil {
-			_ = c.Wait()
-			t.Fatal("Start accepted a closed file")
-		}
-		if len(children()) != len(before) || fdCount() != fds {
-			t.Error("a refused Start leaked a process or descriptor")
-		}
+		t.Parallel()
+		leakCheck(t, leakScenario{Kind: "closed-file"})
 	})
 	t.Run("the caller's copy stays usable", func(t *testing.T) {
+		t.Parallel()
 		f, err := os.CreateTemp(t.TempDir(), "f")
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer f.Close()
 		_, _ = f.WriteString("0123456789")
-		c, _, stderr := escCmd(t, t.Context(), Spec{Files: []*os.File{f}}, "esc", "read-fds", "1")
+		c, _, stderr := escCmd(t.Context(), t, Spec{Files: []*os.File{f}}, "esc", "read-fds", "1")
 		if err := c.Start(); err != nil {
 			t.Fatal(err)
 		}
@@ -714,33 +816,38 @@ func TestAPIFiles(t *testing.T) {
 // Listen, ListenAddrs, LoopbackPorts, Listeners: addresses are known before
 // Start, each listener serves the address of its index.
 func TestAPIListeners(t *testing.T) {
+	t.Parallel()
 	t.Run("none", func(t *testing.T) {
-		c, _, _ := escCmd(t, t.Context(), Spec{}, "esc", "env")
+		t.Parallel()
+		c, _, _ := escCmd(t.Context(), t, Spec{}, "esc", "env")
 		if c.ListenAddrs() != nil || c.LoopbackPorts() != nil || c.Listeners() != nil {
 			t.Errorf("addresses %v, ports %v", c.ListenAddrs(), c.LoopbackPorts())
 		}
 	})
 	t.Run("addresses", func(t *testing.T) {
-		c, _, _ := escCmd(t, t.Context(), Spec{Listen: 3, Loopback: 2}, "esc", "env")
+		t.Parallel()
+		c, _, _ := escCmd(t.Context(), t, Spec{Listen: 3, Loopback: 2}, "esc", "env")
 		if want := []string{"127.0.0.1:3128", "127.0.0.1:3129", "127.0.0.1:3130"}; !slices.Equal(c.ListenAddrs(), want) {
 			t.Errorf("ListenAddrs = %v, want %v", c.ListenAddrs(), want)
 		}
 		if want := []int{4444, 4445}; !slices.Equal(c.LoopbackPorts(), want) {
 			t.Errorf("LoopbackPorts = %v, want %v", c.LoopbackPorts(), want)
 		}
-		c2, _, _ := escCmd(t, t.Context(), Spec{Listen: maxListen, Loopback: maxListen}, "esc", "env")
+		c2, _, _ := escCmd(t.Context(), t, Spec{Listen: maxListen, Loopback: maxListen}, "esc", "env")
 		if n := len(c2.ListenAddrs()); n != maxListen {
 			t.Errorf("%d addresses", n)
 		}
 		if p := c2.LoopbackPorts(); p[len(p)-1] != 4444+maxListen-1 {
 			t.Errorf("last loopback port %d", p[len(p)-1])
 		}
-		if c.ListenAddrs()[0] != c.ListenAddrs()[0] {
+		first := c.ListenAddrs()
+		if again := c.ListenAddrs(); first[0] != again[0] {
 			t.Error("addresses change")
 		}
 	})
 	t.Run("each listener serves its own", func(t *testing.T) {
-		c, _, stderr := escCmd(t, t.Context(), Spec{Listen: 3}, "esc", "dial-each")
+		t.Parallel()
+		c, _, stderr := escCmd(t.Context(), t, Spec{Listen: 3}, "esc", "dial-each")
 		c.spec.Command = append(c.spec.Command, c.ListenAddrs()...)
 		if err := c.Start(); err != nil {
 			t.Fatal(err)
@@ -751,7 +858,7 @@ func TestAPIListeners(t *testing.T) {
 		}
 		got := make([]chan string, len(lns))
 		for i, ln := range lns {
-			defer ln.Close()
+			t.Cleanup(func() { _ = ln.Close() })
 			if ln.Addr().String() != c.ListenAddrs()[i] {
 				t.Errorf("listener %d is on %s, want %s", i, ln.Addr(), c.ListenAddrs()[i])
 			}
@@ -782,13 +889,14 @@ func TestAPIListeners(t *testing.T) {
 		}
 	})
 	t.Run("two sandboxes share the addresses without meeting", func(t *testing.T) {
-		var cs []*Cmd
+		t.Parallel()
+		cs := make([]*Cmd, 0, 2)
 		for range 2 {
-			c, _, _ := escCmd(t, t.Context(), Spec{Listen: 1}, "esc", "env")
+			c, _, _ := escCmd(t.Context(), t, Spec{Listen: 1}, "esc", "env")
 			if err := c.Start(); err != nil {
 				t.Fatal(err)
 			}
-			defer c.Listeners()[0].Close()
+			t.Cleanup(func() { _ = c.Listeners()[0].Close() })
 			cs = append(cs, c)
 		}
 		if cs[0].Listeners()[0].Addr().String() != cs[1].Listeners()[0].Addr().String() {
@@ -799,6 +907,7 @@ func TestAPIListeners(t *testing.T) {
 		}
 	})
 	t.Run("Run refuses Listen", func(t *testing.T) {
+		t.Parallel()
 		if _, err := Run(t.Context(), Spec{Command: []string{"/bin/true"}, Home: t.TempDir(), Listen: 1}); err == nil {
 			t.Error("Run served a listener it cannot")
 		}
@@ -808,12 +917,13 @@ func TestAPIListeners(t *testing.T) {
 // Run: the dedicated-process form. It uses the process's own streams,
 // environment and working directory, and returns the command's status.
 func TestAPIRun(t *testing.T) {
+	t.Parallel()
 	exe, dir := escBinary(t)
 	run := func(t *testing.T, spec Spec, env []string, wd string, check string, args ...string) (int, string, string) {
 		t.Helper()
 		spec.Command = append([]string{exe, "esc", check}, args...)
 		spec.Read = append(slices.Clone(spec.Read), dir)
-		cmd := exec.CommandContext(t.Context(), "/proc/self/exe", "esc-run", jsonArg(t, spec))
+		cmd := exec.CommandContext(t.Context(), "/proc/self/exe", "esc-run", jsonArg(t, spec)) //nolint:gosec // G204: the test binary or a tool the test names, run as the test's own child.
 		cmd.Dir = wd
 		cmd.Env = append(os.Environ(), env...)
 		var stdout, stderr bytes.Buffer
@@ -830,6 +940,7 @@ func TestAPIRun(t *testing.T) {
 	}
 	home := t.TempDir()
 	t.Run("status", func(t *testing.T) {
+		t.Parallel()
 		for _, want := range []int{0, 1, 7} {
 			if code, _, stderr := run(t, Spec{Home: home}, nil, home, "exit", strconv.Itoa(want)); code != want {
 				t.Errorf("exit %d: Run returned %d: %s", want, code, stderr)
@@ -837,13 +948,15 @@ func TestAPIRun(t *testing.T) {
 		}
 	})
 	t.Run("a signal is 128 plus its number", func(t *testing.T) {
+		t.Parallel()
 		if code, _, stderr := run(t, Spec{Home: home}, nil, home, "selfkill", "15"); code != 128+15 {
 			t.Errorf("Run returned %d: %s", code, stderr)
 		}
 	})
 	t.Run("its environment and directory", func(t *testing.T) {
+		t.Parallel()
 		sub := filepath.Join(home, "sub")
-		if err := os.Mkdir(sub, 0o755); err != nil {
+		if err := os.Mkdir(sub, 0o750); err != nil {
 			t.Fatal(err)
 		}
 		code, out, stderr := run(t, Spec{Home: home}, []string{"RUN_API_VAR=seen", "HOME=/evil"}, sub, "env")
@@ -862,6 +975,7 @@ func TestAPIRun(t *testing.T) {
 		}
 	})
 	t.Run("errors are errors", func(t *testing.T) {
+		t.Parallel()
 		code, _, stderr := run(t, Spec{Home: filepath.Join(home, "missing")}, nil, home, "env")
 		if code != 99 || !strings.Contains(stderr, "run error") {
 			t.Errorf("Run with a missing home: exit %d: %s", code, stderr)
@@ -872,8 +986,9 @@ func TestAPIRun(t *testing.T) {
 		}
 	})
 	t.Run("a signal to Run ends the sandbox", func(t *testing.T) {
+		t.Parallel()
 		spec := Spec{Home: home, Command: []string{exe, "esc", "hold"}, Read: []string{dir}}
-		cmd := exec.CommandContext(t.Context(), "/proc/self/exe", "esc-run", jsonArg(t, spec))
+		cmd := exec.CommandContext(t.Context(), "/proc/self/exe", "esc-run", jsonArg(t, spec)) //nolint:gosec // G204: the test binary or a tool the test names, run as the test's own child.
 		cmd.Dir = home
 		out, err := cmd.StdoutPipe()
 		if err != nil {
@@ -891,7 +1006,10 @@ func TestAPIRun(t *testing.T) {
 		done := make(chan error, 1)
 		go func() { done <- cmd.Wait() }()
 		select {
-		case <-done:
+		case err := <-done:
+			if ee := new(exec.ExitError); err != nil && !errors.As(err, &ee) {
+				t.Errorf("Wait for Run: %v", err)
+			}
 		case <-time.After(10 * time.Second):
 			_ = cmd.Process.Kill()
 			t.Fatal("Run did not end after SIGTERM")
@@ -905,6 +1023,7 @@ func TestAPIRun(t *testing.T) {
 // Stage: false in an ordinary process, and a clean failure, not a hang, when
 // its marker arguments are run outside a sandbox.
 func TestAPIStage(t *testing.T) {
+	t.Parallel()
 	if code, ok := Stage(); ok || code != 0 {
 		t.Errorf("Stage() = %d, %v in an ordinary process", code, ok)
 	}
@@ -913,7 +1032,7 @@ func TestAPIStage(t *testing.T) {
 		{reaperArg, "--", "/bin/true"},
 	} {
 		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
-		cmd := exec.CommandContext(ctx, "/proc/self/exe", args...)
+		cmd := exec.CommandContext(ctx, "/proc/self/exe", args...) //nolint:gosec // G204: the test binary or a tool the test names, run as the test's own child.
 		out, err := cmd.CombinedOutput()
 		cancel()
 		var ee *exec.ExitError
@@ -929,6 +1048,7 @@ func TestAPIStage(t *testing.T) {
 // RegisterFlags: every flag sets its field, repeatable ones accumulate, the
 // command is what is left, and a Spec built from flags runs.
 func TestAPIRegisterFlags(t *testing.T) {
+	t.Parallel()
 	parse := func(t *testing.T, args ...string) (Spec, *flag.FlagSet, error) {
 		t.Helper()
 		var spec Spec
@@ -939,11 +1059,12 @@ func TestAPIRegisterFlags(t *testing.T) {
 		return spec, fs, err
 	}
 	t.Run("round trip", func(t *testing.T) {
+		t.Parallel()
 		want := Spec{
 			Home: "/h", Dir: "/h/d", Write: []string{"/w1", "/w2", "/w3"}, Read: []string{"/r1", "/r2"},
 			Cover: []string{"/c1", "/c2"}, Kernel: KernelOpen, Network: NetworkHost,
 		}
-		var args []string
+		args := make([]string, 0, 8+2*(len(want.Write)+len(want.Read)+len(want.Cover))+4)
 		args = append(args, "-home", want.Home, "-dir", want.Dir, "-kernel", string(want.Kernel), "-network", want.Network.String())
 		for _, w := range want.Write {
 			args = append(args, "-write", w)
@@ -963,11 +1084,12 @@ func TestAPIRegisterFlags(t *testing.T) {
 		want.Command = []string{"prog", "-x", "arg"}
 		a, _ := json.Marshal(got)
 		b, _ := json.Marshal(want)
-		if string(a) != string(b) {
+		if !bytes.Equal(a, b) {
 			t.Errorf("parsed %s, want %s", a, b)
 		}
 	})
 	t.Run("defaults", func(t *testing.T) {
+		t.Parallel()
 		got, fs, err := parse(t)
 		if err != nil {
 			t.Fatal(err)
@@ -990,6 +1112,7 @@ func TestAPIRegisterFlags(t *testing.T) {
 		}
 	})
 	t.Run("errors", func(t *testing.T) {
+		t.Parallel()
 		for _, args := range [][]string{
 			{"-kernel", "loose"}, {"-network", "all"}, {"-nope"}, {"-home"}, {"-write"},
 		} {
@@ -999,6 +1122,7 @@ func TestAPIRegisterFlags(t *testing.T) {
 		}
 	})
 	t.Run("two Specs are independent", func(t *testing.T) {
+		t.Parallel()
 		a, _, _ := parse(t, "-home", "/a", "-write", "/wa")
 		b, _, _ := parse(t, "-home", "/b", "-write", "/wb")
 		if a.Home != "/a" || b.Home != "/b" || !slices.Equal(a.Write, []string{"/wa"}) || !slices.Equal(b.Write, []string{"/wb"}) {
@@ -1006,6 +1130,7 @@ func TestAPIRegisterFlags(t *testing.T) {
 		}
 	})
 	t.Run("usage lists every flag", func(t *testing.T) {
+		t.Parallel()
 		var spec Spec
 		fs := flag.NewFlagSet("test", flag.ContinueOnError)
 		var buf bytes.Buffer
@@ -1019,6 +1144,7 @@ func TestAPIRegisterFlags(t *testing.T) {
 		}
 	})
 	t.Run("a Spec from flags runs", func(t *testing.T) {
+		t.Parallel()
 		exe, dir := escBinary(t)
 		home, write := t.TempDir(), t.TempDir()
 		view := viewSpec{Writable: []string{home, write}, ReadOnly: []string{"/etc", dir}}
@@ -1045,6 +1171,7 @@ func TestAPIRegisterFlags(t *testing.T) {
 
 // Network and Kernel: String and Set, as the flag package calls them.
 func TestAPIStringSet(t *testing.T) {
+	t.Parallel()
 	var n, five, host Network = NetworkNone, 5, NetworkHost
 	if n.String() != "none" || (*Network)(nil).String() != "none" || five.String() != "Network(5)" || host.String() != "host" {
 		t.Errorf("Network strings: %q %q %q", n.String(), five.String(), host.String())
@@ -1085,6 +1212,7 @@ func TestAPIStringSet(t *testing.T) {
 // Rlimits: a limit of math.MaxUint64 is none, and a limit the host will not
 // allow is an error from Start naming it.
 func TestAPIRlimits(t *testing.T) {
+	t.Parallel()
 	r := runReport(t, Spec{Rlimits: []Rlimit{{ResourceFileSize, ^uint64(0), ^uint64(0)}}}, nil)
 	if got := r.Limits["fsize"]; got.Soft != ^uint64(0) || got.Hard != ^uint64(0) {
 		t.Errorf("no limit became %+v", got)
@@ -1096,7 +1224,7 @@ func TestAPIRlimits(t *testing.T) {
 	if cur.Max == ^uint64(0) {
 		t.Skip("the host's hard core limit is unlimited, so no higher limit can be asked for")
 	}
-	c, _, _ := escCmd(t, t.Context(), Spec{Rlimits: []Rlimit{{ResourceCore, cur.Max + 1, cur.Max + 1}}}, "esc", "env")
+	c, _, _ := escCmd(t.Context(), t, Spec{Rlimits: []Rlimit{{ResourceCore, cur.Max + 1, cur.Max + 1}}}, "esc", "env")
 	if err := c.Start(); err == nil {
 		_ = c.Wait()
 		t.Error("a limit above the host's hard limit was set")
@@ -1105,13 +1233,15 @@ func TestAPIRlimits(t *testing.T) {
 
 // Services and BroadLoopback mean nothing on Linux and are ignored.
 func TestAPIMacOSFieldsIgnored(t *testing.T) {
+	t.Parallel()
 	escRun(t, Spec{Home: t.TempDir(), Services: []Service{"fonts", "anything"}, BroadLoopback: true}, "env")
 }
 
 // Process group: the sandbox is always a process group of its own, and
-// signalling it ends it.
+// signaling it ends it.
 func TestAPIProcessGroup(t *testing.T) {
-	c, _, _ := escCmd(t, t.Context(), Spec{}, "esc", "hold")
+	t.Parallel()
+	c, _, _ := escCmd(t.Context(), t, Spec{}, "esc", "hold")
 	if err := c.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -1133,6 +1263,7 @@ func TestAPIProcessGroup(t *testing.T) {
 
 // CgroupFD: a cgroup directory to start in, where the host delegates one.
 func TestAPICgroupFD(t *testing.T) {
+	t.Parallel()
 	self, err := os.ReadFile("/proc/self/cgroup")
 	if err != nil {
 		t.Skip("no /proc/self/cgroup: " + err.Error())
@@ -1146,7 +1277,7 @@ func TestAPICgroupFD(t *testing.T) {
 		"/sys/fs/cgroup/user.slice/user-" + uid + ".slice/user@" + uid + ".service/app.slice",
 	} {
 		dir := filepath.Join(parent, fmt.Sprintf("sandbox-api-test-%d", os.Getpid()))
-		if err := os.Mkdir(dir, 0o755); err == nil {
+		if err := os.Mkdir(dir, 0o750); err == nil { //nolint:gosec // G703: the test touches only paths it made, or was passed, to see whether a sandbox allows it.
 			made = dir
 			break
 		}
@@ -1154,13 +1285,13 @@ func TestAPICgroupFD(t *testing.T) {
 	if made == "" {
 		t.Skip("no cgroup this account may create a child of: the VM's user session does not delegate one")
 	}
-	defer os.Remove(made)
-	d, err := os.Open(made)
+	removeAtCleanup(t, made)
+	d, err := openFile(made)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer d.Close()
-	c, _, stderr := escCmd(t, t.Context(), Spec{}, "esc", "hold")
+	c, _, stderr := escCmd(t.Context(), t, Spec{}, "esc", "hold")
 	c.CgroupFD = int(d.Fd())
 	if err := c.Start(); errors.Is(err, unix.EACCES) {
 		t.Skipf("the kernel refused to start a process in %s: %v. Starting in a cgroup needs write access to the common ancestor's cgroup.procs too, which this VM session does not delegate", made, err)
@@ -1176,7 +1307,7 @@ func TestAPICgroupFD(t *testing.T) {
 	}
 	// A negative or zero value means none.
 	for _, fd := range []int{-5, -1, 0} {
-		c, _, _ := escCmd(t, t.Context(), Spec{}, "esc", "env")
+		c, _, _ := escCmd(t.Context(), t, Spec{}, "esc", "env")
 		c.CgroupFD = fd
 		if err := c.Start(); err != nil {
 			t.Errorf("CgroupFD %d: %v", fd, err)
@@ -1186,11 +1317,12 @@ func TestAPICgroupFD(t *testing.T) {
 	}
 }
 
-// WaitDelay and ctx: cancelling kills the sandbox, and Wait returns within
+// WaitDelay and ctx: canceling kills the sandbox, and Wait returns within
 // WaitDelay even when the output is a writer the caller supplied.
 func TestAPIContextAndWaitDelay(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithCancel(t.Context())
-	c, stdout, _ := escCmd(t, ctx, Spec{}, "esc", "hold")
+	c, stdout, _ := escCmd(ctx, t, Spec{}, "esc", "hold")
 	c.WaitDelay = 2 * time.Second
 	if err := c.Start(); err != nil {
 		t.Fatal(err)
@@ -1201,12 +1333,12 @@ func TestAPIContextAndWaitDelay(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	ns, _ := lineWith(stdout.String(), "ns ")
+	ns := lineWith(stdout.String(), "ns ")
 	start := time.Now()
 	cancel()
 	err := c.Wait()
 	if err == nil {
-		t.Error("Wait returned nil for a cancelled sandbox")
+		t.Error("Wait returned nil for a canceled sandbox")
 	}
 	if d := time.Since(start); d > 6*time.Second {
 		t.Errorf("Wait took %v after the context ended", d)
@@ -1219,7 +1351,8 @@ func TestAPIContextAndWaitDelay(t *testing.T) {
 // Pid: the host pid of pid 1, known after Start only, and it is not
 // bubblewrap's.
 func TestAPIPid(t *testing.T) {
-	c, _, _ := escCmd(t, t.Context(), Spec{}, "esc", "hold")
+	t.Parallel()
+	c, _, _ := escCmd(t.Context(), t, Spec{}, "esc", "hold")
 	if c.Pid() != 0 {
 		t.Errorf("Pid = %d before Start", c.Pid())
 	}
@@ -1245,9 +1378,9 @@ func TestAPIPid(t *testing.T) {
 func fillScratch(e *escT, _ []string) {
 	chunk := make([]byte, 1<<20)
 	for _, d := range []string{"/tmp", "/var/tmp", "/dev/shm"} {
-		f, err := os.Create(d + "/fill")
+		f, err := createFile(d + "/fill")
 		if err != nil {
-			e.fail("create in %s: %v", d, err)
+			e.failf("create in %s: %v", d, err)
 			continue
 		}
 		total := 0
@@ -1269,8 +1402,9 @@ func fillScratch(e *escT, _ []string) {
 // ScratchSize: each private tmpfs holds no more than it says, and a write
 // past it fails with ENOSPC.
 func TestAPIScratchSize(t *testing.T) {
+	t.Parallel()
 	const limit = 4 << 20
-	c, stdout, stderr := escCmd(t, t.Context(), Spec{ScratchSize: limit}, "esc", "fill-scratch")
+	c, stdout, stderr := escCmd(t.Context(), t, Spec{ScratchSize: limit}, "esc", "fill-scratch")
 	if err := c.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -1294,6 +1428,7 @@ func TestAPIScratchSize(t *testing.T) {
 // SelfPath: a command that runs this binary again by it gets that binary's
 // mode.
 func TestAPISelfPath(t *testing.T) {
+	t.Parallel()
 	c, err := Command(t.Context(), Spec{Home: t.TempDir(), Command: []string{SelfPath, "self-hello", "a", "b"}})
 	if err != nil {
 		t.Fatal(err)
@@ -1316,9 +1451,10 @@ func TestAPISelfPath(t *testing.T) {
 // gives as the reason there is a lifeline and neither Pdeathsig nor
 // --die-with-parent.
 func TestAPIStartThreadExits(t *testing.T) {
+	t.Parallel()
 	for i := range 3 {
 		ctx, cancel := context.WithCancel(t.Context())
-		c, stdout, _ := escCmd(t, ctx, Spec{}, "esc", "hold")
+		c, stdout, _ := escCmd(ctx, t, Spec{}, "esc", "hold")
 		started := make(chan error, 1)
 		go func() {
 			// A goroutine that exits while locked ends its thread.
@@ -1330,7 +1466,7 @@ func TestAPIStartThreadExits(t *testing.T) {
 		}
 		var ns string
 		for range 100 {
-			if ns, _ = lineWith(stdout.String(), "ns "); ns != "" {
+			if ns = lineWith(stdout.String(), "ns "); ns != "" {
 				break
 			}
 			time.Sleep(20 * time.Millisecond)
@@ -1346,18 +1482,21 @@ func TestAPIStartThreadExits(t *testing.T) {
 
 // Many sandboxes at once from one process, as a server does.
 func TestAPIConcurrent(t *testing.T) {
+	t.Parallel()
 	var wg sync.WaitGroup
-	errs := make(chan error, 8)
+	errs := make(chan error, 16)
 	for i := range 8 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			home, err := os.MkdirTemp("", "sbx-conc")
 			if err != nil {
 				errs <- err
 				return
 			}
-			defer os.RemoveAll(home)
+			defer func() {
+				if err := os.RemoveAll(home); err != nil {
+					errs <- err
+				}
+			}()
 			exe, dir := escBinary(t)
 			c, err := Command(t.Context(), Spec{Home: home, Command: []string{exe, "esc", "exit", strconv.Itoa(i)}, Read: []string{dir}, Listen: 1})
 			if err != nil {
@@ -1371,9 +1510,9 @@ func TestAPIConcurrent(t *testing.T) {
 			defer c.Listeners()[0].Close()
 			var ee *exec.ExitError
 			if err := c.Wait(); i == 0 && err != nil || i != 0 && (!errors.As(err, &ee) || ee.ExitCode() != i) {
-				errs <- fmt.Errorf("sandbox %d: Wait = %v", i, err)
+				errs <- fmt.Errorf("sandbox %d: Wait = %w", i, err)
 			}
-		}()
+		})
 	}
 	wg.Wait()
 	close(errs)
@@ -1388,14 +1527,14 @@ func TestAPIBubblewrapDiscovery(t *testing.T) {
 	dir := t.TempDir()
 	t.Run("a setuid copy is refused", func(t *testing.T) {
 		fake := filepath.Join(dir, "bwrap")
-		if err := os.WriteFile(fake, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		if err := os.WriteFile(fake, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil { //nolint:gosec // G306: the file is a program the test runs, which needs its owner to execute it.
 			t.Fatal(err)
 		}
 		if err := os.Chmod(fake, 0o755|os.ModeSetuid); err != nil {
 			t.Fatal(err)
 		}
 		t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
-		c, _, _ := escCmd(t, t.Context(), Spec{}, "esc", "env")
+		c, _, _ := escCmd(t.Context(), t, Spec{}, "esc", "env")
 		err := c.Start()
 		if err == nil {
 			_ = c.Wait()
@@ -1407,7 +1546,7 @@ func TestAPIBubblewrapDiscovery(t *testing.T) {
 	})
 	t.Run("none on the PATH", func(t *testing.T) {
 		t.Setenv("PATH", t.TempDir())
-		c, _, _ := escCmd(t, t.Context(), Spec{}, "esc", "env")
+		c, _, _ := escCmd(t.Context(), t, Spec{}, "esc", "env")
 		err := c.Start()
 		if err == nil {
 			_ = c.Wait()
@@ -1419,8 +1558,8 @@ func TestAPIBubblewrapDiscovery(t *testing.T) {
 	})
 }
 
-func init() {
-	escChecks["alloc"] = func(e *escT, a []string) {
+func registerAPIAllocCheck() {
+	escChecks["alloc"] = func(_ *escT, a []string) {
 		mb, _ := strconv.Atoi(a[0])
 		buf := make([]byte, mb<<20)
 		for i := 0; i < len(buf); i += 4096 {
@@ -1434,7 +1573,8 @@ func init() {
 // TestAPIFootprint checks that Footprint counts the resident memory of the
 // sandbox's processes, which a watchdog polls where there is no cgroup.
 func TestAPIFootprint(t *testing.T) {
-	c, stdout, _ := escCmd(t, t.Context(), Spec{}, "esc", "alloc", "200")
+	t.Parallel()
+	c, stdout, _ := escCmd(t.Context(), t, Spec{}, "esc", "alloc", "200")
 	if _, err := c.Footprint(); err == nil {
 		t.Error("Footprint before Start succeeded")
 	}

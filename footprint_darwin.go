@@ -1,9 +1,10 @@
 package sandbox
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
-	"os"
+	"math"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -45,11 +46,12 @@ func (c *Cmd) Footprint() (int64, error) {
 	// child and so still has its pid, is among its ancestors. That covers the
 	// moment before sandbox-exec has applied the profile.
 	ppid := map[int]int{}
-	for _, p := range procs {
+	for i := range procs {
+		p := &procs[i]
 		ppid[int(p.Proc.P_pid)] = int(p.Eproc.Ppid)
 	}
 	stage := c.run.cmd.Process.Pid
-	uid := uint32(os.Geteuid())
+	uid := euid()
 	underStage := func(pid int) bool {
 		for range 4096 {
 			if pid == stage {
@@ -64,7 +66,8 @@ func (c *Cmd) Footprint() (int64, error) {
 		return false
 	}
 	in := map[int32]bool{}
-	for _, p := range procs {
+	for i := range procs {
+		p := &procs[i]
 		if p.Proc.P_stat == stateZombie {
 			continue
 		}
@@ -75,7 +78,8 @@ func (c *Cmd) Footprint() (int64, error) {
 	// Descendants of a member, found until no more are.
 	for grew := true; grew; {
 		grew = false
-		for _, p := range procs {
+		for i := range procs {
+			p := &procs[i]
 			if !in[p.Proc.P_pid] && in[p.Eproc.Ppid] && p.Proc.P_stat != stateZombie {
 				in[p.Proc.P_pid], grew = true, true
 			}
@@ -85,7 +89,7 @@ func (c *Cmd) Footprint() (int64, error) {
 	found := false
 	for pid := range in {
 		if fp, err := physFootprint(int(pid)); err == nil {
-			total += int64(fp)
+			total += fp
 			found = true
 		}
 	}
@@ -98,11 +102,15 @@ func (c *Cmd) Footprint() (int64, error) {
 // physFootprint returns the physical footprint of pid, from proc_info's
 // PROC_INFO_CALL_PIDRUSAGE, which libproc's proc_pid_rusage wraps. It is
 // called directly, since the package builds without cgo.
-func physFootprint(pid int) (uint64, error) {
+func physFootprint(pid int) (int64, error) {
 	var buf [rusageSize]byte
-	_, _, errno := unix.Syscall6(unix.SYS_PROC_INFO, procInfoRusage, uintptr(pid), 0, 0, uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
+	_, _, errno := unix.Syscall6(unix.SYS_PROC_INFO, procInfoRusage, uintptr(pid), 0, 0, uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf))) //nolint:gosec,staticcheck // G103: the kernel writes the buffer during the call. SA1019: Syscall6 passes the number to libc's syscall(2), and libproc's wrapper has no binding without cgo.
 	if errno != 0 {
 		return 0, errno
 	}
-	return *(*uint64)(unsafe.Pointer(&buf[rusageOffsetFootprint])), nil
+	fp := binary.NativeEndian.Uint64(buf[rusageOffsetFootprint:])
+	if fp > math.MaxInt64 { // not a size of memory, so the sum below cannot overflow on it
+		fp = math.MaxInt64
+	}
+	return int64(fp), nil
 }

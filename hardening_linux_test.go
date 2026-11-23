@@ -25,7 +25,17 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func init() {
+// fsBytes is the size of a filesystem from its block count and block size,
+// which Statfs_t gives as a signed number whose width depends on the
+// architecture. A negative block size is none.
+func fsBytes[B int32 | int64](blocks uint64, bsize B) uint64 {
+	if bsize < 0 {
+		return 0
+	}
+	return blocks * uint64(bsize)
+}
+
+func registerHardeningChecks() {
 	childModes["esc-tty"] = escTTYMode
 	childModes["esc-keys"] = escKeysMode
 	escChecks["sig-group"] = escSigGroup
@@ -43,7 +53,7 @@ func escSigGroup(e *escT, args []string) {
 		// Ends the sandbox's own group, bubblewrap included.
 		_ = unix.Kill(0, unix.SIGTERM)
 		time.Sleep(10 * time.Second)
-		e.fail("kill(0) did not end the sandbox's group")
+		e.failf("kill(0) did not end the sandbox's group")
 	case "killall":
 		// Every process in the namespace but pid 1 and this one, which is
 		// nothing outside.
@@ -62,14 +72,15 @@ func escSigGroup(e *escT, args []string) {
 // nothing outside it. The caller's group holds a sibling, which stays alive
 // and at its priority, and the caller gets no signal.
 func TestEscapeSignalsStayInside(t *testing.T) {
-	canary := exec.Command("sleep", "120") // in this process's group
+	t.Parallel()
+	canary := exec.CommandContext(t.Context(), "sleep", "120") // in this process's group
 	if err := canary.Start(); err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = canary.Process.Kill(); _ = canary.Wait() }()
+	t.Cleanup(func() { _ = canary.Process.Kill(); _ = canary.Wait() })
 	sigs := make(chan os.Signal, 8)
 	signal.Notify(sigs, unix.SIGTERM, unix.SIGUSR1, unix.SIGHUP, unix.SIGINT)
-	defer signal.Stop(sigs)
+	t.Cleanup(func() { signal.Stop(sigs) })
 	prio := func(pid int) int {
 		p, err := unix.Getpriority(unix.PRIO_PROCESS, pid)
 		if err != nil {
@@ -82,14 +93,15 @@ func TestEscapeSignalsStayInside(t *testing.T) {
 	}
 	for _, mode := range []string{"kill0", "killall", "nice", "nice-user"} {
 		t.Run(mode, func(t *testing.T) {
+			t.Parallel()
 			selfBefore, canaryBefore := prio(0), prio(canary.Process.Pid)
-			c, _, stderr := escCmd(t, t.Context(), Spec{}, "esc", "sig-group", mode)
+			c, _, stderr := escCmd(t.Context(), t, Spec{}, "esc", "sig-group", mode)
 			if err := c.Start(); err != nil {
 				t.Fatal(err)
 			}
 			err := c.Wait()
 			if mode == "kill0" && err == nil {
-				t.Error("kill(0) from inside did not end the sandbox, so it signalled nothing")
+				t.Error("kill(0) from inside did not end the sandbox, so it signaled nothing")
 			} else if mode != "kill0" && err != nil {
 				t.Fatalf("%v: %s", err, stderr)
 			}
@@ -151,6 +163,7 @@ func escTTYMode(args []string) int {
 // foreground back when it is done. Without it the read stops the sandbox on
 // SIGTTIN.
 func TestEscapeTerminalForeground(t *testing.T) {
+	t.Parallel()
 	mfd, err := unix.Open("/dev/ptmx", unix.O_RDWR|unix.O_NOCTTY|unix.O_CLOEXEC, 0)
 	if err != nil {
 		t.Skip("no /dev/ptmx: " + err.Error())
@@ -180,7 +193,7 @@ func TestEscapeTerminalForeground(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 	exe, _ := escBinary(t)
-	cmd := exec.CommandContext(ctx, exe, "esc-tty", string(body))
+	cmd := exec.CommandContext(ctx, exe, "esc-tty", string(body)) //nolint:gosec // G204: the test binary or a tool the test names, run as the test's own child.
 	var stdout, stderr bytes.Buffer
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = slave, &stdout, &stderr
 	// A session of its own whose controlling terminal is the pty, with its
@@ -230,7 +243,7 @@ func escDevReadOnly(e *escT, args []string) {
 
 	mi, err := os.ReadFile("/proc/self/mountinfo")
 	if err != nil {
-		e.fail("read mountinfo: %v", err)
+		e.failf("read mountinfo: %v", err)
 		return
 	}
 	checked := 0
@@ -259,18 +272,18 @@ func escDevReadOnly(e *escT, args []string) {
 		}
 		var sf unix.Statfs_t
 		if err := unix.Statfs(mp, &sf); err != nil {
-			e.fail("statfs %s: %v", mp, err)
+			e.failf("statfs %s: %v", mp, err)
 			continue
 		}
 		writable := !contains(opts, "ro") && !contains(super, "ro")
-		size := sf.Blocks * uint64(sf.Bsize)
+		size := fsBytes(sf.Blocks, sf.Bsize)
 		if writable && (fstype != "tmpfs" || size > limit) {
-			e.fail("%s is a writable %s of %d bytes, want at most %d", mp, fstype, size, limit)
+			e.failf("%s is a writable %s of %d bytes, want at most %d", mp, fstype, size, limit)
 		}
 		checked++
 	}
 	if checked == 0 {
-		e.fail("no tmpfs found in the mount table")
+		e.failf("no tmpfs found in the mount table")
 	}
 
 	// What programs use from /dev.
@@ -287,7 +300,7 @@ func escDevReadOnly(e *escT, args []string) {
 		if err == nil {
 			n, rerr := unix.Read(fd, buf[:])
 			if rerr != nil || n != len(buf) {
-				e.fail("read %s: %d, %v", p, n, rerr)
+				e.failf("read %s: %d, %v", p, n, rerr)
 			}
 			_ = unix.Close(fd)
 		}
@@ -300,13 +313,13 @@ func escDevReadOnly(e *escT, args []string) {
 	}
 	// A new pseudoterminal through /dev/ptmx and /dev/pts.
 	if mfd, err := unix.Open("/dev/ptmx", unix.O_RDWR|unix.O_NOCTTY, 0); err != nil {
-		e.fail("open /dev/ptmx: %v", err)
+		e.failf("open /dev/ptmx: %v", err)
 	} else {
 		e.is("unlock the pty", unix.IoctlSetPointerInt(mfd, unix.TIOCSPTLCK, 0))
 		n, err := unix.IoctlGetInt(mfd, unix.TIOCGPTN)
 		e.is("pty number", err)
 		if sfd, err := unix.Open("/dev/pts/"+strconv.Itoa(n), unix.O_RDWR|unix.O_NOCTTY, 0); err != nil {
-			e.fail("open the pty's slave: %v", err)
+			e.failf("open the pty's slave: %v", err)
 		} else {
 			_ = unix.Close(sfd)
 		}
@@ -314,23 +327,23 @@ func escDevReadOnly(e *escT, args []string) {
 	}
 	// /dev/fd and the standard stream links lead to the descriptors.
 	if target, err := os.Readlink("/dev/fd"); err != nil || target != "/proc/self/fd" {
-		e.fail("/dev/fd is %q, %v", target, err)
+		e.failf("/dev/fd is %q, %v", target, err)
 	}
 	if fd, err := unix.Open("/dev/fd/0", unix.O_RDONLY, 0); err != nil {
-		e.fail("open /dev/fd/0: %v", err)
+		e.failf("open /dev/fd/0: %v", err)
 	} else {
 		_ = unix.Close(fd)
 	}
 	for _, l := range []string{"/dev/stdin", "/dev/stdout", "/dev/stderr"} {
 		if _, err := os.Readlink(l); err != nil {
-			e.fail("%s: %v", l, err)
+			e.failf("%s: %v", l, err)
 		}
 	}
 	// /dev/shm is the one place in /dev to write, and it is capped.
 	e.is("write /dev/shm", os.WriteFile("/dev/shm/ok", []byte("ok"), 0o600))
 	var sf unix.Statfs_t
-	if err := unix.Statfs("/dev/shm", &sf); err != nil || sf.Blocks*uint64(sf.Bsize) > limit {
-		e.fail("/dev/shm holds %d bytes, %v, want at most %d", sf.Blocks*uint64(sf.Bsize), err, limit)
+	if err := unix.Statfs("/dev/shm", &sf); err != nil || fsBytes(sf.Blocks, sf.Bsize) > limit {
+		e.failf("/dev/shm holds %d bytes, %v, want at most %d", fsBytes(sf.Blocks, sf.Bsize), err, limit)
 	}
 }
 
@@ -347,6 +360,7 @@ func contains(s []string, v string) bool {
 // written but /dev/shm, every writable tmpfs in the sandbox holds no more than
 // that, and the devices still work.
 func TestEscapeDevReadOnly(t *testing.T) {
+	t.Parallel()
 	const size = 16 << 20
 	home := t.TempDir() // may itself be a tmpfs on the host, and is the caller's
 	escRun(t, Spec{Home: home, ScratchSize: size}, "dev-ro", strconv.Itoa(size), home)
@@ -358,7 +372,7 @@ func TestEscapeDevReadOnly(t *testing.T) {
 // escReopen tries to reopen descriptor 3 through /proc/self/fd/3 for writing
 // and for reading, and says what became of each on stdout. args[0] is the
 // bytes it writes through the descriptor it reopened, if it did.
-func escReopen(e *escT, args []string) {
+func escReopen(_ *escT, args []string) {
 	target, _ := os.Readlink("/proc/self/fd/3")
 	fmt.Println("target", target)
 	for _, m := range []struct {
@@ -384,22 +398,24 @@ func escReopen(e *escT, args []string) {
 // and a pipe lead nowhere on the file system, so reopening one gives the
 // sandbox no more than the descriptor already did.
 func TestEscapeReopenDescriptor(t *testing.T) {
+	t.Parallel()
 	t.Run("file", func(t *testing.T) {
+		t.Parallel()
 		dir := t.TempDir()
 		covered := filepath.Join(dir, "covered")
-		if err := os.Mkdir(covered, 0o755); err != nil {
+		if err := os.Mkdir(covered, 0o750); err != nil {
 			t.Fatal(err)
 		}
 		path := filepath.Join(covered, "ro.txt")
-		if err := os.WriteFile(path, []byte("config"), 0o644); err != nil {
+		if err := os.WriteFile(path, []byte("config"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		f, err := os.Open(path) // read-only
+		f, err := openFile(path) // read-only
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer f.Close()
-		c, stdout, stderr := escCmd(t, t.Context(), Spec{Cover: []string{covered}, Files: []*os.File{f}}, "esc", "reopen", "REWRITTEN")
+		c, stdout, stderr := escCmd(t.Context(), t, Spec{Cover: []string{covered}, Files: []*os.File{f}}, "esc", "reopen", "REWRITTEN")
 		if err := c.Start(); err != nil {
 			t.Fatal(err)
 		}
@@ -410,12 +426,13 @@ func TestEscapeReopenDescriptor(t *testing.T) {
 		if !strings.Contains(stdout.String(), "write ok") {
 			t.Errorf("the read-only file was not reopened for writing: %s", stdout)
 		}
-		got, _ := os.ReadFile(path)
+		got, _ := readFile(path)
 		if !bytes.HasPrefix(got, []byte("REWRITTEN")) {
 			t.Errorf("the file reads %q, so the documented reopening no longer works, and the docs need to change", got)
 		}
 	})
 	t.Run("socket", func(t *testing.T) {
+		t.Parallel()
 		fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
 		if err != nil {
 			t.Fatal(err)
@@ -423,7 +440,7 @@ func TestEscapeReopenDescriptor(t *testing.T) {
 		a, b := os.NewFile(uintptr(fds[0]), "a"), os.NewFile(uintptr(fds[1]), "b")
 		defer a.Close()
 		defer b.Close()
-		c, stdout, stderr := escCmd(t, t.Context(), Spec{Files: []*os.File{a}}, "esc", "reopen", "x")
+		c, stdout, stderr := escCmd(t.Context(), t, Spec{Files: []*os.File{a}}, "esc", "reopen", "x")
 		if err := c.Start(); err != nil {
 			t.Fatal(err)
 		}
@@ -435,6 +452,7 @@ func TestEscapeReopenDescriptor(t *testing.T) {
 		}
 	})
 	t.Run("pipe", func(t *testing.T) {
+		t.Parallel()
 		// A pipe's read end can be reopened as another end of the same pipe,
 		// which is the pipe the caller passed and nothing else: what it
 		// writes comes out of the pipe the caller holds.
@@ -443,7 +461,7 @@ func TestEscapeReopenDescriptor(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer r.Close()
-		c, stdout, stderr := escCmd(t, t.Context(), Spec{Files: []*os.File{r}}, "esc", "reopen", "via-the-pipe")
+		c, stdout, stderr := escCmd(t.Context(), t, Spec{Files: []*os.File{r}}, "esc", "reopen", "via-the-pipe")
 		if err := c.Start(); err != nil {
 			t.Fatal(err)
 		}
@@ -483,7 +501,7 @@ func escKeysMode(args []string) int {
 	typ, _ := unix.BytePtrFromString("user")
 	desc, _ := unix.BytePtrFromString(args[1])
 	for _, ring := range []int{unix.KEY_SPEC_SESSION_KEYRING, unix.KEY_SPEC_USER_KEYRING} {
-		if _, _, errno := unix.Syscall6(unix.SYS_ADD_KEY, uintptr(unsafe.Pointer(typ)), uintptr(unsafe.Pointer(desc)), uintptr(unsafe.Pointer(&secret[0])), uintptr(len(secret)), uintptr(ring), 0); errno != 0 {
+		if _, _, errno := unix.Syscall6(unix.SYS_ADD_KEY, uintptr(unsafe.Pointer(typ)), uintptr(unsafe.Pointer(desc)), uintptr(unsafe.Pointer(&secret[0])), uintptr(len(secret)), uintptr(ring), 0); errno != 0 { //nolint:gosec // G103: the kernel reads or writes the buffer during the call, which keeps it valid.
 			fmt.Fprintln(os.Stderr, "add a key:", errno)
 			return 1
 		}
@@ -520,20 +538,22 @@ func escKeys(e *escT, args []string) {
 		name string
 		id   int
 	}{
-		{"thread", unix.KEY_SPEC_THREAD_KEYRING}, {"process", unix.KEY_SPEC_PROCESS_KEYRING},
-		{"session", unix.KEY_SPEC_SESSION_KEYRING}, {"user", unix.KEY_SPEC_USER_KEYRING},
+		{"thread", unix.KEY_SPEC_THREAD_KEYRING},
+		{"process", unix.KEY_SPEC_PROCESS_KEYRING},
+		{"session", unix.KEY_SPEC_SESSION_KEYRING},
+		{"user", unix.KEY_SPEC_USER_KEYRING},
 		{"user session", unix.KEY_SPEC_USER_SESSION_KEYRING},
 	} {
 		if id, err := unix.KeyctlSearch(r.id, "user", args[1], 0); err == nil {
-			e.fail("found the caller's key %d in the %s keyring", id, r.name)
+			e.failf("found the caller's key %d in the %s keyring", id, r.name)
 		}
 	}
 	// The caller's session keyring by its id.
 	if id, err := unix.KeyctlSearch(atoi(args[0]), "user", args[1], 0); err == nil {
-		e.fail("found the caller's key %d in its session keyring by id", id)
+		e.failf("found the caller's key %d in its session keyring by id", id)
 	}
 	if ring, err := unix.KeyctlGetKeyringID(unix.KEY_SPEC_SESSION_KEYRING, false); err == nil && strconv.Itoa(ring) == args[0] {
-		e.fail("the session keyring is the caller's, %d", ring)
+		e.failf("the session keyring is the caller's, %d", ring)
 	}
 }
 
@@ -546,6 +566,7 @@ func atoi(s string) int {
 // does not share its caller's session keyring, and so cannot find or read a
 // key in it.
 func TestEscapeSessionKeyring(t *testing.T) {
+	t.Parallel()
 	if _, err := unix.KeyctlGetKeyringID(unix.KEY_SPEC_SESSION_KEYRING, true); err != nil {
 		t.Skip("no key support: " + err.Error())
 	}
@@ -555,7 +576,7 @@ func TestEscapeSessionKeyring(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	out, err := exec.Command(exe, "esc-keys", string(body), fmt.Sprintf("sbx-secret-%d", os.Getpid())).CombinedOutput()
+	out, err := exec.CommandContext(t.Context(), exe, "esc-keys", string(body), fmt.Sprintf("sbx-secret-%d", os.Getpid())).CombinedOutput() //nolint:gosec // G204: the test binary or a tool the test names, run as the test's own child.
 	if err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}

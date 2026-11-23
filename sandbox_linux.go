@@ -19,6 +19,13 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// backend is what the platform's implementation holds in a Cmd.
+type backend struct {
+	ctx  context.Context
+	spec Spec
+	run  run
+}
+
 // run is what a started Cmd holds.
 type run struct {
 	started, waited bool
@@ -87,13 +94,16 @@ func Command(ctx context.Context, spec Spec) (*Cmd, error) {
 	spec.Command = slices.Clone(spec.Command)
 	spec.Files = slices.Clone(spec.Files)
 	spec.Rlimits = slices.Clone(spec.Rlimits)
-	return &Cmd{ctx: ctx, spec: spec, CgroupFD: -1}, nil
+	return &Cmd{backend: backend{ctx: ctx, spec: spec}, CgroupFD: -1}, nil
 }
 
 // ListenAddrs returns the addresses of the Listen listeners, which the
 // command reaches. They are known before Start, so Env can carry them.
 func (c *Cmd) ListenAddrs() []string {
-	var addrs []string
+	if c.spec.Listen == 0 {
+		return nil
+	}
+	addrs := make([]string, 0, c.spec.Listen)
 	for i := range c.spec.Listen {
 		addrs = append(addrs, net.JoinHostPort("127.0.0.1", strconv.Itoa(listenPort+i)))
 	}
@@ -104,7 +114,10 @@ func (c *Cmd) ListenAddrs() []string {
 // On Linux they are fixed, 4444 and up, and private to the sandbox's network
 // namespace, so two sandboxes use the same ones without meeting.
 func (c *Cmd) LoopbackPorts() []int {
-	var ports []int
+	if c.spec.Loopback == 0 {
+		return nil
+	}
+	ports := make([]int, 0, c.spec.Loopback)
 	for i := range c.spec.Loopback {
 		ports = append(ports, loopbackPort+i)
 	}
@@ -154,7 +167,7 @@ func (c *Cmd) Start() error {
 	if err != nil {
 		return err
 	}
-	spec, err = prepare(spec, homes, os.DirFS("/"), mounts)
+	spec, err = prepare(spec, hostView{fs: os.DirFS("/"), homes: homes, mounts: mounts, cover: defaultCover})
 	if err != nil {
 		return err
 	}
@@ -261,10 +274,10 @@ func (c *Cmd) Start() error {
 		_ = cmd.Process.Kill()
 		waitErr := cmd.Wait()
 		c.run.giveBackTerminal(cmd.Process.Pid)
-		<-sent
+		<-sent //nolint:errcheck // Start is already failing and returns its own error. This only waits for the settings writer to end.
 		var ee *exec.ExitError
 		if errors.As(waitErr, &ee) {
-			err = fmt.Errorf("%w (bubblewrap: %v)", err, ee)
+			err = fmt.Errorf("%w (bubblewrap: %w)", err, ee)
 		}
 		return err
 	}

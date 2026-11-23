@@ -247,8 +247,12 @@ func reaperStage(command []string) (int, error) {
 // receiveSettings reads the settings from the control socket.
 func receiveSettings() (stageSettings, error) {
 	var settings stageSettings
-	if typ, err := unix.GetsockoptInt(fdControl, unix.SOL_SOCKET, unix.SO_TYPE); err != nil || typ != unix.SOCK_SEQPACKET {
-		return settings, fmt.Errorf("descriptor %d is not the control socket: %v", fdControl, err)
+	typ, err := unix.GetsockoptInt(fdControl, unix.SOL_SOCKET, unix.SO_TYPE)
+	if err != nil {
+		return settings, fmt.Errorf("descriptor %d is not the control socket: %w", fdControl, err)
+	}
+	if typ != unix.SOCK_SEQPACKET {
+		return settings, fmt.Errorf("descriptor %d is not the control socket: its type is %d", fdControl, typ)
 	}
 	buf := make([]byte, maxMessage)
 	for {
@@ -343,13 +347,19 @@ func send(reply stageReply, listeners []*net.TCPListener) error {
 	}
 	var oob []byte
 	if len(listeners) > 0 {
+		files := make([]*os.File, 0, len(listeners))
+		defer func() {
+			for _, f := range files {
+				f.Close() //nolint:gosec // G104: l.File made these as copies of the listeners' descriptors, and a failed close changes nothing.
+			}
+		}()
 		fds := make([]int, 0, len(listeners))
 		for _, l := range listeners {
 			f, err := l.File()
 			if err != nil {
 				return err
 			}
-			defer f.Close()
+			files = append(files, f)
 			fds = append(fds, int(f.Fd()))
 		}
 		oob = unix.UnixRights(fds...)
@@ -369,7 +379,7 @@ func watchLifeline() {
 	var b [1]byte
 	for {
 		if _, err := unix.Read(fdLifeline, b[:]); !errors.Is(err, unix.EINTR) {
-			os.Exit(128 + int(unix.SIGKILL))
+			os.Exit(128 + int(unix.SIGKILL)) //nolint:revive // deep-exit: pid 1 must end the whole sandbox from this goroutine, and nothing above it could take an exit status.
 		}
 	}
 }

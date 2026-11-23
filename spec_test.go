@@ -10,6 +10,7 @@ import (
 )
 
 func TestCovers(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name               string
 		paths, binds, want []string
@@ -52,6 +53,7 @@ func fakeHost(dirs, files []string, links map[string]string) fstest.MapFS {
 }
 
 func TestResolve(t *testing.T) {
+	t.Parallel()
 	host := fakeHost(
 		[]string{"/run/app", "/srv/app/state", "/home/agent/.claude/projects/a", "/data"},
 		[]string{"/srv/app/state/db"},
@@ -95,22 +97,16 @@ func TestResolve(t *testing.T) {
 	}
 }
 
-// withLinuxCovers makes the default covers Linux's for a test whose fake host
-// is a Linux one, whatever the platform the test runs on.
-func withLinuxCovers(t *testing.T) {
-	t.Helper()
-	oldCover, oldAliases := defaultCover, coverAliases
-	defaultCover = []string{"/home", "/root", "/run", "/tmp", "/var", "/mnt", "/media", "/dev/shm", "/.snapshots", "/sysroot"}
-	coverAliases = nil
-	t.Cleanup(func() { defaultCover, coverAliases = oldCover, oldAliases })
-}
+// linuxCover is Linux's default covers, which a test whose fake host
+// has Linux's layout passes to prepare on any platform.
+var linuxCover = []string{"/home", "/root", "/run", "/tmp", "/var", "/mnt", "/media", "/dev/shm", "/.snapshots", "/sysroot"}
 
 func TestPrepare(t *testing.T) {
-	withLinuxCovers(t)
+	t.Parallel()
 	host := fakeHost(
 		[]string{
 			"/home", "/root", "/run", "/tmp", "/var", "/mnt", "/dev/shm", "/srv/app/state/servers/a",
-			"/users/aaron", "/srv/agent/.claude/projects/a", "/srv/agent/.claude/projects/b",
+			"/users/aaron", "/srv/agent/.claude/projects/a", "/srv/agent/.claude/projects/b", "/export/homes",
 		},
 		[]string{"/var/lib/sgml-base/supercatalog"},
 		map[string]string{
@@ -124,11 +120,15 @@ func TestPrepare(t *testing.T) {
 		Home:    "/srv/app/state/servers/a",
 		Write:   []string{"/gone"},
 		Cover:   []string{"/state", "/var/run"},
-	}, []string{"/users/aaron"}, host, nil)
+	}, hostView{fs: host, homes: []string{"/users/aaron"}, cover: linuxCover, mounts: []mount{
+		{dev: "0:60", root: "/", point: "/"},
+		// The root filesystem's /home shown again elsewhere, which hides it too.
+		{dev: "0:60", root: "/home", point: "/export/homes"},
+	}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"/dev/shm", "/home", "/mnt", "/root", "/run", "/srv/app/state", "/tmp", "/users/aaron", "/var"}
+	want := []string{"/dev/shm", "/export/homes", "/home", "/mnt", "/root", "/run", "/srv/app/state", "/tmp", "/users/aaron", "/var"}
 	if !slices.Equal(spec.Cover, want) {
 		t.Errorf("Cover = %q, want %q", spec.Cover, want)
 	}
@@ -144,7 +144,7 @@ func TestPrepare(t *testing.T) {
 		{"/srv/agent", "/srv/agent"},
 		{"/state/servers/a", "/srv/app/state/servers/a"},
 	} {
-		spec, err := prepare(Spec{Command: []string{"true"}, Home: "/srv/app/state/servers/a", Dir: tc.dir}, nil, host, nil)
+		spec, err := prepare(Spec{Command: []string{"true"}, Home: "/srv/app/state/servers/a", Dir: tc.dir}, hostView{fs: host, cover: linuxCover})
 		if err != nil {
 			t.Errorf("dir %s: %v", tc.dir, err)
 		} else if spec.Dir != tc.want {
@@ -198,13 +198,14 @@ func TestPrepare(t *testing.T) {
 			Spec{Command: []string{"true"}, Home: "/home", Write: []string{"/srv/agent"}, Read: []string{"/srv/agent/.claude"}},
 		},
 	} {
-		if _, err := prepare(tc.spec, nil, tc.host, nil); err == nil {
+		if _, err := prepare(tc.spec, hostView{fs: tc.host, cover: linuxCover}); err == nil {
 			t.Errorf("%s: prepare succeeded", tc.name)
 		}
 	}
 }
 
 func TestParseMountinfo(t *testing.T) {
+	t.Parallel()
 	table := `4449 3733 0:60 / / rw,relatime shared:2207 master:81 - zfs rpool/data/subvol-7002-disk-0 rw,xattr
 4450 4449 0:86 / /users/aaron rw,nosuid shared:2208 - zfs raft/users/aaron rw
 4512 4449 0:60 /home /srv/old\040homes rw - zfs rpool/data/subvol-7002-disk-0 rw
@@ -227,6 +228,7 @@ func TestParseMountinfo(t *testing.T) {
 }
 
 func TestMountCovers(t *testing.T) {
+	t.Parallel()
 	mounts := []mount{
 		// A root on ZFS, as on a Proxmox container.
 		{dev: "0:60", root: "/", point: "/", fsType: "zfs"},
@@ -251,6 +253,7 @@ func TestMountCovers(t *testing.T) {
 }
 
 func TestLinkedFiles(t *testing.T) {
+	t.Parallel()
 	host := fakeHost(
 		nil,
 		[]string{
@@ -288,6 +291,7 @@ func TestLinkedFiles(t *testing.T) {
 }
 
 func TestAccountHomes(t *testing.T) {
+	t.Parallel()
 	owners := map[string]uint64{
 		"/": 0, "/bin": 0, "/usr/sbin": 0, "/usr/games": 0, "/root": 0,
 		"/var/cache/man": 6,
