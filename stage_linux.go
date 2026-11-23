@@ -36,8 +36,8 @@ const failed = 125
 // The descriptors bubblewrap hands the stages, which Start numbers by the
 // order of its ExtraFiles. fd 3 holds bubblewrap's options and goes no
 // further. bubblewrap consumes its --info-fd, its bind sources, and its
-// data pipes, and passes the rest on at the same numbers, as spikes.md L1
-// found on 0.12.0.
+// data pipes, and passes the rest on at the same numbers, as docs/linux.md
+// (Descriptor passthrough) found on 0.12.0.
 const (
 	fdArgs     = 3
 	fdInfo     = 4

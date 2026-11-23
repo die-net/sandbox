@@ -1312,8 +1312,9 @@ func TestAPISelfPath(t *testing.T) {
 }
 
 // A server's threads come and go: a sandbox started from a goroutine whose
-// thread then exits must not be killed, which design.md 4.4 gives as the
-// reason there is a lifeline and neither Pdeathsig nor --die-with-parent.
+// thread then exits must not be killed, which docs/linux.md (The lifeline)
+// gives as the reason there is a lifeline and neither Pdeathsig nor
+// --die-with-parent.
 func TestAPIStartThreadExits(t *testing.T) {
 	for i := range 3 {
 		ctx, cancel := context.WithCancel(t.Context())

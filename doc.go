@@ -1,8 +1,9 @@
 // Package sandbox runs a command in a sandbox that shows it the host's files
 // read-only, with the paths that hold the caller's data, people's homes, and
 // other services' state covered by empty directories, and only its own
-// directories writable. docs/sandbox.md describes how it holds, and every
-// way past it found so far, with what stops it and the test that checks it.
+// directories writable. docs/security-model.md says what it guarantees and
+// what it doesn't, and docs/findings.md lists every way past it found so far,
+// with what stops it and the test that checks it.
 //
 // On Linux, bubblewrap builds the sandbox from new namespaces without root,
 // from options this package works out and passes it on descriptors. It then
@@ -21,7 +22,7 @@
 // command in a process group of its own, and ends every process that runs
 // under the profile, whatever its group or parent, when the command does or
 // the caller dies. macOS has no pid namespace, so the sandbox's processes see
-// the caller's, and read its environment, and docs/sandbox.md lists what that
-// costs.
+// the caller's, and read its environment, and docs/security-model.md lists what
+// that costs.
 // Elsewhere [Command] and [Run] return [errors.ErrUnsupported].
 package sandbox

@@ -17,7 +17,9 @@ import (
 // sees.
 type Spec struct {
 	// Command is the program to run and its arguments. A program name
-	// without a slash is looked up on PATH inside the sandbox.
+	// without a slash is looked up on the PATH in Cmd.Env, and there is no
+	// default: with no PATH there, as when Env is nil, the name is not
+	// found. Give the full path, or set PATH in Env.
 	Command []string `json:"command"`
 	// Home is the sandbox's own directory. It is writable, and it is the
 	// command's HOME. On macOS a path through /System/Volumes/Data that a
@@ -52,8 +54,8 @@ type Spec struct {
 	// ignores them. BroadLoopback is an opt-in gap: it lets the command bind,
 	// accept on and dial any port, over TCP and UDP, on every address the
 	// host has, the caller's own listeners and the user's other local
-	// services included, and so serve the LAN as well. See docs/design.md
-	// section 4.3.
+	// services included, and so serve the LAN as well. See docs/macos.md,
+	// The network, and docs/usage.md, Egress through Files and Listen.
 	Services      []Service `json:"services,omitempty"`
 	BroadLoopback bool      `json:"broad_loopback,omitempty"`
 	// Listen is how many TCP listeners the caller serves for the command,
@@ -68,7 +70,7 @@ type Spec struct {
 	// up. On macOS it is not: the ports are chosen free, and a profile names
 	// an address only as every one the host has, so the command can bind
 	// one on the LAN address too, and a peer on the LAN can connect to it,
-	// as can any local process (docs/sandbox.md, Limits). It may not exceed
+	// as can any local process (docs/security-model.md, Limits). It may not exceed
 	// maxListen either.
 	Loopback int `json:"loopback,omitempty"`
 	// Files are the descriptors the command gets as 3, 4, and so on. The
@@ -154,7 +156,7 @@ const (
 	// (org.mozilla.machname.*), and LaunchServices' and configd's lookups,
 	// which it aborts or crashes without. The lookup of LaunchServices does
 	// not let a process open an app or a URL, since that is the lsopen
-	// operation, which no profile here ever allows (docs/spikes.md, M3).
+	// operation, which no profile here ever allows (docs/macos.md, M3).
 	ServiceFirefox Service = "firefox"
 	// ServiceDirectory lets the command look accounts up through Directory
 	// Services (getpwuid, getpwnam). Without it those find nothing, since the

@@ -638,7 +638,7 @@ func Run(ctx context.Context, spec Spec) (int, error) {
 // directory in the variables programs read them from. CFFIXED_USER_HOME is
 // what Cocoa resolves ~/Library from, which $HOME alone does not move: without
 // it Firefox 152 to 157 hangs on the TCC-protected real ~/Library, and later
-// versions write into it (docs/spikes.md, M2).
+// versions write into it (docs/macos.md, M2).
 func commandEnv(env []string, spec Spec) []string {
 	tmp := filepath.Join(spec.Home, tmpName)
 	set := [][2]string{

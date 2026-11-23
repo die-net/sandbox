@@ -1,9 +1,9 @@
 package sandbox
 
 // Escape tests for the macOS backend: for each guarantee in the macOS column
-// of docs/design.md section 2's table, code runs inside a sandbox, tries the
-// escape, and the test asserts it fails. Each test cites the row it checks as
-// "Row: ...". A guarantee the platform cannot give has a test named TestGap...
+// of docs/security-model.md's guarantee table, code runs inside a sandbox,
+// tries the escape, and the test asserts it fails. Each test cites the row it
+// checks as "Row: ...", by the first words of the Guarantee column. A guarantee the platform cannot give has a test named TestGap...
 // that shows the gap, and fails when the gap closes, so that the docs get
 // changed with it.
 //
@@ -1306,7 +1306,7 @@ func TestEscapeLoopbackPorts(t *testing.T) {
 
 // Row: "Network: BroadLoopback only by opt-in": without it a sandbox reaches no
 // local listener, with it, it reaches every one on any of the host's own
-// addresses. That is the reported gap (spikes.md, M1): the test documents it,
+// addresses. That is the reported gap (docs/macos.md, M1): the test documents it,
 // and fails if a per-port deny ever becomes reliable.
 func TestGapBroadLoopback(t *testing.T) {
 	port := listenAny(t)
@@ -1879,7 +1879,7 @@ func TestEscapeEveryFieldStarts(t *testing.T) {
 
 // ---------------------------------------------------------------- descriptors
 
-// Row: "Descriptors handed in" (docs/sandbox.md): a descriptor grants what its
+// Row: "Descriptors handed in" (docs/linux.md): a descriptor grants what its
 // object does. On Linux the command reopens a read-only file under a cover
 // through /proc/self/fd for writing. On macOS /dev/fd/N is the file's path,
 // and the profile decides by that path, so the reopen is refused under a
@@ -1979,7 +1979,7 @@ int main(int argc, char **argv) {
 }
 `
 
-// Row: "Seatbelt profile: ... never lsopen (spikes.md M3)", the raw-XPC case that
+// Row: "Launching apps and URLs" (docs/macos.md, M3), the raw-XPC case that
 // M3 left open: a client that talks to launchservicesd directly. With the
 // Firefox group, which allows the lookup, the connection is made, where
 // without it the sandbox refuses the lookup. Our message is rejected as it is

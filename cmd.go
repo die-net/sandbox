@@ -57,9 +57,11 @@ type Cmd struct {
 	Stdout io.Writer
 	Stderr io.Writer
 	// Env is the command's environment. Nil means empty, never the
-	// caller's own. On macOS the caller's own environment is still readable
-	// by the command through sysctl(KERN_PROCARGS2), which no profile can
-	// stop, so a caller must hold no secret in its environment there. Start sets HOME, TMPDIR, and the XDG_* variables,
+	// caller's own, so there is no PATH and a program name in Spec.Command
+	// without a slash is not found. On macOS the caller's own environment is
+	// still readable by the command through sysctl(KERN_PROCARGS2), which no
+	// profile can stop, so a caller must hold no secret in its environment
+	// there. Start sets HOME, TMPDIR, and the XDG_* variables,
 	// XDG_RUNTIME_DIR included, to the sandbox's own over whatever Env
 	// holds, since the caller's would point into a path the sandbox covers.
 	// On macOS TMPDIR and XDG_RUNTIME_DIR are a directory named tmp in the

@@ -255,7 +255,7 @@ func profile(in profileInput) (string, error) {
 	// LAN address or the wildcard, and a peer on the LAN may connect to it.
 	// Seatbelt takes no other host than "*" or "localhost" in an address, and
 	// checks a connection's remote address at connect and not at accept, so
-	// there is no rule that limits it to 127.0.0.1 (docs/sandbox.md).
+	// there is no rule that limits it to 127.0.0.1 (docs/macos.md, The network).
 	for _, p := range in.Listen {
 		b.line(`(allow network-outbound (remote tcp "localhost:%s"))`, strconv.Itoa(p))
 	}
