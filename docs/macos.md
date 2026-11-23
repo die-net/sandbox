@@ -40,7 +40,7 @@ The base rules are:
 
 All of `/dev` is denied but `null`, `zero`, `random`, `urandom` and `/dev/fd/N`, so a command reaches a terminal, a console, a serial port, packet capture or a disk only as a descriptor it was given. A list of what to deny had missed `/dev/console` and `/dev/cu.*`. `dtracehelper`, which every process tries to open, is denied too, and Firefox renders without it.
 
-Last, the home and each `Write` path get a deny of unlink and create at their own path, so the sandbox can't remove, rename or replace its own root ([findings](findings.md#a-sandbox-could-replace-its-own-home-with-a-link)).
+Last, the home and each `Write` path get a deny of unlink, create and hard link at their own path, so the sandbox can't remove, rename, replace or hard-link its own root ([findings](findings.md#a-sandbox-could-replace-its-own-home-with-a-link)).
 
 The profile never allows `lsopen`, which would let the command open any app or URL through LaunchServices, outside the profile. It never allows a Mach service outside a requested group, `iokit-open`, or `file-write*` outside the home and the `Write` paths.
 
@@ -74,7 +74,7 @@ Seatbelt checks the path a file has when it is opened, not one opened earlier. S
 
 - A `Write` directory that another process replaces with a link after the profile is written gives the sandbox nothing, since its path leads somewhere the rule doesn't name.
 - A link the sandbox plants in its home leads out of the rule that allows the home, so nothing is read or written through it.
-- The sandbox can't swap its own root. The profile denies unlink and create at the literal path of the home and of each `Write` path, so `rmdir`, a rename of it and a link made in its place fail. Without that, the sandbox could remove its home and put a link to the caller's private directory there, and the caller, which reads and cleans up by that name, would follow it.
+- The sandbox can't swap its own root. The profile denies unlink, create and `file-link` at the literal path of the home and of each `Write` path, so `rmdir`, a rename of it, a link made in its place and a hard link of a `Write` file into the home fail. macOS 27 refuses that hard link without the `file-link` deny, and 15 and 26 don't ([findings](findings.md#a-write-file-could-be-hard-linked-into-the-home-on-macos-15-and-26)). Without that, the sandbox could remove its home and put a link to the caller's private directory there, and the caller, which reads and cleans up by that name, would follow it.
 - A home or `Write` path with a link in it is still refused, for the reason it is on Linux: the next run would be pointed at what the link leads to. A caller must name the real path (`t.TempDir()` leads through `/var`).
 
 ## The stage
