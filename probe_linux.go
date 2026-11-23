@@ -70,7 +70,7 @@ func firstLine(s string) string {
 func runOutput(name string, args ...string) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, name, args...).Output()
+	out, err := exec.CommandContext(ctx, name, args...).Output() //nolint:gosec // G204: Probe runs the tools it reports on, by the names its own code gives.
 	if err != nil {
 		return ""
 	}
@@ -96,7 +96,7 @@ func tryBubblewrap(bwrap string) string {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, bwrap, "--unshare-user", "--unshare-pid", "--die-with-parent",
+	cmd := exec.CommandContext(ctx, bwrap, "--unshare-user", "--unshare-pid", "--die-with-parent", //nolint:gosec // G204: bwrap is the bubblewrap Probe found, run with a fixed trial.
 		"--ro-bind", "/", "/", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--", tr)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -137,7 +137,7 @@ func gatherFailureFacts(f *probeFacts) {
 	}
 	if st, err := os.Open("/proc/self/status"); err == nil {
 		s, _ := parseStatus(st)
-		st.Close()
+		st.Close() //nolint:gosec // G104: a read-only descriptor, and nothing can be done about a failed close.
 		f.Seccomp = s.Seccomp
 	}
 	if b, err := os.ReadFile("/proc/self/attr/current"); err == nil {
@@ -145,12 +145,14 @@ func gatherFailureFacts(f *probeFacts) {
 	}
 	if mi, err := os.Open("/proc/self/mountinfo"); err == nil {
 		f.Mounts, _ = parseMountinfo(mi)
-		mi.Close()
+		mi.Close() //nolint:gosec // G104: a read-only descriptor, and nothing can be done about a failed close.
 	}
 	// An ordinary process asks for a user namespace, with nothing else to
 	// go wrong, so EPERM here comes from a filter.
 	if tr := trueBinary(); tr != "" {
-		cmd := exec.Command(tr)
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, tr) //nolint:gosec // G204: tr is a true binary Probe found, run to see whether a user namespace can be made.
 		cmd.SysProcAttr = &syscall.SysProcAttr{Cloneflags: syscall.CLONE_NEWUSER}
 		f.UnshareErr = cmd.Run()
 		var ee *exec.ExitError

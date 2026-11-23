@@ -3,7 +3,6 @@ package sandbox
 import (
 	"context"
 	"fmt"
-	"net"
 	"os"
 	"path/filepath"
 	"slices"
@@ -34,7 +33,7 @@ func checkWorld(t *testing.T) (home, sock string) {
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(short) })
 	sock = filepath.Join(short, "agent.sock")
-	l, err := net.Listen("unix", sock)
+	l, err := listen("unix", sock)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,12 +55,14 @@ func checkWorld(t *testing.T) (home, sock string) {
 // network and a home, and checks each result the macOS backend is meant to
 // give: a pass where the profile holds, and a failure, with its reason, where
 // the platform cannot hold.
+//
+//nolint:paralleltest // uses t.Setenv through checkWorld, which t.Parallel forbids.
 func TestCheckSandboxDarwin(t *testing.T) {
 	userHome, _ := checkWorld(t)
 	home := realTemp(t)
 	secret := hostSecret(t)
 	inHome := mkdirs(t, home, "inside-home")
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	listener, err := listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +108,7 @@ func TestCheckSandboxDarwin(t *testing.T) {
 			t.Errorf("no result named %s", name)
 			continue
 		}
-		if r.Status != st && !(name == "proc.environ" && r.Status == Fail) {
+		if r.Status != st && (name != "proc.environ" || r.Status != Fail) {
 			t.Errorf("%s = %+v, want %v", name, r, st)
 		}
 	}
@@ -149,13 +150,15 @@ func TestCheckSandboxDarwin(t *testing.T) {
 // TestCheckCatchesEscapesDarwin runs the checks against sandboxes that have a
 // hole, to see that they fail: host network, BroadLoopback, a Read path that
 // shows a secret, a Write path that is writable.
+//
+//nolint:paralleltest // uses t.Setenv through checkWorld, which t.Parallel forbids.
 func TestCheckCatchesEscapesDarwin(t *testing.T) {
-	conn, err := net.DialTimeout("tcp", "1.1.1.1:443", 3*time.Second)
+	conn, err := dialTimeout("tcp", "1.1.1.1:443", 3*time.Second)
 	haveNet := err == nil
 	if haveNet {
-		conn.Close()
+		conn.Close() //nolint:gosec // G104: nothing can be done about a failed close here, and the test is over or has what it needs.
 	}
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	listener, err := listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -221,7 +224,7 @@ func TestCheckCatchesEscapesDarwin(t *testing.T) {
 		if err != nil || len(pids) == 0 {
 			t.Fatalf("foreignPIDs = %v, %v", pids, err)
 		}
-		if p, err := unix.SysctlKinfoProc("kern.proc.pid", pids[0]); err != nil || p.Eproc.Ucred.Uid != uint32(os.Geteuid()) {
+		if p, err := unix.SysctlKinfoProc("kern.proc.pid", pids[0]); err != nil || p.Eproc.Ucred.Uid != euid() {
 			t.Errorf("the first outside process tried, %d, is not this account's: %v", pids[0], err)
 		}
 	})
@@ -231,10 +234,10 @@ func TestCheckCatchesEscapesDarwin(t *testing.T) {
 		// when it is not writable. A Check with a sandbox cannot fail this row
 		// by a hole in the spec, since a Write path is the sandbox's own.
 		open, closed := mkdirs(t, realTemp(t), "open"), mkdirs(t, realTemp(t), "closed")
-		if err := os.Chmod(closed, 0o500); err != nil {
+		if err := os.Chmod(closed, 0o400); err != nil {
 			t.Fatal(err)
 		}
-		t.Cleanup(func() { _ = os.Chmod(closed, 0o700) })
+		t.Cleanup(func() { _ = os.Chmod(closed, 0o600) })
 		env := &checkEnv{spec: &Spec{Home: home}, hints: checkHints{Set: true, WriteTargets: []string{open}}}
 		if r := checkWrites(env)[0]; r.Status != Fail || !strings.Contains(r.Detail, open) {
 			t.Errorf("a writable directory outside the sandbox: %+v", r)
@@ -300,6 +303,7 @@ func TestCheckCatchesEscapesDarwin(t *testing.T) {
 // gives it, and checks the macOS results: other processes are listed and can
 // be signaled.
 func TestCheckNilDarwin(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	res, err := Check(ctx, nil, Expect{})
@@ -320,6 +324,7 @@ func TestCheckNilDarwin(t *testing.T) {
 // TestProcEnvironment checks the KERN_PROCARGS2 parse: argv alone is not an
 // environment, and a record with one is.
 func TestProcEnvironment(t *testing.T) {
+	t.Parallel()
 	dir := realTemp(t)
 	cmd := newTestProcess(t, dir, []string{"SBX_ENV_PARSE=1"})
 	if !procEnvironment(cmd) {

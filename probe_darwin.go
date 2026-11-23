@@ -67,7 +67,7 @@ func gatherDarwinContext() string {
 // a profile cannot apply another, which Seatbelt reports as
 // sandbox_apply: Operation not permitted.
 func tryProfile(exe string) string {
-	if fi, err := os.Stat(exe); err != nil {
+	if fi, err := os.Stat(exe); err != nil { //nolint:gosec // G703: exe is the sandbox-exec path the caller of Probe set, and Stat only reads its mode.
 		return "missing: " + err.Error()
 	} else if fi.Mode()&0o111 == 0 {
 		return "missing: " + exe + " is not executable"
@@ -75,7 +75,7 @@ func tryProfile(exe string) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	var stderr bytes.Buffer
-	cmd := exec.CommandContext(ctx, exe, "-p", "(version 1)(allow default)", "/usr/bin/true")
+	cmd := exec.CommandContext(ctx, exe, "-p", "(version 1)(allow default)", "/usr/bin/true") //nolint:gosec // G204: exe is the sandbox-exec path the caller of Probe set, and the profile allows everything and runs /usr/bin/true.
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		msg := strings.TrimSpace(stderr.String())

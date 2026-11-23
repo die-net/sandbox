@@ -54,9 +54,9 @@ func (t *terminal) restore(sandboxPgrp int) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	var set, old uint64 = 1 << (unix.SIGTTOU - 1), 0
-	_, _, errno := unix.RawSyscall6(unix.SYS_RT_SIGPROCMASK, 0 /* SIG_BLOCK */, uintptr(unsafe.Pointer(&set)), uintptr(unsafe.Pointer(&old)), 8, 0, 0)
+	_, _, errno := unix.RawSyscall6(unix.SYS_RT_SIGPROCMASK, 0 /* SIG_BLOCK */, uintptr(unsafe.Pointer(&set)), uintptr(unsafe.Pointer(&old)), 8, 0, 0) //nolint:gosec // G103: the kernel reads set and writes old during the call.
 	if errno == 0 {
-		defer unix.RawSyscall6(unix.SYS_RT_SIGPROCMASK, 2 /* SIG_SETMASK */, uintptr(unsafe.Pointer(&old)), 0, 8, 0, 0)
+		defer unix.RawSyscall6(unix.SYS_RT_SIGPROCMASK, 2 /* SIG_SETMASK */, uintptr(unsafe.Pointer(&old)), 0, 8, 0, 0) //nolint:gosec,errcheck // G103: the kernel reads old during the call. The restore can only fail on a bad pointer, and no caller could act on that.
 	}
 	if pgrp, err := unix.IoctlGetInt(t.fd, unix.TIOCGPGRP); err == nil && (sandboxPgrp == 0 || pgrp == sandboxPgrp) {
 		_ = unix.IoctlSetPointerInt(t.fd, unix.TIOCSPGRP, t.callers)

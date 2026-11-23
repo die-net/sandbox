@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -184,7 +183,7 @@ func supervise(command []string) (int, error) {
 		if group != 0 {
 			finish(killAll(group, mark))
 		}
-		os.Exit(128 + int(unix.SIGKILL))
+		os.Exit(128 + int(unix.SIGKILL)) //nolint:revive // deep-exit: the stage must end from this goroutine once the lifeline closes, and nothing above it could take an exit status.
 	}()
 	// Without the lifeline the watcher's first read fails and ends the
 	// process, racing the clean error below. Fail here instead.
@@ -274,10 +273,11 @@ func startCommand(s stageSettings, command []string, mu *sync.Mutex, group *int)
 	// The profile is written from here, in the background, since
 	// sandbox-exec reads it all before it starts anything.
 	go func() {
-		_, _ = io.WriteString(profW, s.Profile)
+		_, _ = profW.WriteString(s.Profile)
 		_ = profW.Close()
 	}()
-	args := []string{"sandbox-exec", "-f", "/dev/fd/" + strconv.Itoa(profFd), "--"}
+	args := make([]string, 0, 4+len(command))
+	args = append(args, "sandbox-exec", "-f", "/dev/fd/"+strconv.Itoa(profFd), "--")
 	args = append(args, command...)
 	attr := &os.ProcAttr{
 		Env:   os.Environ(),
@@ -293,7 +293,7 @@ func startCommand(s stageSettings, command []string, mu *sync.Mutex, group *int)
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	p, err := os.StartProcess(sandboxExec, args, attr)
+	p, err := os.StartProcess(sandboxExec, args, attr) //nolint:gosec // G702: sandboxExec is a constant path, and running the configured command under it is the library's job.
 	runtime.KeepAlive(files)
 	if err != nil {
 		return nil, fmt.Errorf("start %s: %w", sandboxExec, err)

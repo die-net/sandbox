@@ -72,3 +72,42 @@ func dupFile(f *os.File) (*os.File, error) {
 	}
 	return os.NewFile(uintptr(nfd), f.Name()), nil
 }
+
+// maxListen is the most Listen and Loopback may each be, which keeps their
+// fixed Linux ports apart.
+const maxListen = 1000
+
+// checkRequest checks the parts of spec that need no host: the
+// network and listener counts, the limits, and the files. It is shared by
+// every backend.
+func (s Spec) checkRequest() error {
+	if len(s.Command) == 0 {
+		return errors.New("no command")
+	}
+	if s.Network != NetworkNone && s.Network != NetworkHost {
+		return fmt.Errorf("unknown network %d", int(s.Network))
+	}
+	if s.Listen < 0 || s.Listen > maxListen || s.Loopback < 0 || s.Loopback > maxListen {
+		return fmt.Errorf("listen and loopback must each be from 0 to %d", maxListen)
+	}
+	if s.Network == NetworkHost && (s.Listen > 0 || s.Loopback > 0) {
+		return errors.New("listeners and loopback ports need NetworkNone, since the host's network has no private loopback")
+	}
+	if s.ScratchSize < 0 {
+		return fmt.Errorf("scratch size %d is negative", s.ScratchSize)
+	}
+	for _, f := range s.Files {
+		if f == nil {
+			return errors.New("a nil file in Files")
+		}
+	}
+	for _, r := range s.Rlimits {
+		if r.Resource < ResourceCPU || r.Resource > ResourceAddressSpace {
+			return fmt.Errorf("unknown resource %d", int(r.Resource))
+		}
+		if r.Soft > r.Hard {
+			return fmt.Errorf("limit %d has a soft limit above its hard limit", int(r.Resource))
+		}
+	}
+	return nil
+}

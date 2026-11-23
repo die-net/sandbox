@@ -3,10 +3,11 @@ package sandbox
 import (
 	"bufio"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
-	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -31,11 +32,7 @@ func platformChecks(e *checkEnv) []Result {
 	groups := make([][]Result, len(fns))
 	var wg sync.WaitGroup
 	for i, fn := range fns {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			groups[i] = fn(e)
-		}()
+		wg.Go(func() { groups[i] = fn(e) })
 	}
 	wg.Wait()
 	return slices.Concat(groups...)
@@ -209,7 +206,7 @@ func grandchild(args []string) (int, bool) {
 func spawnNS(flags uintptr, mode ...string) (started bool, detail string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 4*netTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "/proc/self/exe", append([]string{checkArg}, mode...)...)
+	cmd := exec.CommandContext(ctx, "/proc/self/exe", append([]string{checkArg}, mode...)...) //nolint:gosec // G204: this binary, run with the check's own fixed modes.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Cloneflags: flags}
 	if flags&syscall.CLONE_NEWUSER != 0 {
 		// Map our uid to root, as bubblewrap does. Without a mapping the
@@ -256,7 +253,7 @@ func checkIOUring(*checkEnv) []Result {
 	var params [120]byte                                                                             // struct io_uring_params
 	fd, _, errno := unix.Syscall(unix.SYS_IO_URING_SETUP, 1, uintptr(unsafe.Pointer(&params[0])), 0) //nolint:gosec // G103: the kernel reads the buffer during the call.
 	if errno == 0 {
-		unix.Close(int(fd))
+		unix.Close(int(fd)) //nolint:gosec // G104: the ring was only a probe, and creating it is the result.
 		return []Result{fail(name, "io_uring_setup worked")}
 	}
 	return []Result{pass(name, "io_uring_setup refused: %v", errno)}
@@ -275,21 +272,22 @@ func checkNetfilter(*checkEnv) []Result {
 	switch errno {
 	case unix.EPERM, unix.EACCES, unix.ENOPROTOOPT, unix.ENOSYS, unix.EAFNOSUPPORT:
 		return []Result{pass(name, "IPT_SO_SET_REPLACE refused: %v", errno)}
+	default:
+		return []Result{fail(name, "IPT_SO_SET_REPLACE reached the table code: %v", errno)}
 	}
-	return []Result{fail(name, "IPT_SO_SET_REPLACE reached the table code: %v", errno)}
 }
 
 func checkBPF(*checkEnv) []Result {
 	const name = "bpf.load"
 	// BPF_MAP_CREATE of a one-entry array map, the least a program can ask of bpf(2).
 	var attr [128]byte
-	*(*uint32)(unsafe.Pointer(&attr[0])) = 2 // BPF_MAP_TYPE_ARRAY
-	*(*uint32)(unsafe.Pointer(&attr[4])) = 4 // key size
-	*(*uint32)(unsafe.Pointer(&attr[8])) = 4 // value size
-	*(*uint32)(unsafe.Pointer(&attr[12])) = 1
+	binary.NativeEndian.PutUint32(attr[0:], 2) // BPF_MAP_TYPE_ARRAY
+	binary.NativeEndian.PutUint32(attr[4:], 4) // key size
+	binary.NativeEndian.PutUint32(attr[8:], 4) // value size
+	binary.NativeEndian.PutUint32(attr[12:], 1)
 	fd, _, errno := unix.Syscall(unix.SYS_BPF, unix.BPF_MAP_CREATE, uintptr(unsafe.Pointer(&attr[0])), uintptr(len(attr))) //nolint:gosec // G103: the kernel reads the buffer during the call.
 	if errno == 0 {
-		unix.Close(int(fd))
+		unix.Close(int(fd)) //nolint:gosec // G104: the map was only a probe, and creating it is the result.
 		return []Result{fail(name, "bpf(BPF_MAP_CREATE) worked")}
 	}
 	return []Result{pass(name, "bpf(BPF_MAP_CREATE) refused: %v", errno)}
@@ -300,7 +298,7 @@ func checkBPF(*checkEnv) []Result {
 func checkNested(e *checkEnv) []Result {
 	names := []string{"nested.umount-cover", "nested.remount-rw", "nested.mount-outside"}
 	if e.spec == nil || e.spec.Kernel != KernelNested {
-		var res []Result
+		res := make([]Result, 0, len(names))
 		for _, n := range names {
 			res = append(res, skipped(n, "the spec is not KernelNested"))
 		}
@@ -429,7 +427,7 @@ func checkProcesses(*checkEnv) []Result {
 		{"proc.trace", func(pid int) bool {
 			f, err := os.Open("/proc/" + strconv.Itoa(pid) + "/mem")
 			if err == nil {
-				f.Close()
+				f.Close() //nolint:gosec // G104: the open worked, which is the result.
 			}
 			return err == nil
 		}},
@@ -557,6 +555,9 @@ func checkAbstract(*checkEnv) []Result {
 	return []Result{verdict(name, fmt.Sprintf("connect to %d abstract sockets", len(names)), worked)}
 }
 
+// cgroupRoot is where the v2 hierarchy is mounted.
+const cgroupRoot = "/sys/fs/cgroup"
+
 // cgroupDir returns this process's cgroup directory under the v2 mount.
 func cgroupDir() (string, error) {
 	b, err := os.ReadFile("/proc/self/cgroup")
@@ -565,7 +566,7 @@ func cgroupDir() (string, error) {
 	}
 	for _, line := range strings.Split(string(b), "\n") {
 		if p, ok := strings.CutPrefix(line, "0::"); ok {
-			return filepath.Join("/sys/fs/cgroup", filepath.Clean("/"+p)), nil
+			return cgroupRoot + filepath.Clean("/"+p), nil
 		}
 	}
 	return "", errors.New("no cgroup v2")
@@ -573,13 +574,13 @@ func cgroupDir() (string, error) {
 
 // cgroupLimit finds the first finite value of file in dir or an ancestor.
 func cgroupLimit(dir, file string) (string, bool) {
-	for d := dir; under(d, "/sys/fs/cgroup"); d = filepath.Dir(d) {
-		if b, err := os.ReadFile(filepath.Join(d, file)); err == nil {
+	for d := dir; under(d, cgroupRoot); d = filepath.Dir(d) {
+		if b, err := os.ReadFile(filepath.Join(d, file)); err == nil { //nolint:gosec // G304: the check reads the limit files of its own cgroup.
 			if v := strings.TrimSpace(string(b)); v != "max" {
 				return v + " in " + d, true
 			}
 		}
-		if d == "/sys/fs/cgroup" {
+		if d == cgroupRoot {
 			break
 		}
 	}
@@ -615,19 +616,28 @@ func checkDelegate(*checkEnv) []Result {
 		return []Result{fail(name, "%v", err)}
 	}
 	child := filepath.Join(dir, "sbx-check-"+strconv.Itoa(os.Getpid())+"-"+strconv.FormatInt(time.Now().UnixNano(), 36))
-	if err := os.Mkdir(child, 0o755); err != nil {
+	if err := os.Mkdir(child, 0o750); err != nil {
 		return []Result{fail(name, "mkdir in %s: %v", dir, err)}
 	}
-	defer os.Remove(child)
-	b, err := os.ReadFile(filepath.Join(child, "cgroup.controllers"))
+	res := delegateOffers(name, dir, child)
+	if err := os.Remove(child); err != nil {
+		return []Result{fail(name, "remove %s: %v", child, err)}
+	}
+	return []Result{res}
+}
+
+// delegateOffers checks that the child cgroup the check made offers the
+// memory and pids controllers.
+func delegateOffers(name, dir, child string) Result {
+	b, err := os.ReadFile(filepath.Join(child, "cgroup.controllers")) //nolint:gosec // G304: a file in the cgroup the check just made.
 	if err != nil {
-		return []Result{fail(name, "%v", err)}
+		return fail(name, "%v", err)
 	}
 	have := strings.Fields(string(b))
 	if !slices.Contains(have, "memory") || !slices.Contains(have, "pids") {
-		return []Result{fail(name, "a child cgroup of %s offers only %v, not memory and pids", dir, have)}
+		return fail(name, "a child cgroup of %s offers only %v, not memory and pids", dir, have)
 	}
-	return []Result{pass(name, "made a child cgroup of %s with memory and pids", dir)}
+	return pass(name, "made a child cgroup of %s with memory and pids", dir)
 }
 
 // defaultGateway returns the default route's gateway from /proc/net/route.
@@ -654,7 +664,9 @@ func parseGateway(r io.Reader) (string, error) {
 		if err != nil || err2 != nil || flags&unix.RTF_GATEWAY == 0 {
 			continue
 		}
-		return net.IPv4(byte(gw), byte(gw>>8), byte(gw>>16), byte(gw>>24)).String(), nil
+		var octets [4]byte
+		binary.LittleEndian.PutUint32(octets[:], uint32(gw))
+		return netip.AddrFrom4(octets).String(), nil
 	}
 	return "", errors.New("no default route")
 }

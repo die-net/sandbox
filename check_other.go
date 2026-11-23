@@ -10,16 +10,18 @@ import (
 // platformChecks are the checks that need Linux, which are skipped here, and
 // the limits, which nothing here can enforce.
 func platformChecks(*checkEnv) []Result {
-	var res []Result
-	for _, n := range []string{
+	linuxOnly := []string{
 		"proc.no_new_privs", "proc.seccomp", "caps.effective", "caps.permitted", "caps.bounding",
 		"userns.create", "mount.tmpfs", "io_uring.setup", "netfilter.setsockopt", "bpf.load",
 		"nested.umount-cover", "nested.remount-rw", "nested.mount-outside",
 		"sockets.abstract", "cgroup.delegate",
-	} {
+	}
+	limits := []string{"limits.memory", "limits.tasks"}
+	res := make([]Result, 0, len(linuxOnly)+len(limits))
+	for _, n := range linuxOnly {
 		res = append(res, skipped(n, "Linux only"))
 	}
-	for _, n := range []string{"limits.memory", "limits.tasks"} {
+	for _, n := range limits {
 		res = append(res, Result{Name: n, Status: NotEnforceable, Detail: "nothing on this platform can enforce it"})
 	}
 	return res

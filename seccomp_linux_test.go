@@ -36,6 +36,7 @@ func (c call) data() []byte {
 }
 
 func TestSeccompFilter(t *testing.T) {
+	t.Parallel()
 	const (
 		allow       = unix.SECCOMP_RET_ALLOW
 		enosys      = unix.SECCOMP_RET_ERRNO | uint32(unix.ENOSYS)
@@ -157,6 +158,7 @@ func TestSeccompFilter(t *testing.T) {
 // of the process cannot take the filter, which the kernel reports as that
 // thread's id with no errno.
 func TestSeccompUnsyncedThread(t *testing.T) {
+	t.Parallel()
 	// The filter would stay on the test binary if it went on, so it runs
 	// in a process of its own.
 	out, err := exec.CommandContext(t.Context(), "/proc/self/exe", "tsync").CombinedOutput()

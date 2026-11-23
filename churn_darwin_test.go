@@ -35,6 +35,8 @@ func churnBackoff(t *testing.T) {
 // exits at once. It needs a machine with nothing else to do, and takes half a
 // minute, so it runs only with SANDBOX_CHURN=1. The figures are in
 // docs/macos.md, "Process churn".
+//
+//nolint:paralleltest // measures the machine: the clean-scan rate under process churn, which needs a quiet host.
 func TestChurnCleanScanRate(t *testing.T) {
 	if os.Getenv("SANDBOX_CHURN") == "" {
 		t.Skip("set SANDBOX_CHURN=1 to measure")
@@ -47,8 +49,9 @@ func TestChurnCleanScanRate(t *testing.T) {
 	}
 	loopCounts := []int{1, 2, 4, 8, 16}
 	if v := os.Getenv("SANDBOX_CHURN_LOOPS"); v != "" {
-		loopCounts = nil
-		for _, f := range strings.Split(v, ",") {
+		fields := strings.Split(v, ",")
+		loopCounts = make([]int, 0, len(fields))
+		for _, f := range fields {
 			n, err := strconv.Atoi(f)
 			if err != nil {
 				t.Fatalf("SANDBOX_CHURN_LOOPS = %q", v)
@@ -63,7 +66,7 @@ func TestChurnCleanScanRate(t *testing.T) {
 		var cmds []*exec.Cmd
 		outs := make([]*syncBuffer, loops)
 		for i := range loops {
-			cmd := exec.Command("/usr/bin/perl", "-e", loop, strconv.Itoa(secs))
+			cmd := exec.CommandContext(t.Context(), "/usr/bin/perl", "-e", loop, strconv.Itoa(secs)) //nolint:gosec // G204: the test binary or a tool the test names, run as the test's own child.
 			outs[i] = &syncBuffer{}
 			cmd.Stdout = outs[i]
 			if err := cmd.Start(); err != nil {
@@ -113,7 +116,9 @@ func TestChurnCleanScanRate(t *testing.T) {
 		for i, cmd := range cmds {
 			_ = cmd.Wait()
 			var n int
-			fmt.Sscan(outs[i].buf.String(), &n)
+			if _, err := fmt.Sscan(outs[i].buf.String(), &n); err != nil {
+				t.Errorf("the loop count of process %d: %v", i, err)
+			}
 			forks += n
 		}
 		t.Logf("loops=%d: %d forks/s; scans=%d clean=%d (%.1f%%); %d teardowns with a %v budget: mean %.1f scans, most %d, worst %v, gave up %d",
@@ -124,6 +129,8 @@ func TestChurnCleanScanRate(t *testing.T) {
 // TestChurnNormalTeardownLatency measures how long Wait takes for a command that
 // leaves two orphans behind, which the teardown signals in its first scan, on an
 // idle machine and with 4 fork loops running. Run it with SANDBOX_CHURN=1.
+//
+//nolint:paralleltest // measures the machine: teardown latency under process churn, which needs a quiet host.
 func TestChurnNormalTeardownLatency(t *testing.T) {
 	if os.Getenv("SANDBOX_CHURN") == "" {
 		t.Skip("set SANDBOX_CHURN=1 to measure")
@@ -133,14 +140,14 @@ func TestChurnNormalTeardownLatency(t *testing.T) {
 	for _, loops := range []int{0, 4, 16} {
 		var cmds []*exec.Cmd
 		for range loops {
-			cmd := exec.Command("/usr/bin/perl", "-e", loop, "9")
+			cmd := exec.CommandContext(t.Context(), "/usr/bin/perl", "-e", loop, "9")
 			if err := cmd.Start(); err != nil {
 				t.Fatal(err)
 			}
 			cmds = append(cmds, cmd)
 		}
 		time.Sleep(200 * time.Millisecond)
-		var took []time.Duration
+		took := make([]time.Duration, 0, 20)
 		scans, survivors := 0, 0
 		for range 20 {
 			c, err := Command(t.Context(), Spec{Home: realTemp(t), Command: []string{"/bin/sh", "-c", "/bin/sleep 30 & /bin/sleep 30 & exit 0"}})

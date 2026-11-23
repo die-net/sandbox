@@ -147,9 +147,9 @@ func Check(ctx context.Context, spec *Spec, want Expect) ([]Result, error) {
 		return nil, fmt.Errorf("check: %w", err)
 	}
 	defer r.Close()
+	defer w.Close() // on an error path. The success path closes it below, before reading.
 	pr, pw, err := os.Pipe()
 	if err != nil {
-		w.Close()
 		return nil, fmt.Errorf("check: %w", err)
 	}
 	defer pr.Close()
@@ -165,24 +165,24 @@ func Check(ctx context.Context, spec *Spec, want Expect) ([]Result, error) {
 	if spec == nil {
 		exe, err := os.Executable()
 		if err != nil {
-			w.Close()
 			return nil, fmt.Errorf("check: find this binary: %w", err)
 		}
-		cmd := exec.CommandContext(ctx, exe, checkArg)
+		cmd := exec.CommandContext(ctx, exe, checkArg) //nolint:gosec // G204: the check child is this binary, run with a fixed argument.
 		cmd.ExtraFiles = []*os.File{w, pr}
 		cmd.Stderr = &stderr
 		cmd.WaitDelay = netTimeout
 		if err := cmd.Start(); err != nil {
-			w.Close()
 			return nil, fmt.Errorf("check: start the child: %w", err)
 		}
 		wait = cmd.Wait
 	} else if wait, err = startInSandbox(ctx, *spec, w, pr, &stderr); err != nil {
-		w.Close()
 		return nil, fmt.Errorf("check: start the sandbox: %w", err)
 	}
-	w.Close() // the child holds the only write end now
-	pr.Close()
+	// The child holds the only write end now, so the reader sees its end of
+	// file. A close error changes neither, and the deferred closes above
+	// are the same calls on a descriptor that is already closed.
+	w.Close()  //nolint:gosec // G104: see the comment above. Nothing can be done about a failed close.
+	pr.Close() //nolint:gosec // G104: ends the payload writer's blocked write if the child never reads it.
 
 	var results []Result
 	sc := bufio.NewScanner(r)
@@ -269,16 +269,14 @@ func runChecks(e *checkEnv) []Result {
 	groups := make([][]Result, len(genericChecks))
 	var wg sync.WaitGroup
 	for i, fn := range genericChecks {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			defer func() {
 				if p := recover(); p != nil {
 					groups[i] = []Result{{Name: "check.internal", Status: Fail, Detail: fmt.Sprint("check panicked: ", p)}}
 				}
 			}()
 			groups[i] = fn(e)
-		}()
+		})
 	}
 	wg.Wait()
 	return slices.Concat(groups...)
@@ -355,7 +353,7 @@ var secretPaths = []string{"/etc/shadow"}
 // readable reports whether path can be opened for reading, and for a
 // directory listed, which is what covers a home that is only searchable.
 func readable(path string) bool {
-	f, err := os.Open(path)
+	f, err := os.Open(path) //nolint:gosec // G304: the check opens the paths it was asked to probe.
 	if err != nil {
 		return false
 	}
@@ -444,11 +442,17 @@ const (
 	failedOther
 )
 
+// dialTimeout connects to addr, giving up after timeout.
+func dialTimeout(network, addr string, timeout time.Duration) (net.Conn, error) {
+	d := net.Dialer{Timeout: timeout}
+	return d.DialContext(context.Background(), network, addr)
+}
+
 // tryDial connects to addr and closes at once.
 func tryDial(network, addr string, timeout time.Duration) (outcome, string) {
-	c, err := net.DialTimeout(network, addr, timeout)
+	c, err := dialTimeout(network, addr, timeout)
 	if err == nil {
-		c.Close()
+		c.Close() //nolint:gosec // G104: the connection is only a probe, and connecting is the result.
 		return connected, "connected"
 	}
 	var ne net.Error
@@ -462,19 +466,20 @@ func tryDial(network, addr string, timeout time.Duration) (outcome, string) {
 }
 
 // reachResult turns a dial's outcome into a Result, where connecting is a
-// failure. refusedReaches says that a refusal still shows the host answered.
-func reachResult(name, what string, out outcome, detail string, refusedReaches bool) Result {
-	if out == connected || (out == refused && refusedReaches) {
+// failure.
+func reachResult(name, what string, out outcome, detail string) Result {
+	if out == connected {
 		return fail(name, "%s: %s", what, detail)
 	}
 	return pass(name, "%s: %s", what, detail)
 }
 
 func checkEgress(*checkEnv) []Result {
-	var res []Result
 	out, d := tryDial("tcp", "1.1.1.1:443", netTimeout)
-	res = append(res, reachResult("egress.direct-tcp", "TCP to 1.1.1.1:443", out, d, false))
-	return append(res, dnsProbe("egress.direct-udp", "9.9.9.9:53"))
+	return []Result{
+		reachResult("egress.direct-tcp", "TCP to 1.1.1.1:443", out, d),
+		dnsProbe("egress.direct-udp", "9.9.9.9:53"),
+	}
 }
 
 // dnsQuery asks for the root's NS records, which any resolver answers.
@@ -482,12 +487,14 @@ var dnsQuery = []byte{0xbe, 0xef, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 1}
 
 func dnsProbe(name, addr string) Result {
 	what := "UDP DNS query to " + addr
-	c, err := net.DialTimeout("udp", addr, netTimeout)
+	c, err := dialTimeout("udp", addr, netTimeout)
 	if err != nil {
 		return pass(name, "%s: %v", what, err)
 	}
 	defer c.Close()
-	c.SetDeadline(time.Now().Add(netTimeout))
+	if err := c.SetDeadline(time.Now().Add(netTimeout)); err != nil {
+		return pass(name, "%s: %v", what, err)
+	}
 	if _, err := c.Write(dnsQuery); err == nil {
 		var buf [512]byte
 		n, err := c.Read(buf[:])
@@ -503,10 +510,10 @@ func dnsProbe(name, addr string) Result {
 }
 
 func checkMetadata(*checkEnv) []Result {
-	var res []Result
+	res := make([]Result, 0, 2)
 	for _, m := range []struct{ name, addr string }{{"metadata.v4", "169.254.169.254:80"}, {"metadata.v6", "[fd00:ec2::254]:80"}} {
 		out, d := tryDial("tcp", m.addr, netTimeout)
-		res = append(res, reachResult(m.name, "TCP to "+m.addr, out, d, false))
+		res = append(res, reachResult(m.name, "TCP to "+m.addr, out, d))
 	}
 	return res
 }
@@ -522,16 +529,14 @@ func checkLAN(*checkEnv) []Result {
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	for _, p := range ports {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			// A refusal comes from the gateway itself, so it was reached.
 			if out, d := tryDial("tcp", net.JoinHostPort(gw, p), netTimeout); out == connected || out == refused {
 				mu.Lock()
 				worked = append(worked, p+" ("+d+")")
 				mu.Unlock()
 			}
-		}()
+		})
 	}
 	wg.Wait()
 	slices.Sort(worked)
@@ -541,12 +546,14 @@ func checkLAN(*checkEnv) []Result {
 // connectVia asks proxy to CONNECT to target and returns the status code,
 // closing the connection at once.
 func connectVia(proxy, target string) (int, error) {
-	c, err := net.DialTimeout("tcp", proxy, netTimeout)
+	c, err := dialTimeout("tcp", proxy, netTimeout)
 	if err != nil {
 		return 0, err
 	}
 	defer c.Close()
-	c.SetDeadline(time.Now().Add(2 * netTimeout))
+	if err := c.SetDeadline(time.Now().Add(2 * netTimeout)); err != nil {
+		return 0, err
+	}
 	if _, err := fmt.Fprintf(c, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", target, target); err != nil {
 		return 0, err
 	}
@@ -602,9 +609,9 @@ func tryCreate(path string) error {
 		return err
 	}
 	if !fi.IsDir() {
-		f, err := os.OpenFile(path, os.O_WRONLY, 0)
+		f, err := os.OpenFile(path, os.O_WRONLY, 0) //nolint:gosec // G304: the check opens the paths it was asked to probe.
 		if err == nil {
-			f.Close()
+			f.Close() //nolint:gosec // G104: the open worked, which is the result. A failed close changes nothing.
 		}
 		return err
 	}
@@ -613,11 +620,11 @@ func tryCreate(path string) error {
 		return err
 	}
 	name := filepath.Join(path, ".sandbox-check-"+hex.EncodeToString(b[:]))
-	f, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	f, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600) //nolint:gosec // G304: the check creates a file in the directory it was asked to probe.
 	if err != nil {
 		return err
 	}
-	f.Close()
+	f.Close() //nolint:gosec // G104: the create worked, which is the result. The file is removed next either way.
 	return os.Remove(name)
 }
 
@@ -675,11 +682,12 @@ func checkCovers(e *checkEnv) []Result {
 		}
 		var leak string
 		n := 0
-		_ = filepath.WalkDir(c, func(p string, d fs.DirEntry, err error) error {
+		_ = filepath.WalkDir(c, func(p string, _ fs.DirEntry, err error) error {
 			if p == c || err != nil {
 				return nil
 			}
-			if n++; n > coverLimit {
+			n++
+			if n > coverLimit {
 				return fs.SkipAll
 			}
 			if slices.ContainsFunc(shown, func(s string) bool { return under(p, s) }) {
@@ -729,7 +737,7 @@ func checkExpect(e *checkEnv) []Result {
 			res = append(res, dnsLike(name, addr))
 		default:
 			out, d := tryDial(network, addr, netTimeout)
-			res = append(res, reachResult(name, "connect to "+u, out, d, false))
+			res = append(res, reachResult(name, "connect to "+u, out, d))
 		}
 	}
 	return res
@@ -738,13 +746,17 @@ func checkExpect(e *checkEnv) []Result {
 // dnsLike sends a datagram to addr and fails the check if anything comes
 // back. UDP has no handshake, so an answer is the only proof of reach.
 func dnsLike(name, addr string) Result {
-	c, err := net.DialTimeout("udp", addr, netTimeout)
+	c, err := dialTimeout("udp", addr, netTimeout)
 	if err != nil {
 		return pass(name, "udp:%s: %v", addr, err)
 	}
 	defer c.Close()
-	c.SetDeadline(time.Now().Add(netTimeout))
-	c.Write(dnsQuery)
+	if err := c.SetDeadline(time.Now().Add(netTimeout)); err != nil {
+		return pass(name, "udp:%s: %v", addr, err)
+	}
+	if _, err := c.Write(dnsQuery); err != nil {
+		return pass(name, "udp:%s: %v", addr, err)
+	}
 	var buf [512]byte
 	if n, err := c.Read(buf[:]); err == nil {
 		return fail(name, "udp:%s answered with %d bytes", addr, n)

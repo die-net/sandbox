@@ -84,8 +84,8 @@ type builder struct {
 	err error
 }
 
-func (b *builder) line(format string, a ...any) {
-	fmt.Fprintf(b, format+"\n", a...)
+func (b *builder) linef(format string, a ...any) {
+	fmt.Fprintf(&b.Builder, format+"\n", a...)
 }
 
 // q quotes p, or records why not.
@@ -136,45 +136,45 @@ func profile(in profileInput) (string, error) {
 	// pipe, is a syntax error and does not run. sandbox-exec takes a profile cut
 	// between two rules as it is, with the rules after it missing, which can be
 	// every deny that follows an allow (TestProfileCutShortDoesNotRun).
-	b.line("(version 1)")
-	b.line("(begin")
-	b.line("(deny default)")
+	b.linef("(version 1)")
+	b.linef("(begin")
+	b.linef("(deny default)")
 	if in.Marker.In != "" {
 		// First, so that a profile cut short anywhere still carries them (it
 		// does not run: see the wrapper above). A lookup of these names finds no
 		// service, and no rule below names them. They only tell the kernel's
 		// answer for this profile from every other's (member_darwin.go).
-		b.line("; The marker: teardown tells this sandbox's processes by it.")
+		b.linef("; The marker: teardown tells this sandbox's processes by it.")
 		for _, n := range []string{in.Marker.In, in.Marker.Out} {
 			if strings.Trim(n, "abcdefghijklmnopqrstuvwxyz0123456789.-") != "" {
 				return "", fmt.Errorf("marker name %q is not plain", n)
 			}
 		}
-		b.line(`(allow mach-lookup (global-name "%s"))`, in.Marker.In)
-		b.line(`(deny mach-lookup (global-name "%s"))`, in.Marker.Out)
+		b.linef(`(allow mach-lookup (global-name "%s"))`, in.Marker.In)
+		b.linef(`(deny mach-lookup (global-name "%s"))`, in.Marker.Out)
 	}
-	b.line("; Processes stay in the sandbox, and so do the signals they send.")
-	b.line("(allow process-fork)")
-	b.line(`(allow process-exec* (subpath "/"))`)
-	b.line("(allow signal (target same-sandbox))")
+	b.linef("; Processes stay in the sandbox, and so do the signals they send.")
+	b.linef("(allow process-fork)")
+	b.linef(`(allow process-exec* (subpath "/"))`)
+	b.linef("(allow signal (target same-sandbox))")
 	// Under (deny default) process-info is still allowed: proc_pidinfo and
 	// proc_pid_rusage of any process of the uid work, so it is denied by name
 	// first, and then allowed for the sandbox's own processes.
-	b.line("(deny process-info*)")
-	b.line("(allow process-info* (target same-sandbox))")
-	b.line("(allow sysctl-read)")
-	b.line("; The host's files, read-only.")
-	b.line(`(allow file-read* (subpath "/"))`)
+	b.linef("(deny process-info*)")
+	b.linef("(allow process-info* (target same-sandbox))")
+	b.linef("(allow sysctl-read)")
+	b.linef("; The host's files, read-only.")
+	b.linef(`(allow file-read* (subpath "/"))`)
 	// Every device is refused but the few a program uses, so a console, a
 	// serial port, a terminal, packet capture or a disk opens only as a
 	// descriptor handed in. A list of what to refuse missed /dev/console and
 	// /dev/cu.*, which stay openable by their permissions.
-	b.line("; Devices: none but these.")
-	b.line(`(deny file-read* file-write* file-ioctl (subpath "/dev"))`)
-	b.line(`(allow file-read-metadata (literal "/dev") (literal "/dev/fd"))`)
-	b.line(`(allow file-read* (literal "/dev/null") (literal "/dev/zero") (literal "/dev/random") (literal "/dev/urandom"))`)
-	b.line(`(allow file-write* (literal "/dev/null") (literal "/dev/zero"))`)
-	b.line(`(allow file-read* file-write* (regex #"^/dev/fd/[0-9]+$"))`)
+	b.linef("; Devices: none but these.")
+	b.linef(`(deny file-read* file-write* file-ioctl (subpath "/dev"))`)
+	b.linef(`(allow file-read-metadata (literal "/dev") (literal "/dev/fd"))`)
+	b.linef(`(allow file-read* (literal "/dev/null") (literal "/dev/zero") (literal "/dev/random") (literal "/dev/urandom"))`)
+	b.linef(`(allow file-write* (literal "/dev/null") (literal "/dev/zero"))`)
+	b.linef(`(allow file-read* file-write* (regex #"^/dev/fd/[0-9]+$"))`)
 
 	var rules []fileRule
 	for _, c := range in.Cover {
@@ -200,15 +200,15 @@ func profile(in profileInput) (string, error) {
 		}
 		return 0
 	})
-	b.line("; Covers, and what is shown again under them, shallowest first.")
+	b.linef("; Covers, and what is shown again under them, shallowest first.")
 	for _, r := range rules {
 		switch {
 		case r.deny:
-			b.line("(deny file-read* file-write* process-exec* (subpath %s))", b.q(r.path))
+			b.linef("(deny file-read* file-write* process-exec* (subpath %s))", b.q(r.path))
 		case r.write:
-			b.line("(allow file-read* file-write* process-exec* (subpath %s))", b.q(r.path))
+			b.linef("(allow file-read* file-write* process-exec* (subpath %s))", b.q(r.path))
 		default:
-			b.line("(allow file-read* process-exec* (subpath %s))", b.q(r.path))
+			b.linef("(allow file-read* process-exec* (subpath %s))", b.q(r.path))
 		}
 	}
 	// A root cannot be removed, renamed or made again, or the sandbox could
@@ -225,37 +225,37 @@ func profile(in profileInput) (string, error) {
 	roots := slices.Concat([]string{in.Home}, in.Write)
 	slices.Sort(roots)
 	for _, r := range slices.Compact(roots) {
-		b.line("(deny file-write-unlink file-write-create file-link (literal %s))", b.q(r))
+		b.linef("(deny file-write-unlink file-write-create file-link (literal %s))", b.q(r))
 	}
 	if in.Self != "" {
-		b.line("; This binary, for the check child and a command that runs it again.")
-		b.line("(allow file-read* process-exec* (literal %s))", b.q(in.Self))
+		b.linef("; This binary, for the check child and a command that runs it again.")
+		b.linef("(allow file-read* process-exec* (literal %s))", b.q(in.Self))
 	}
 
-	b.line("; The network.")
+	b.linef("; The network.")
 	for _, s := range in.Sockets {
-		b.line("(allow network-outbound (remote unix-socket (path-literal %s)))", b.q(s))
+		b.linef("(allow network-outbound (remote unix-socket (path-literal %s)))", b.q(s))
 	}
 	if in.Network == NetworkHost {
-		b.line(`(allow network-outbound (remote tcp "*:*"))`)
-		b.line(`(allow network-outbound (remote udp "*:*"))`)
-		b.line("(allow network-outbound (remote unix-socket (path-literal %s)))", b.q(mdnsSocket))
-		b.line(`(allow mach-lookup (global-name "com.apple.SystemConfiguration.configd"))`)
-		b.line(`(allow mach-lookup (global-name "com.apple.dnssd.service"))`)
+		b.linef(`(allow network-outbound (remote tcp "*:*"))`)
+		b.linef(`(allow network-outbound (remote udp "*:*"))`)
+		b.linef("(allow network-outbound (remote unix-socket (path-literal %s)))", b.q(mdnsSocket))
+		b.linef(`(allow mach-lookup (global-name "com.apple.SystemConfiguration.configd"))`)
+		b.linef(`(allow mach-lookup (global-name "com.apple.dnssd.service"))`)
 		// Certificate checks, which curl needs from macOS 27.2 on (earlier,
 		// 27.0.1, it verified without).
-		b.line(`(allow mach-lookup (global-name "com.apple.TrustEvaluationAgent"))`)
+		b.linef(`(allow mach-lookup (global-name "com.apple.TrustEvaluationAgent"))`)
 		if !in.BroadLoopback {
 			// "localhost" in a profile means every address the host has, so
 			// this refuses its LAN address too. The same deny after an allow
 			// written as (remote ip "*:*") held for nothing.
-			b.line(`(deny network-outbound (remote ip "localhost:*"))`)
+			b.linef(`(deny network-outbound (remote ip "localhost:*"))`)
 		}
 	}
 	if in.BroadLoopback {
-		b.line(`(allow network-bind (local ip "localhost:*"))`)
-		b.line(`(allow network-inbound (local ip "localhost:*"))`)
-		b.line(`(allow network-outbound (remote ip "localhost:*"))`)
+		b.linef(`(allow network-bind (local ip "localhost:*"))`)
+		b.linef(`(allow network-inbound (local ip "localhost:*"))`)
+		b.linef(`(allow network-outbound (remote ip "localhost:*"))`)
 	}
 	// These are TCP, as the ports are, and not the UDP that "ip" adds. "localhost"
 	// is every address the host has, so a Loopback port may be bound on the
@@ -264,12 +264,12 @@ func profile(in profileInput) (string, error) {
 	// checks a connection's remote address at connect and not at accept, so
 	// there is no rule that limits it to 127.0.0.1 (docs/macos.md, The network).
 	for _, p := range in.Listen {
-		b.line(`(allow network-outbound (remote tcp "localhost:%s"))`, strconv.Itoa(p))
+		b.linef(`(allow network-outbound (remote tcp "localhost:%s"))`, strconv.Itoa(p))
 	}
 	for _, p := range in.Loopback {
-		b.line(`(allow network-bind (local tcp "localhost:%s"))`, strconv.Itoa(p))
-		b.line(`(allow network-inbound (local tcp "localhost:%s"))`, strconv.Itoa(p))
-		b.line(`(allow network-outbound (remote tcp "localhost:%s"))`, strconv.Itoa(p))
+		b.linef(`(allow network-bind (local tcp "localhost:%s"))`, strconv.Itoa(p))
+		b.linef(`(allow network-inbound (local tcp "localhost:%s"))`, strconv.Itoa(p))
+		b.linef(`(allow network-outbound (remote tcp "localhost:%s"))`, strconv.Itoa(p))
 	}
 
 	var done []Service
@@ -282,12 +282,12 @@ func profile(in profileInput) (string, error) {
 		if !ok {
 			return "", fmt.Errorf("unknown service %q", s)
 		}
-		b.line("; Mach services: %s.", string(s))
+		b.linef("; Mach services: %s.", string(s))
 		for _, r := range rules {
-			b.line("%s", r)
+			b.linef("%s", r)
 		}
 	}
-	b.line(")")
+	b.linef(")")
 	if b.err != nil {
 		return "", b.err
 	}

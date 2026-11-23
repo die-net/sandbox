@@ -1,28 +1,29 @@
 package sandbox
 
 import (
-	"os"
+	"fmt"
 	"os/exec"
 	"strings"
 	"testing"
 )
 
-func init() {
+func registerProbeMode() {
 	childModes["probe"] = func([]string) int {
 		rep, err := Probe()
 		if err == nil {
-			os.Stdout.WriteString("probe worked\n")
+			fmt.Println("probe worked")
 			return 0
 		}
-		os.Stdout.WriteString(err.Error() + "\n")
+		fmt.Println(err)
 		for _, c := range rep.Checks {
-			os.Stdout.WriteString(c.Name + ": " + c.Detail + "\n")
+			fmt.Println(c.Name + ": " + c.Detail)
 		}
 		return 1
 	}
 }
 
 func TestProbeDarwin(t *testing.T) {
+	t.Parallel()
 	rep, err := Probe()
 	if err != nil {
 		t.Fatalf("Probe: %v\n%+v", err, rep.Checks)
@@ -87,7 +88,8 @@ func TestProbeDarwin(t *testing.T) {
 // the failed check says to run outside it. (A profile that is allow-default
 // does not stop a second one from being applied, so this one is deny-default.)
 func TestProbeInsideProfile(t *testing.T) {
-	out, err := exec.Command(sandboxExec, "-p", `(version 1)(deny default)(allow process-exec* (subpath "/"))(allow file-read* (subpath "/"))(allow process-fork)(allow sysctl-read)(allow file-write* (literal "/dev/null"))`, self(t), "probe").CombinedOutput()
+	t.Parallel()
+	out, err := exec.CommandContext(t.Context(), sandboxExec, "-p", `(version 1)(deny default)(allow process-exec* (subpath "/"))(allow file-read* (subpath "/"))(allow process-fork)(allow sysctl-read)(allow file-write* (literal "/dev/null"))`, self(t), "probe").CombinedOutput() //nolint:gosec // G204: the test binary or a tool the test names, run as the test's own child.
 	if err == nil {
 		t.Fatalf("Probe worked inside another profile:\n%s", out)
 	}
@@ -100,6 +102,7 @@ func TestProbeInsideProfile(t *testing.T) {
 }
 
 func TestDiagnoseDarwin(t *testing.T) {
+	t.Parallel()
 	res := diagnoseDarwin("missing: stat /usr/bin/sandbox-exec: no such file or directory")
 	if len(res) != 1 || res[0].Status != Fail || !strings.Contains(res[0].Detail, "ships with macOS") {
 		t.Errorf("missing: %+v", res)
@@ -114,6 +117,7 @@ func TestDiagnoseDarwin(t *testing.T) {
 	}
 }
 
+//nolint:paralleltest // uses t.Setenv, which t.Parallel forbids.
 func TestDarwinContext(t *testing.T) {
 	for _, tc := range []struct {
 		env  map[string]string

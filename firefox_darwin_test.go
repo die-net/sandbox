@@ -10,7 +10,8 @@ package sandbox
 import (
 	"bytes"
 	"context"
-	"crypto/md5"
+	"crypto/sha256"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
@@ -20,6 +21,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -66,9 +68,9 @@ func abs(n int) int {
 // readPNG decodes the file, which must exist: a sandbox denial can leave
 // Firefox exiting 0 with no output, which is why the caller checks for the
 // file and not only for the status.
-func readPNG(t *testing.T, path string) (image.Image, [16]byte) {
+func readPNG(t *testing.T, path string) (image.Image, [sha256.Size]byte) {
 	t.Helper()
-	b, err := os.ReadFile(path)
+	b, err := readFile(path)
 	if err != nil {
 		t.Fatalf("no screenshot: %v", err)
 	}
@@ -76,7 +78,7 @@ func readPNG(t *testing.T, path string) (image.Image, [16]byte) {
 	if err != nil {
 		t.Fatalf("the screenshot is not a PNG: %v", err)
 	}
-	return img, md5.Sum(b)
+	return img, sha256.Sum256(b)
 }
 
 // firefoxHome returns a fresh home for a Firefox run. Firefox makes
@@ -86,10 +88,10 @@ func firefoxHome(t *testing.T) string {
 	t.Helper()
 	home := realTemp(t)
 	t.Cleanup(func() {
-		_ = exec.Command("/bin/chmod", "-RN", home).Run()
+		_ = exec.CommandContext(context.Background(), "/bin/chmod", "-RN", home).Run() //nolint:gosec // G204: the test binary or a tool the test names, run as the test's own child.
 		if dir := os.Getenv("SBX_KEEP_DIR"); dir != "" && t.Failed() {
-			if b, err := os.ReadFile(filepath.Join(home, "shot.png")); err == nil {
-				_ = os.WriteFile(filepath.Join(dir, strings.ReplaceAll(t.Name(), "/", "_")+".png"), b, 0o644)
+			if b, err := readFile(filepath.Join(home, "shot.png")); err == nil {
+				_ = os.WriteFile(filepath.Join(dir, strings.ReplaceAll(t.Name(), "/", "_")+".png"), b, 0o600) //nolint:gosec // G703: the test touches only paths it made, or was passed, to see whether a sandbox allows it.
 			}
 		}
 	})
@@ -110,12 +112,16 @@ func serveImage(t *testing.T, l net.Listener, c color.RGBA) *atomic.Int64 {
 		t.Fatal(err)
 	}
 	hits := new(atomic.Int64)
-	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	srv := &http.Server{ReadHeaderTimeout: 10 * time.Second, Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		hits.Add(1)
 		w.Header().Set("Content-Type", "image/png")
 		_, _ = w.Write(buf.Bytes())
 	})}
-	go srv.Serve(l)
+	go func() {
+		if err := srv.Serve(l); !errors.Is(err, http.ErrServerClosed) {
+			t.Errorf("serve the page: %v", err)
+		}
+	}()
 	t.Cleanup(func() { _ = srv.Close() })
 	return hits
 }
@@ -124,6 +130,7 @@ func serveImage(t *testing.T, l net.Listener, c color.RGBA) *atomic.Int64 {
 // network at all, and checks the PNG against an unsandboxed render. The page
 // has a heading in Helvetica and a red box.
 func TestFirefoxScreenshot(t *testing.T) {
+	t.Parallel()
 	if _, err := os.Stat(firefoxApp); err != nil {
 		t.Skip("Firefox is not installed")
 	}
@@ -136,8 +143,8 @@ func TestFirefoxScreenshot(t *testing.T) {
 	baseShot := filepath.Join(base, "shot.png")
 	ctx, cancel := context.WithTimeout(t.Context(), 90*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, firefoxApp, firefoxArgs(base, basePage, baseShot)[1:]...)
-	cmd.Env = append(firefoxEnv[:len(firefoxEnv):len(firefoxEnv)], "HOME="+base, "CFFIXED_USER_HOME="+base, "TMPDIR="+mkdirs(t, base, "tmp"))
+	cmd := exec.CommandContext(ctx, firefoxApp, firefoxArgs(base, basePage, baseShot)[1:]...) //nolint:gosec // G204: the test binary or a tool the test names, run as the test's own child.
+	cmd.Env = slices.Concat(firefoxEnv, []string{"HOME=" + base, "CFFIXED_USER_HOME=" + base, "TMPDIR=" + mkdirs(t, base, "tmp")})
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Skipf("Firefox does not render outside the sandbox either: %v\n%s", err, out)
 	}
@@ -188,10 +195,11 @@ func TestFirefoxScreenshot(t *testing.T) {
 // The first loads and the second does not, as docs/macos.md (M2) records for a
 // hand-written profile.
 func TestFirefoxNetwork(t *testing.T) {
+	t.Parallel()
 	if _, err := os.Stat(firefoxApp); err != nil {
 		t.Skip("Firefox is not installed")
 	}
-	other, err := net.Listen("tcp", "127.0.0.1:0")
+	other, err := listenLocal()
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -34,34 +34,34 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func init() {
+func registerAPIModes() {
 	childModes["self-hello"] = func(args []string) int { fmt.Println("hello from", strings.Join(args, " ")); return 0 }
 	childModes["esc-run"] = escRunMode
 	escChecks["pwd"] = func(e *escT, _ []string) { wd, err := os.Getwd(); e.is("getwd", err); fmt.Println(wd) }
 	escChecks["env"] = func(*escT, []string) { fmt.Println(strings.Join(os.Environ(), "\n")) }
-	escChecks["exit"] = func(e *escT, a []string) { n, _ := strconv.Atoi(a[0]); os.Exit(n) }
+	escChecks["exit"] = func(_ *escT, a []string) { n, _ := strconv.Atoi(a[0]); os.Exit(n) } //nolint:revive // deep-exit: the check exists to end the sandbox's command with a chosen status.
 	escChecks["cat"] = func(*escT, []string) { _, _ = io.Copy(os.Stdout, os.Stdin) }
-	escChecks["both"] = func(*escT, []string) { fmt.Fprint(os.Stdout, "to stdout"); fmt.Fprint(os.Stderr, "to stderr") }
+	escChecks["both"] = func(*escT, []string) { fmt.Print("to stdout"); fmt.Fprint(os.Stderr, "to stderr") }
 	escChecks["fds"] = listFds
 	escChecks["dial-each"] = dialEach
-	escChecks["selfkill"] = func(e *escT, a []string) {
+	escChecks["selfkill"] = func(_ *escT, a []string) {
 		n, _ := strconv.Atoi(a[0])
 		_ = syscall.Kill(os.Getpid(), syscall.Signal(n))
 		time.Sleep(5 * time.Second)
 	}
 	escChecks["spin"] = func(*escT, []string) {
-		for {
+		for { //nolint:revive,staticcheck // empty-block, SA5002: the process spins on purpose, to be a command that never waits.
 		}
 	}
-	escChecks["spin-marker"] = func(e *escT, a []string) {
-		_ = os.WriteFile(a[0], []byte(strconv.Itoa(os.Getpid())), 0o644)
-		for {
+	escChecks["spin-marker"] = func(_ *escT, a []string) {
+		_ = os.WriteFile(a[0], []byte(strconv.Itoa(os.Getpid())), 0o600) //nolint:gosec // G703: the test touches only paths it made, or was passed, to see whether a sandbox allows it.
+		for {                                                            //nolint:revive,staticcheck // empty-block, SA5002: the process spins on purpose, to be a command that never waits.
 		}
 	}
-	escChecks["hold"] = func(e *escT, a []string) {
+	escChecks["hold"] = func(_ *escT, a []string) {
 		// Tell the caller we are running, then wait to be killed.
 		if len(a) > 0 {
-			_ = os.WriteFile(a[0], []byte(strconv.Itoa(os.Getpid())), 0o644)
+			_ = os.WriteFile(a[0], []byte(strconv.Itoa(os.Getpid())), 0o600) //nolint:gosec // G703: the test touches only paths it made, or was passed, to see whether a sandbox allows it.
 		}
 		time.Sleep(time.Minute)
 	}
@@ -92,19 +92,21 @@ func escRunMode(args []string) int {
 // dialEach dials each address in args, and tells it its index.
 func dialEach(e *escT, args []string) {
 	for i, a := range args {
-		c, err := net.DialTimeout("tcp", a, 3*time.Second)
+		c, err := dialTimeout("tcp", a, 3*time.Second)
 		if err != nil {
-			e.fail("dial %s: %v", a, err)
+			e.failf("dial %s: %v", a, err)
 			continue
 		}
-		fmt.Fprintln(c, i)
+		if _, err := fmt.Fprintln(c, i); err != nil {
+			e.failf("tell %s its index: %v", a, err)
+		}
 		_ = c.Close()
 	}
 }
 
 // listFds prints the descriptors open in this process, one per line, as
 // "number kind", where the kind is what fstat says it is.
-func listFds(e *escT, _ []string) {
+func listFds(_ *escT, _ []string) {
 	for fd := range 64 {
 		var st unix.Stat_t
 		if err := unix.Fstat(fd, &st); err != nil {
@@ -129,6 +131,7 @@ func fdKinds(out string) map[int]string {
 }
 
 func TestAPICommandErrors(t *testing.T) {
+	t.Parallel()
 	home := realTemp(t)
 	for _, tc := range []struct {
 		name string
@@ -151,6 +154,7 @@ func TestAPICommandErrors(t *testing.T) {
 		{"unknown service", Spec{Command: []string{"true"}, Home: home, Services: []Service{"fonts"}}, `unknown service "fonts"`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			c, err := Command(t.Context(), tc.spec)
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Errorf("Command = %v, %v, want an error with %q", c, err, tc.want)
@@ -158,10 +162,7 @@ func TestAPICommandErrors(t *testing.T) {
 		})
 	}
 	// A root caller is refused, and so is one that the tests make look like it.
-	old := geteuid
-	geteuid = func() int { return 0 }
-	defer func() { geteuid = old }()
-	if _, err := Command(t.Context(), Spec{Command: []string{"true"}, Home: home}); err == nil || !strings.Contains(err.Error(), "root") {
+	if _, err := commandAs(t.Context(), Spec{Command: []string{"true"}, Home: home}, 0); err == nil || !strings.Contains(err.Error(), "root") {
 		t.Errorf("Command as euid 0 = %v, want a refusal", err)
 	}
 }
@@ -169,6 +170,7 @@ func TestAPICommandErrors(t *testing.T) {
 // TestAPICommandStartsNothingAndCopies checks that Command starts no process,
 // and that the Cmd keeps its own copy of the Spec's slices.
 func TestAPICommandStartsNothingAndCopies(t *testing.T) {
+	t.Parallel()
 	home := realTemp(t)
 	marker := filepath.Join(home, "ran")
 	spec := Spec{Command: []string{"/usr/bin/touch", marker}, Home: home, Write: []string{home}}
@@ -195,6 +197,7 @@ func TestAPICommandStartsNothingAndCopies(t *testing.T) {
 }
 
 func TestAPIStartErrors(t *testing.T) {
+	t.Parallel()
 	home := realTemp(t)
 	link := filepath.Join(realTemp(t), "link")
 	if err := os.Symlink(home, link); err != nil {
@@ -217,6 +220,7 @@ func TestAPIStartErrors(t *testing.T) {
 		{"nested link in a write path", Spec{Command: []string{"/usr/bin/true"}, Home: home, Write: []string{link}}, "leads through a link"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			c, err := Command(t.Context(), tc.spec)
 			if err != nil {
 				t.Fatalf("Command: %v", err)
@@ -231,7 +235,7 @@ func TestAPIStartErrors(t *testing.T) {
 			}
 			// A failed Start leaves nothing running.
 			if err := c.Wait(); err == nil {
-				t.Errorf("Wait after a failed Start succeeded")
+				t.Error("Wait after a failed Start succeeded")
 			}
 		})
 	}
@@ -253,6 +257,7 @@ func TestAPIStartErrors(t *testing.T) {
 }
 
 func TestAPICmdMisuse(t *testing.T) {
+	t.Parallel()
 	c, err := Command(t.Context(), Spec{Command: []string{"/usr/bin/true"}, Home: realTemp(t), Listen: 1, Loopback: 1})
 	if err != nil {
 		t.Fatal(err)
@@ -287,8 +292,10 @@ func TestAPICmdMisuse(t *testing.T) {
 }
 
 func TestAPIStdio(t *testing.T) {
+	t.Parallel()
 	t.Run("readers and writers", func(t *testing.T) {
-		c := escCmd(t, t.Context(), Spec{}, "cat")
+		t.Parallel()
+		c := escCmd(t.Context(), t, Spec{}, "cat")
 		c.Stdin = strings.NewReader("through a pipe")
 		var out bytes.Buffer
 		c.Stdout = &out
@@ -297,36 +304,39 @@ func TestAPIStdio(t *testing.T) {
 		}
 	})
 	t.Run("both streams", func(t *testing.T) {
+		t.Parallel()
 		r := escResult(t, Spec{}, "both")
 		if r.stdout != "to stdout" || r.stderr != "to stderr" {
 			t.Errorf("got %s", r)
 		}
 	})
 	t.Run("files", func(t *testing.T) {
+		t.Parallel()
 		dir := realTemp(t)
 		in := writeFile(t, "from a file", dir, "in")
-		fin, err := os.Open(in)
+		fin, err := openFile(in)
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer fin.Close()
-		fout, err := os.Create(filepath.Join(dir, "out"))
+		fout, err := createFile(filepath.Join(dir, "out"))
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer fout.Close()
-		c := escCmd(t, t.Context(), Spec{}, "cat")
+		c := escCmd(t.Context(), t, Spec{}, "cat")
 		c.Stdin, c.Stdout = fin, fout
 		if r := execute(t, c); r.code != 0 {
 			t.Fatal(r)
 		}
-		if b, _ := os.ReadFile(filepath.Join(dir, "out")); string(b) != "from a file" {
+		if b, _ := readFile(filepath.Join(dir, "out")); string(b) != "from a file" {
 			t.Errorf("out = %q", b)
 		}
 	})
 	t.Run("nil is null", func(t *testing.T) {
+		t.Parallel()
 		// A nil Stdin is /dev/null, so cat sees no input and ends.
-		c := escCmd(t, t.Context(), Spec{}, "cat")
+		c := escCmd(t.Context(), t, Spec{}, "cat")
 		c.Stdout = io.Discard
 		done := make(chan result, 1)
 		go func() { done <- execute(t, c) }()
@@ -344,7 +354,7 @@ func TestAPIStdio(t *testing.T) {
 func TestAPIEnv(t *testing.T) {
 	home := realTemp(t)
 	env := func(set ...string) map[string]string {
-		c := escCmd(t, t.Context(), Spec{Home: home}, "env")
+		c := escCmd(t.Context(), t, Spec{Home: home}, "env")
 		c.Env = append(slices.Clone(set), "NOT_OURS=x")
 		r := execute(t, c)
 		if r.code != 0 {
@@ -371,7 +381,7 @@ func TestAPIEnv(t *testing.T) {
 	}
 	// A nil Env is empty, never the caller's own.
 	t.Setenv("CALLERS_SECRET", "hunter2")
-	c := escCmd(t, t.Context(), Spec{Home: home}, "env")
+	c := escCmd(t.Context(), t, Spec{Home: home}, "env")
 	c.Env = []string{} // execute turns nil into a PATH, so this is the empty one
 	r := execute(t, c)
 	if strings.Contains(r.stdout, "hunter2") || strings.Contains(r.stdout, "CALLERS_SECRET") {
@@ -387,6 +397,7 @@ func TestAPIEnv(t *testing.T) {
 }
 
 func TestAPICommandLookup(t *testing.T) {
+	t.Parallel()
 	home := realTemp(t)
 	// A name with no slash is found on the PATH in Env.
 	c, err := Command(t.Context(), Spec{Command: []string{"cat", "/etc/hosts"}, Home: home})
@@ -421,6 +432,7 @@ func TestAPICommandLookup(t *testing.T) {
 }
 
 func TestAPIWaitStatus(t *testing.T) {
+	t.Parallel()
 	for _, code := range []int{0, 1, 42} {
 		if r := escResult(t, Spec{}, "exit", strconv.Itoa(code)); r.code != code {
 			t.Errorf("exit %d: %s", code, r)
@@ -428,7 +440,7 @@ func TestAPIWaitStatus(t *testing.T) {
 	}
 	// A command ended by a signal has an ExitError that reports it, and
 	// exitStatus turns it into 128 plus the signal, as a shell does.
-	c := escCmd(t, t.Context(), Spec{}, "selfkill", strconv.Itoa(int(syscall.SIGTERM)))
+	c := escCmd(t.Context(), t, Spec{}, "selfkill", strconv.Itoa(int(syscall.SIGTERM)))
 	c.Env = []string{}
 	if err := c.Start(); err != nil {
 		t.Fatal(err)
@@ -441,6 +453,7 @@ func TestAPIWaitStatus(t *testing.T) {
 }
 
 func TestAPIDir(t *testing.T) {
+	t.Parallel()
 	home := realTemp(t)
 	other := mkdirs(t, realTemp(t), "other")
 	if got := strings.TrimSpace(escRun(t, Spec{Home: home}, "pwd")); got != home {
@@ -471,6 +484,7 @@ func TestAPIDir(t *testing.T) {
 // that the command holds no descriptor but those and its three streams, apart
 // from the one pipe that held its profile, which is at end of file.
 func TestAPIFiles(t *testing.T) {
+	t.Parallel()
 	r1, w1, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
@@ -482,7 +496,7 @@ func TestAPIFiles(t *testing.T) {
 	defer r1.Close()
 	defer r2.Close()
 	_ = w2.Close()
-	c := escCmd(t, t.Context(), Spec{Files: []*os.File{w1, r2}}, "fds")
+	c := escCmd(t.Context(), t, Spec{Files: []*os.File{w1, r2}}, "fds")
 	var out bytes.Buffer
 	c.Stdout = &out
 	if err := c.Start(); err != nil {
@@ -515,6 +529,7 @@ func TestAPIFiles(t *testing.T) {
 
 // TestAPIFilesData sends data through a handed-in pipe each way.
 func TestAPIFilesData(t *testing.T) {
+	t.Parallel()
 	r, w, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
@@ -536,8 +551,9 @@ func TestAPIFilesData(t *testing.T) {
 }
 
 func TestAPIListeners(t *testing.T) {
+	t.Parallel()
 	spec := Spec{Home: realTemp(t), Listen: 2}
-	c := escCmd(t, t.Context(), spec, "dial-each")
+	c := escCmd(t.Context(), t, spec, "dial-each")
 	addrs := c.ListenAddrs()
 	if len(addrs) != 2 {
 		t.Fatalf("ListenAddrs = %v, want 2", addrs)
@@ -572,9 +588,7 @@ func TestAPIListeners(t *testing.T) {
 	got := make([]string, 2)
 	var wg sync.WaitGroup
 	for i, l := range ls {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			conn, err := l.Accept()
 			if err != nil {
 				return
@@ -582,7 +596,7 @@ func TestAPIListeners(t *testing.T) {
 			defer conn.Close()
 			line, _ := bufio.NewReader(conn).ReadString('\n')
 			got[i] = strings.TrimSpace(line)
-		}()
+		})
 	}
 	if err := c.Wait(); err != nil {
 		t.Fatal(err)
@@ -599,6 +613,7 @@ func TestAPIListeners(t *testing.T) {
 // TestAPIListenersFreed checks that a Cmd that is never started gives its
 // ports back when ctx ends, and that Start on it then fails.
 func TestAPIListenersFreed(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithCancel(t.Context())
 	c, err := Command(ctx, Spec{Command: []string{"/usr/bin/true"}, Home: realTemp(t), Listen: 1, Loopback: 1})
 	if err != nil {
@@ -606,17 +621,17 @@ func TestAPIListenersFreed(t *testing.T) {
 	}
 	addr := c.ListenAddrs()[0]
 	port := c.LoopbackPorts()[0]
-	if l, err := net.Listen("tcp", addr); err == nil {
-		l.Close()
+	if l, err := listen("tcp", addr); err == nil {
+		l.Close() //nolint:gosec // G104: nothing can be done about a failed close here, and the test is over or has what it needs.
 		t.Fatal("the listener's port was free before ctx ended")
 	}
 	cancel()
 	eventually(t, 5*time.Second, "the unstarted Cmd's ports were not freed", func() bool {
-		l1, err1 := net.Listen("tcp", addr)
-		l2, err2 := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(port))
+		l1, err1 := listen("tcp", addr)
+		l2, err2 := listen("tcp", "127.0.0.1:"+strconv.Itoa(port))
 		for _, l := range []net.Listener{l1, l2} {
 			if l != nil {
-				l.Close()
+				l.Close() //nolint:gosec // G104: nothing can be done about a failed close here, and the test is over or has what it needs.
 			}
 		}
 		return err1 == nil && err2 == nil
@@ -627,6 +642,7 @@ func TestAPIListenersFreed(t *testing.T) {
 }
 
 func TestAPILoopbackPorts(t *testing.T) {
+	t.Parallel()
 	c, err := Command(t.Context(), Spec{Command: []string{"/usr/bin/true"}, Home: realTemp(t), Loopback: 3})
 	if err != nil {
 		t.Fatal(err)
@@ -648,23 +664,24 @@ func TestAPILoopbackPorts(t *testing.T) {
 	}
 	// Start gave the reservations up, so the ports are free to bind.
 	for _, p := range ports {
-		l, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(p))
+		l, err := listen("tcp", "127.0.0.1:"+strconv.Itoa(p))
 		if err != nil {
 			t.Errorf("port %d is still held after Start: %v", p, err)
 			continue
 		}
-		l.Close()
+		l.Close() //nolint:gosec // G104: nothing can be done about a failed close here, and the test is over or has what it needs.
 	}
 }
 
 func TestAPIRun(t *testing.T) {
-	run := func(t *testing.T, spec Spec, wantCode int, wantOut string) string {
+	t.Parallel()
+	run := func(t *testing.T, spec Spec, wantCode int, wantOut string) {
 		t.Helper()
 		if spec.Home == "" {
 			spec.Home = realTemp(t)
 		}
 		body, _ := json.Marshal(spec)
-		cmd := exec.Command(self(t), "esc-run", string(body))
+		cmd := exec.CommandContext(t.Context(), self(t), "esc-run", string(body)) //nolint:gosec // G204: the test binary or a tool the test names, run as the test's own child.
 		cmd.Env = []string{shellPath, "RUN_MARKER=seen"}
 		cmd.Dir = spec.Home
 		var out, errb bytes.Buffer
@@ -680,9 +697,9 @@ func TestAPIRun(t *testing.T) {
 		if code != wantCode || !strings.Contains(out.String(), wantOut) {
 			t.Fatalf("Run: exit %d, want %d, stdout %q should hold %q\nstderr: %s", code, wantCode, out.String(), wantOut, errb.String())
 		}
-		return out.String()
 	}
 	t.Run("status and environment", func(t *testing.T) {
+		t.Parallel()
 		// Run passes its own environment, and runs in its own directory.
 		run(t, Spec{Command: []string{"/usr/bin/env"}}, 0, "RUN_MARKER=seen")
 		run(t, Spec{Command: []string{"/bin/sh", "-c", "exit 7"}}, 7, "")
@@ -690,35 +707,42 @@ func TestAPIRun(t *testing.T) {
 		run(t, Spec{Home: home, Command: []string{"/bin/pwd"}}, 0, home)
 	})
 	t.Run("signal status", func(t *testing.T) {
+		t.Parallel()
 		run(t, Spec{Command: []string{"/bin/sh", "-c", "kill -TERM $$"}}, 128+int(syscall.SIGTERM), "")
 	})
 	t.Run("refuses listeners", func(t *testing.T) {
+		t.Parallel()
 		if _, err := Run(t.Context(), Spec{Command: []string{"/usr/bin/true"}, Home: realTemp(t), Listen: 1}); err == nil || !strings.Contains(err.Error(), "listeners") {
 			t.Errorf("Run with Listen = %v", err)
 		}
 	})
 	t.Run("a bad spec", func(t *testing.T) {
+		t.Parallel()
 		if _, err := Run(t.Context(), Spec{Home: realTemp(t)}); err == nil {
 			t.Error("Run with no command succeeded")
 		}
 	})
 	t.Run("sigterm ends the sandbox", func(t *testing.T) {
+		t.Parallel()
 		home := realTemp(t)
 		marker := filepath.Join(home, "pid")
 		body, _ := json.Marshal(Spec{Home: home, Command: []string{self(t), "esc", "hold", marker}})
-		cmd := exec.Command(self(t), "esc-run", string(body))
+		cmd := exec.CommandContext(t.Context(), self(t), "esc-run", string(body)) //nolint:gosec // G204: the test binary or a tool the test names, run as the test's own child.
 		cmd.Dir = home
 		if err := cmd.Start(); err != nil {
 			t.Fatal(err)
 		}
 		eventually(t, 10*time.Second, "the command did not start", func() bool { _, err := os.Stat(marker); return err == nil })
-		b, _ := os.ReadFile(marker)
+		b, _ := readFile(marker)
 		inner, _ := strconv.Atoi(string(b))
 		_ = cmd.Process.Signal(syscall.SIGTERM)
 		done := make(chan error, 1)
 		go func() { done <- cmd.Wait() }()
 		select {
-		case <-done:
+		case err := <-done:
+			if ee := new(exec.ExitError); err != nil && !errors.As(err, &ee) {
+				t.Errorf("Wait for Run: %v", err)
+			}
 		case <-time.After(10 * time.Second):
 			_ = cmd.Process.Kill()
 			t.Fatal("Run did not end on SIGTERM")
@@ -728,6 +752,7 @@ func TestAPIRun(t *testing.T) {
 }
 
 func TestAPIStage(t *testing.T) {
+	t.Parallel()
 	// The test binary's own arguments are not a stage's.
 	if code, ok := Stage(); ok {
 		t.Errorf("Stage() = %d, true in an ordinary process", code)
@@ -735,6 +760,7 @@ func TestAPIStage(t *testing.T) {
 }
 
 func TestAPIRlimits(t *testing.T) {
+	t.Parallel()
 	// CPU ends a spinning shell with SIGXCPU at the soft limit. A program that
 	// ignores it is not ended by the hard limit on macOS, which
 	// TestGapCPULimitIgnorable shows.
@@ -750,14 +776,14 @@ func TestAPIRlimits(t *testing.T) {
 		t.Errorf("RLIMIT_FSIZE did not hold: %v %v\n%s", fi, err, r)
 	}
 	// NOFILE bounds the descriptors.
-	if r := escResult(t, Spec{Rlimits: []Rlimit{{ResourceOpenFiles, 16, 16}}}, "open-files"); r.code != 0 || !strings.Contains(r.stdout, "EMFILE") {
-		t.Errorf("RLIMIT_NOFILE did not hold: %s", r)
+	if nr := escResult(t, Spec{Rlimits: []Rlimit{{ResourceOpenFiles, 16, 16}}}, "open-files"); nr.code != 0 || !strings.Contains(nr.stdout, "EMFILE") {
+		t.Errorf("RLIMIT_NOFILE did not hold: %s", nr)
 	}
 	// CORE is accepted, and a limit of none is accepted for each resource.
 	for _, res := range []Resource{ResourceCPU, ResourceFileSize, ResourceCore, ResourceOpenFiles, ResourceProcesses} {
 		spec := Spec{Rlimits: []Rlimit{{res, math.MaxUint64, math.MaxUint64}}}
-		if r := sh(t, spec, "true"); r.code != 0 {
-			t.Errorf("a limit of none for resource %d: %s", res, r)
+		if nr := sh(t, spec, "true"); nr.code != 0 {
+			t.Errorf("a limit of none for resource %d: %s", res, nr)
 		}
 	}
 	r = sh(t, Spec{Rlimits: []Rlimit{{ResourceCore, 0, 0}}}, "ulimit -c")
@@ -772,7 +798,7 @@ func TestAPIRlimits(t *testing.T) {
 	}
 	_ = c
 	if cur := getHard(unix.RLIMIT_CPU); cur != unix.RLIM_INFINITY {
-		c, err := Command(t.Context(), Spec{Command: []string{"/usr/bin/true"}, Home: realTemp(t), Rlimits: []Rlimit{{ResourceCPU, 1, uint64(cur) + 1}}})
+		c, err := Command(t.Context(), Spec{Command: []string{"/usr/bin/true"}, Home: realTemp(t), Rlimits: []Rlimit{{ResourceCPU, 1, cur + 1}}})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -790,6 +816,7 @@ func getHard(res int) uint64 {
 }
 
 func TestAPIIgnoredFields(t *testing.T) {
+	t.Parallel()
 	// Hostname, ScratchSize and CgroupFD mean nothing on macOS and are
 	// accepted. Probe lists the Spec's.
 	c, err := Command(t.Context(), Spec{Command: []string{"/usr/bin/true"}, Home: realTemp(t), Hostname: "elsewhere", ScratchSize: 1 << 20})
@@ -815,11 +842,12 @@ func TestAPIIgnoredFields(t *testing.T) {
 }
 
 func TestAPIProcessGroup(t *testing.T) {
+	t.Parallel()
 	// Every process of the command is in one group that is not the caller's,
 	// and in the caller's session. The stage is outside the profile, in the
 	// caller's group.
 	self := unix.Getpgrp()
-	c := escCmd(t, t.Context(), Spec{}, "hold")
+	c := escCmd(t.Context(), t, Spec{}, "hold")
 	if err := c.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -855,16 +883,18 @@ func TestAPIProcessGroup(t *testing.T) {
 }
 
 func TestAPIContextAndWaitDelay(t *testing.T) {
+	t.Parallel()
 	t.Run("cancel kills", func(t *testing.T) {
+		t.Parallel()
 		ctx, cancel := context.WithCancel(t.Context())
 		home := realTemp(t)
 		marker := filepath.Join(home, "pid")
-		c := escCmd(t, ctx, Spec{Home: home}, "hold", marker)
+		c := escCmd(ctx, t, Spec{Home: home}, "hold", marker)
 		if err := c.Start(); err != nil {
 			t.Fatal(err)
 		}
 		eventually(t, 10*time.Second, "no start", func() bool { _, err := os.Stat(marker); return err == nil })
-		b, _ := os.ReadFile(marker)
+		b, _ := readFile(marker)
 		inner, _ := strconv.Atoi(string(b))
 		cancel()
 		done := make(chan error, 1)
@@ -880,8 +910,9 @@ func TestAPIContextAndWaitDelay(t *testing.T) {
 		eventually(t, 5*time.Second, "the command outlived the cancel", func() bool { return !alive(inner) })
 	})
 	t.Run("a context that is already done", func(t *testing.T) {
+		t.Parallel()
 		ctx, cancel := context.WithCancel(t.Context())
-		c := escCmd(t, ctx, Spec{}, "hold")
+		c := escCmd(ctx, t, Spec{}, "hold")
 		cancel()
 		time.Sleep(50 * time.Millisecond)
 		if err := c.Start(); err == nil {
@@ -890,6 +921,7 @@ func TestAPIContextAndWaitDelay(t *testing.T) {
 		}
 	})
 	t.Run("wait delay", func(t *testing.T) {
+		t.Parallel()
 		// A background process that keeps the output pipe open after the
 		// command exits holds Wait up until WaitDelay, as with os/exec. It is
 		// then ended by the group kill, so it is not left behind.
@@ -928,7 +960,8 @@ func (b *syncBuffer) Write(p []byte) (int, error) {
 }
 
 func TestAPIPid(t *testing.T) {
-	c := escCmd(t, t.Context(), Spec{}, "hold")
+	t.Parallel()
+	c := escCmd(t.Context(), t, Spec{}, "hold")
 	if err := c.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -961,6 +994,7 @@ func unixPpid(pid int) int {
 }
 
 func TestAPISelfPath(t *testing.T) {
+	t.Parallel()
 	if SelfPath != self(t) {
 		t.Errorf("SelfPath = %q, want %q", SelfPath, self(t))
 	}
@@ -979,9 +1013,10 @@ func TestAPISelfPath(t *testing.T) {
 // started it, since a Go server's threads come and go, and Pdeathsig would
 // have killed it with the thread.
 func TestAPIStartThreadExits(t *testing.T) {
+	t.Parallel()
 	home := realTemp(t)
 	marker := filepath.Join(home, "pid")
-	c := escCmd(t, t.Context(), Spec{Home: home}, "hold", marker)
+	c := escCmd(t.Context(), t, Spec{Home: home}, "hold", marker)
 	started := make(chan error, 1)
 	go func() {
 		// A locked goroutine that returns ends its thread.
@@ -992,7 +1027,7 @@ func TestAPIStartThreadExits(t *testing.T) {
 		t.Fatal(err)
 	}
 	eventually(t, 10*time.Second, "no start", func() bool { _, err := os.Stat(marker); return err == nil })
-	b, _ := os.ReadFile(marker)
+	b, _ := readFile(marker)
 	inner, _ := strconv.Atoi(string(b))
 	for range 20 {
 		runtime.GC()
@@ -1007,13 +1042,12 @@ func TestAPIStartThreadExits(t *testing.T) {
 }
 
 func TestAPIConcurrent(t *testing.T) {
+	t.Parallel()
 	const n = 8
 	var wg sync.WaitGroup
 	errs := make(chan string, n)
 	for i := range n {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			home := realTemp(t)
 			c, err := Command(t.Context(), Spec{Command: []string{"/bin/sh", "-c", fmt.Sprintf("echo %d > f && cat f", i)}, Home: home})
 			if err != nil {
@@ -1030,7 +1064,7 @@ func TestAPIConcurrent(t *testing.T) {
 			if err := c.Wait(); err != nil || out.String() != fmt.Sprintf("%d\n", i) {
 				errs <- fmt.Sprintf("sandbox %d: %v %q", i, err, out.String())
 			}
-		}()
+		})
 	}
 	wg.Wait()
 	close(errs)
@@ -1040,6 +1074,7 @@ func TestAPIConcurrent(t *testing.T) {
 }
 
 func TestAPIServices(t *testing.T) {
+	t.Parallel()
 	// Without ServiceDirectory a lookup of the account finds nothing, with it
 	// the name comes back.
 	me := os.Getenv("USER")
@@ -1059,7 +1094,8 @@ func TestAPIServices(t *testing.T) {
 }
 
 func TestAPIFootprint(t *testing.T) {
-	c := escCmd(t, t.Context(), Spec{}, "alloc", "200")
+	t.Parallel()
+	c := escCmd(t.Context(), t, Spec{}, "alloc", "200")
 	r, w, _ := os.Pipe()
 	c.Stdout = w
 	if err := c.Start(); err != nil {
@@ -1084,7 +1120,7 @@ func TestAPIFootprint(t *testing.T) {
 	}
 }
 
-func init() {
+func registerAPIResourceChecks() {
 	escChecks["open-files"] = func(e *escT, _ []string) {
 		var files []*os.File
 		for {
@@ -1095,12 +1131,12 @@ func init() {
 			}
 			files = append(files, f)
 			if len(files) > 1000 {
-				e.fail("opened %d files under a limit of 16", len(files))
+				e.failf("opened %d files under a limit of 16", len(files))
 				return
 			}
 		}
 	}
-	escChecks["alloc"] = func(e *escT, a []string) {
+	escChecks["alloc"] = func(_ *escT, a []string) {
 		mb, _ := strconv.Atoi(a[0])
 		buf := make([]byte, mb<<20)
 		for i := 0; i < len(buf); i += 4096 {
@@ -1119,13 +1155,15 @@ func init() {
 // the caller's scan, stands for a chain that kept ahead of the scan until the
 // budget ran out.
 func TestAPIErrSurvivors(t *testing.T) {
-	defer func(b time.Duration) { teardownBudget = b }(teardownBudget)
+	t.Parallel()
 	wait := func(budget time.Duration, script string) error {
-		teardownBudget = budget
-		unprovable(t, budget == 0)
 		c, err := Command(t.Context(), Spec{Home: realTemp(t), Command: []string{"/bin/sh", "-c", script}})
 		if err != nil {
 			t.Fatal(err)
+		}
+		c.run.budget = budget
+		if budget == 0 {
+			unprovable(c)
 		}
 		c.Env = []string{shellPath}
 		if err := c.Start(); err != nil {

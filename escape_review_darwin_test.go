@@ -15,6 +15,7 @@ package sandbox
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -32,13 +33,13 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func init() {
+func registerReviewChecks() {
 	escChecks["stat-denied"] = func(e *escT, args []string) {
 		for _, p := range args {
-			if _, err := os.Lstat(p); err == nil {
-				e.fail("stat %s: worked", p)
+			if _, err := os.Lstat(p); err == nil { //nolint:gosec // G703: the path is an argument the test passed to this child, whose job is to try it.
+				e.failf("stat %s: worked", p)
 			} else if !isPerm(err) {
-				e.fail("stat %s: %v, want a refusal by the profile", p, err)
+				e.failf("stat %s: %v, want a refusal by the profile", p, err)
 			}
 		}
 	}
@@ -69,29 +70,29 @@ func escLeave(e *escT, args []string) {
 	case "self-join":
 		pg, err := unix.Getpgid(os.Getppid())
 		if err != nil {
-			e.fail("getpgid(parent): %v", err)
+			e.failf("getpgid(parent): %v", err)
 			return
 		}
 		if err := unix.Setpgid(0, pg); err != nil {
-			e.fail("setpgid(0, the caller's group): %v", err)
+			e.failf("setpgid(0, the caller's group): %v", err)
 			return
 		}
-		_ = os.WriteFile(pidfile, []byte(strconv.Itoa(os.Getpid())), 0o644)
+		_ = os.WriteFile(pidfile, []byte(strconv.Itoa(os.Getpid())), 0o600) //nolint:gosec // G703: the test touches only paths it made, or was passed, to see whether a sandbox allows it.
 		escChecks["alloc"](e, []string{mb})
 	case "setpgid", "setsid":
-		cmd := exec.Command(self1(), "esc", "alloc", mb)
+		cmd := exec.CommandContext(context.Background(), self1(), "esc", "alloc", mb) //nolint:gosec // G204: the test binary or a tool the test names, run as the test's own child.
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: how == "setpgid", Setsid: how == "setsid"}
 		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 		if err := cmd.Start(); err != nil {
-			e.fail("start the escapee: %v", err)
+			e.failf("start the escapee: %v", err)
 			return
 		}
-		_ = os.WriteFile(pidfile, []byte(strconv.Itoa(cmd.Process.Pid)), 0o644)
+		_ = os.WriteFile(pidfile, []byte(strconv.Itoa(cmd.Process.Pid)), 0o600) //nolint:gosec // G703: the test touches only paths it made, or was passed, to see whether a sandbox allows it.
 		if !exit {
 			time.Sleep(time.Minute)
 		}
 	default:
-		e.fail("no way out called %q", how)
+		e.failf("no way out called %q", how)
 	}
 }
 
@@ -100,7 +101,7 @@ func readPid(t *testing.T, path string) int {
 	t.Helper()
 	var pid int
 	eventually(t, 10*time.Second, "no pid in "+path, func() bool {
-		b, err := os.ReadFile(path)
+		b, err := readFile(path)
 		if err != nil {
 			return false
 		}
@@ -139,6 +140,7 @@ func waitWithin(t *testing.T, c *Cmd, d time.Duration) error {
 // writer that is not a file, so a survivor would keep Wait from returning. They
 // are all ended, and Wait comes back at once.
 func TestEscapeSetpgidAndJobControl(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name string
 		cmd  func(home string) []string
@@ -154,6 +156,7 @@ func TestEscapeSetpgidAndJobControl(t *testing.T) {
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			home := realTemp(t)
 			c, err := Command(t.Context(), Spec{Home: home, Command: tc.cmd(home)})
 			if err != nil {
@@ -183,11 +186,13 @@ func TestEscapeSetpgidAndJobControl(t *testing.T) {
 // from Footprint ("no process of the sandbox is left") while it ran. Both are
 // counted, and both end with the sandbox.
 func TestEscapeFootprintCountsEscapees(t *testing.T) {
+	t.Parallel()
 	for _, how := range []string{"setpgid", "setsid", "self-join"} {
 		t.Run(how, func(t *testing.T) {
+			t.Parallel()
 			home := realTemp(t)
 			pidfile := filepath.Join(home, "pid")
-			c := escCmd(t, t.Context(), Spec{Home: home}, "leave", how, pidfile, "150")
+			c := escCmd(t.Context(), t, Spec{Home: home}, "leave", how, pidfile, "150")
 			if err := c.Start(); err != nil {
 				t.Fatal(err)
 			}
@@ -217,9 +222,10 @@ func TestEscapeFootprintCountsEscapees(t *testing.T) {
 // process the command left behind in a group of its own holds the output pipe.
 // Wait still returns, and ends the process.
 func TestEscapeStageKilledEscapeeHoldsOutput(t *testing.T) {
+	t.Parallel()
 	home := realTemp(t)
 	pidfile := filepath.Join(home, "pid")
-	c := escCmd(t, t.Context(), Spec{Home: home}, "leave", "setpgid", pidfile, "1")
+	c := escCmd(t.Context(), t, Spec{Home: home}, "leave", "setpgid", pidfile, "1")
 	c.Stdout = &syncBuffer{}
 	if err := c.Start(); err != nil {
 		t.Fatal(err)
@@ -238,10 +244,11 @@ func TestEscapeStageKilledEscapeeHoldsOutput(t *testing.T) {
 // ends a process that left the group too, since the stage finds it by the
 // profile and not by the group.
 func TestEscapeParentKilledEndsEscapees(t *testing.T) {
+	t.Parallel()
 	home := realTemp(t)
 	pidfile := filepath.Join(home, "pid")
 	body := jsonArg(t, Spec{Home: home, Command: []string{self(t), "esc", "leave", "setpgid", pidfile, "1"}})
-	parent := exec.Command(self(t), "esc-parent", body)
+	parent := exec.CommandContext(t.Context(), self(t), "esc-parent", body) //nolint:gosec // G204: the test binary or a tool the test names, run as the test's own child.
 	if err := parent.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -257,10 +264,11 @@ func TestEscapeParentKilledEndsEscapees(t *testing.T) {
 // including a CPU limit's SIGXCPU, which it could ignore, so that is not what
 // ends it.
 func TestEscapeSetsidDiesWithTeardown(t *testing.T) {
+	t.Parallel()
 	home := realTemp(t)
 	secret := hostSecret(t)
 	log := filepath.Join(home, "log")
-	c := escCmd(t, t.Context(), Spec{Home: home, Rlimits: []Rlimit{{ResourceCPU, 600, 600}}}, "daemon", log, secret, "/etc/hosts")
+	c := escCmd(t.Context(), t, Spec{Home: home, Rlimits: []Rlimit{{ResourceCPU, 600, 600}}}, "daemon", log, secret, "/etc/hosts")
 	var out bytes.Buffer
 	c.Stdout = &out
 	if err := c.Start(); err != nil {
@@ -276,7 +284,7 @@ func TestEscapeSetsidDiesWithTeardown(t *testing.T) {
 	}
 	eventually(t, 5*time.Second, "the process that made its own session outlived the sandbox", func() bool { return !alive(pid) })
 	// And while it ran it saw nothing but /etc/hosts and reached no network.
-	b, _ := os.ReadFile(log)
+	b, _ := readFile(log)
 	for _, line := range strings.Split(strings.TrimSpace(string(b)), "\n") {
 		if line != "" && !strings.Contains(line, "worked=[/etc/hosts]") {
 			t.Errorf("the daemon reached more than /etc/hosts: %q", line)
@@ -293,8 +301,9 @@ func TestEscapeSetsidDiesWithTeardown(t *testing.T) {
 // names, and one in another sandbox of this package are all passed over, and
 // every process of the sandbox is found, whatever its group or parent.
 func TestMarkerNamesOnlyItsSandbox(t *testing.T) {
+	t.Parallel()
 	startHold := func(home string) *Cmd {
-		c := escCmd(t, t.Context(), Spec{Home: home}, "leave", "setpgid", filepath.Join(home, "pid"), "1")
+		c := escCmd(t.Context(), t, Spec{Home: home}, "leave", "setpgid", filepath.Join(home, "pid"), "1")
 		if err := c.Start(); err != nil {
 			t.Fatal(err)
 		}
@@ -311,7 +320,7 @@ func TestMarkerNamesOnlyItsSandbox(t *testing.T) {
 		t.Fatal(err)
 	}
 	run := func(args ...string) int {
-		cmd := exec.Command(args[0], args[1:]...)
+		cmd := exec.CommandContext(t.Context(), args[0], args[1:]...) //nolint:gosec // G204: the test binary or a tool the test names, run as the test's own child.
 		if err := cmd.Start(); err != nil {
 			t.Fatal(err)
 		}
@@ -362,6 +371,7 @@ func TestMarkerNamesOnlyItsSandbox(t *testing.T) {
 // Row: "Seatbelt profile": a profile with a marker allows one lookup and denies the
 // other, and a profile with none has neither rule.
 func TestProfileMarker(t *testing.T) {
+	t.Parallel()
 	m, err := newMarker()
 	if err != nil {
 		t.Fatal(err)
@@ -398,6 +408,7 @@ func TestProfileMarker(t *testing.T) {
 // there. Every way of removing, renaming, and renaming over a root is refused,
 // the root is intact afterwards, and the sandbox still writes inside it.
 func TestEscapeRootsCannotBeSwapped(t *testing.T) {
+	t.Parallel()
 	base := realTemp(t)
 	home := mkdirs(t, base, "home")
 	w := mkdirs(t, base, "w")
@@ -410,7 +421,7 @@ func TestEscapeRootsCannotBeSwapped(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(short) })
 	sock := filepath.Join(short, "b.sock")
-	l, err := net.Listen("unix", sock)
+	l, err := listen("unix", sock)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -458,7 +469,7 @@ echo "$worked"
 	if fi, err := os.Lstat(sock); err != nil || fi.Mode()&os.ModeSocket == 0 {
 		t.Errorf("the socket is now %v, %v", fi, err)
 	}
-	if b, err := os.ReadFile(filepath.Join(home, "out.png")); err == nil {
+	if b, err := readFile(filepath.Join(home, "out.png")); err == nil {
 		t.Errorf("the caller reads %q from Home, which now leads to its private directory", b)
 	}
 	for _, p := range []string{home + ".moved", w + ".moved", sock + ".moved"} {
@@ -471,6 +482,7 @@ echo "$worked"
 // ------------------------------------------------------------------ firmlinks
 
 func TestCanonicalName(t *testing.T) {
+	t.Parallel()
 	for in, want := range map[string]string{
 		"/System/Volumes/Data/Users/a/b":                "/Users/a/b",
 		"/System/Volumes/Data/private/var/folders/x":    "/private/var/folders/x",
@@ -498,6 +510,7 @@ func TestCanonicalName(t *testing.T) {
 // Cover written that way covered nothing, silently. Start maps the name, and
 // both spellings of a Cover hide the same files, and of a Read show them.
 func TestEscapeFirmlinkNames(t *testing.T) {
+	t.Parallel()
 	root := realTemp(t) // under /private/var, which is a firmlink
 	if !strings.HasPrefix(root, "/private/var/") {
 		t.Skipf("the temporary directory %s is not under /private/var", root)
@@ -512,6 +525,7 @@ func TestEscapeFirmlinkNames(t *testing.T) {
 		{"both by the data volume name", dataVolume, dataVolume},
 	} {
 		t.Run(sp.name, func(t *testing.T) {
+			t.Parallel()
 			dir := realTemp(t)
 			shown := mkdirs(t, dir, "shown")
 			hidden := mkdirs(t, shown, "hidden")
@@ -554,11 +568,13 @@ func canaryIOMode(args []string) int {
 	dir := args[0]
 	sigs := make(chan os.Signal, 8)
 	signal.Notify(sigs, syscall.SIGIO)
-	_ = os.WriteFile(filepath.Join(dir, "ready"), nil, 0o644)
+	_ = os.WriteFile(filepath.Join(dir, "ready"), nil, 0o600) //nolint:gosec // G703: the test touches only paths it made, or was passed, to see whether a sandbox allows it.
 	for s := range sigs {
-		f, err := os.OpenFile(filepath.Join(dir, "got"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+		f, err := openFileFlags(filepath.Join(dir, "got"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 		if err == nil {
-			fmt.Fprintln(f, s)
+			if _, err := fmt.Fprintln(f, s); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+			}
 			_ = f.Close()
 		}
 	}
@@ -571,17 +587,17 @@ func escSetOwner(e *escT, args []string) {
 	pid, _ := strconv.Atoi(args[0])
 	p, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
 	if err != nil {
-		e.fail("socketpair: %v", err)
+		e.failf("socketpair: %v", err)
 		return
 	}
 	for _, fd := range p {
 		if _, err := unix.FcntlInt(uintptr(fd), unix.F_SETOWN, pid); err != nil {
-			e.fail("F_SETOWN: %v", err)
+			e.failf("F_SETOWN: %v", err)
 			return
 		}
 		fl, _ := unix.FcntlInt(uintptr(fd), unix.F_GETFL, 0)
 		if _, err := unix.FcntlInt(uintptr(fd), unix.F_SETFL, fl|unix.O_ASYNC); err != nil {
-			e.fail("O_ASYNC: %v", err)
+			e.failf("O_ASYNC: %v", err)
 			return
 		}
 	}
@@ -598,8 +614,9 @@ func escSetOwner(e *escT, args []string) {
 // SIGIO's default action is to ignore it, so a program is hurt only if it
 // handles it. The test fails if the gap closes, so the docs change.
 func TestGapSetOwnSignalsOutside(t *testing.T) {
+	t.Parallel()
 	dir := realTemp(t)
-	cmd := exec.Command(self(t), "canary-io", dir)
+	cmd := exec.CommandContext(t.Context(), self(t), "canary-io", dir) //nolint:gosec // G204: the test binary or a tool the test names, run as the test's own child.
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -617,8 +634,9 @@ func TestGapSetOwnSignalsOutside(t *testing.T) {
 // inspect another's processes, the command or its stage, any more than the
 // caller's. Both are of the same uid and in no process group of each other's.
 func TestEscapeOneSandboxCannotSignalAnother(t *testing.T) {
+	t.Parallel()
 	homeA := realTemp(t)
-	a := escCmd(t, t.Context(), Spec{Home: homeA}, "hold", filepath.Join(homeA, "pid"))
+	a := escCmd(t.Context(), t, Spec{Home: homeA}, "hold", filepath.Join(homeA, "pid"))
 	if err := a.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -647,14 +665,14 @@ func escBindAddrs(e *escT, args []string) {
 		must := !strings.HasSuffix(a, "!")
 		a = strings.TrimSuffix(a, "!")
 		network, addr, _ := strings.Cut(a, ":")
-		l, err := net.Listen(network, addr)
+		l, err := listen(network, addr)
 		switch {
 		case err == nil && !must:
-			e.fail("bind %s: worked", a)
+			e.failf("bind %s: worked", a)
 		case err != nil && must:
-			e.fail("bind %s: %v", a, err)
+			e.failf("bind %s: %v", a, err)
 		case err != nil && !isPerm(err):
-			e.fail("bind %s: %v, want a refusal by the profile", a, err)
+			e.failf("bind %s: %v, want a refusal by the profile", a, err)
 		}
 		if l != nil {
 			_ = l.Close()
@@ -667,18 +685,18 @@ func escBindAddrs(e *escT, args []string) {
 func escUDPBind(e *escT, args []string) {
 	for _, p := range args {
 		for _, host := range []string{"127.0.0.1", ""} {
-			c, err := net.ListenPacket("udp", net.JoinHostPort(host, p))
+			c, err := listenPacket("udp", net.JoinHostPort(host, p))
 			if err == nil {
-				e.fail("udp bind %s:%s: worked", host, p)
+				e.failf("udp bind %s:%s: worked", host, p)
 				_ = c.Close()
 			} else if !isPerm(err) {
-				e.fail("udp bind %s:%s: %v, want a refusal", host, p, err)
+				e.failf("udp bind %s:%s: %v, want a refusal", host, p, err)
 			}
 		}
-		c, err := net.Dial("udp", "127.0.0.1:"+p)
+		c, err := dialTimeout("udp", "127.0.0.1:"+p, 5*time.Second)
 		if err == nil {
 			if _, err := c.Write([]byte("x")); err == nil {
-				e.fail("udp send to 127.0.0.1:%s: worked", p)
+				e.failf("udp send to 127.0.0.1:%s: worked", p)
 			}
 			_ = c.Close()
 		}
@@ -690,7 +708,8 @@ func escUDPBind(e *escT, args []string) {
 // beside it are refused on every address, not only 127.0.0.1: the wildcard, the
 // LAN address and ::1 as well. The given ports themselves bind on 127.0.0.1.
 func TestEscapeLoopbackPortsAllAddresses(t *testing.T) {
-	c := escCmd(t, t.Context(), Spec{Loopback: 2}, "bind-addrs")
+	t.Parallel()
+	c := escCmd(t.Context(), t, Spec{Loopback: 2}, "bind-addrs")
 	ports := c.LoopbackPorts()
 	p0, p1 := strconv.Itoa(ports[0]), strconv.Itoa(ports[1])
 	other := listenAny(t) // a port in use outside, which the sandbox is not given
@@ -710,7 +729,7 @@ func TestEscapeLoopbackPortsAllAddresses(t *testing.T) {
 		t.Errorf("%s", r)
 	}
 	// UDP on the given ports is refused.
-	c2 := escCmd(t, t.Context(), Spec{Loopback: 1}, "udp-bind")
+	c2 := escCmd(t.Context(), t, Spec{Loopback: 1}, "udp-bind")
 	port := strconv.Itoa(c2.LoopbackPorts()[0])
 	c2.spec.Command = []string{self(t), "esc", "udp-bind", port}
 	if r := execute(t, c2); r.code != 0 {
@@ -718,7 +737,7 @@ func TestEscapeLoopbackPortsAllAddresses(t *testing.T) {
 	}
 	// A process outside reaches a port the sandbox serves: there is no private
 	// loopback, and the sandbox's server is for whoever connects.
-	c3 := escCmd(t, t.Context(), Spec{Loopback: 1}, "serve-one")
+	c3 := escCmd(t.Context(), t, Spec{Loopback: 1}, "serve-one")
 	port3 := c3.LoopbackPorts()[0]
 	c3.spec.Command = []string{self(t), "esc", "serve-one", strconv.Itoa(port3)}
 	var out syncBuffer
@@ -729,7 +748,7 @@ func TestEscapeLoopbackPortsAllAddresses(t *testing.T) {
 	}
 	endAtCleanup(t, c3)
 	eventually(t, 10*time.Second, "the sandbox's server did not answer a process outside", func() bool {
-		conn, err := net.DialTimeout("tcp", "127.0.0.1:"+strconv.Itoa(port3), time.Second)
+		conn, err := dialTimeout("tcp", "127.0.0.1:"+strconv.Itoa(port3), time.Second)
 		if err != nil {
 			return false
 		}
@@ -741,13 +760,13 @@ func TestEscapeLoopbackPortsAllAddresses(t *testing.T) {
 	_ = c3.Wait()
 }
 
-func init() {
+func registerServeChecks() {
 	// serve-one binds the port in args[0] on 127.0.0.1 and says hello to every
 	// connection until it is ended.
 	escChecks["serve-one"] = func(e *escT, args []string) {
-		l, err := net.Listen("tcp", "127.0.0.1:"+args[0])
+		l, err := listen("tcp", "127.0.0.1:"+args[0])
 		if err != nil {
-			e.fail("listen: %v", err)
+			e.failf("listen: %v", err)
 			return
 		}
 		for {
@@ -763,9 +782,9 @@ func init() {
 	// prints who it came from. A connection from nowhere ends it after args[1]
 	// seconds.
 	escChecks["serve-addr"] = func(e *escT, args []string) {
-		l, err := net.Listen("tcp", args[0])
+		l, err := listen("tcp", args[0])
 		if err != nil {
-			e.fail("listen %s: %v", args[0], err)
+			e.failf("listen %s: %v", args[0], err)
 			return
 		}
 		secs, _ := strconv.Atoi(args[1])
@@ -773,7 +792,7 @@ func init() {
 		_ = l.(*net.TCPListener).SetDeadline(time.Now().Add(time.Duration(secs) * time.Second))
 		c, err := l.Accept()
 		if err != nil {
-			e.fail("accept: %v", err)
+			e.failf("accept: %v", err)
 			return
 		}
 		fmt.Println("accepted", c.RemoteAddr(), "on", c.LocalAddr())
@@ -793,11 +812,12 @@ func init() {
 // machine cannot be had: the Linux test host has no route to
 // this Mac (its connections to any port time out with no sandbox at all).
 func TestGapLoopbackBindsLANAddress(t *testing.T) {
+	t.Parallel()
 	lan := lanAddr()
 	if lan == "" {
 		t.Skip("this host has no LAN address")
 	}
-	c := escCmd(t, t.Context(), Spec{Loopback: 1}, "serve-addr")
+	c := escCmd(t.Context(), t, Spec{Loopback: 1}, "serve-addr")
 	port := strconv.Itoa(c.LoopbackPorts()[0])
 	c.spec.Command = []string{self(t), "esc", "serve-addr", net.JoinHostPort(lan, port), "8"}
 	var out syncBuffer
@@ -810,7 +830,7 @@ func TestGapLoopbackBindsLANAddress(t *testing.T) {
 	var conn net.Conn
 	eventually(t, 10*time.Second, "the LAN address was refused: the gap closed, so change the docs", func() bool {
 		var err error
-		conn, err = net.DialTimeout("tcp", net.JoinHostPort(lan, port), time.Second)
+		conn, err = dialTimeout("tcp", net.JoinHostPort(lan, port), time.Second)
 		return err == nil
 	})
 	_ = conn.Close()
@@ -830,10 +850,11 @@ func TestGapLoopbackBindsLANAddress(t *testing.T) {
 // secret in its environment. The test is a caller of its own with a token in
 // its environment, which starts a sandbox with an empty one.
 func TestGapCallerEnvironmentReadable(t *testing.T) {
+	t.Parallel()
 	home := realTemp(t)
 	token := "SANDBOX_CALLER_TOKEN=caller-secret-" + strconv.Itoa(os.Getpid())
 	body := jsonArg(t, Spec{Home: home, Command: []string{self(t), "esc", "procargs-parent", token}})
-	parent := exec.Command(self(t), "esc-parent", body)
+	parent := exec.CommandContext(t.Context(), self(t), "esc-parent", body) //nolint:gosec // G204: the test binary or a tool the test names, run as the test's own child.
 	parent.Env = []string{token, shellPath}
 	var stderr syncBuffer
 	parent.Stderr = &stderr
@@ -844,23 +865,24 @@ func TestGapCallerEnvironmentReadable(t *testing.T) {
 	}
 }
 
-func init() {
+func registerProcargsParent() {
 	// procargs-parent reads the environment of the stage's parent, the caller
 	// of the sandbox, which holds args[0] and was handed the sandbox no
 	// environment of its own.
 	escChecks["procargs-parent"] = func(e *escT, args []string) {
 		if os.Getenv("SANDBOX_CALLER_TOKEN") != "" {
-			e.fail("the sandbox's own environment holds the token")
+			e.failf("the sandbox's own environment holds the token")
 		}
 		// This process's parent is the stage, whose parent is the caller.
 		stage := os.Getppid()
 		procs, err := unix.SysctlKinfoProcSlice("kern.proc.all")
 		if err != nil {
-			e.fail("list processes: %v", err)
+			e.failf("list processes: %v", err)
 			return
 		}
 		caller := 0
-		for _, p := range procs {
+		for i := range procs {
+			p := &procs[i]
 			if int(p.Proc.P_pid) == stage {
 				caller = int(p.Eproc.Ppid)
 			}
@@ -871,41 +893,41 @@ func init() {
 
 // ---------------------------------------------------------------- devices
 
-func init() {
+func registerDevOK() {
 	// dev-ok uses the devices a program needs: it reads random bytes, writes to
 	// /dev/null and /dev/zero, and opens its standard descriptors by /dev/fd.
 	escChecks["dev-ok"] = func(e *escT, _ []string) {
 		for _, p := range []string{"/dev/zero", "/dev/urandom", "/dev/random", "/dev/null"} {
-			f, err := os.Open(p)
+			f, err := openFile(p)
 			if err != nil {
-				e.fail("open %s: %v", p, err)
+				e.failf("open %s: %v", p, err)
 				continue
 			}
 			var b [16]byte
 			if p != "/dev/null" {
 				if n, err := f.Read(b[:]); err != nil || n == 0 {
-					e.fail("read %s: %d, %v", p, n, err)
+					e.failf("read %s: %d, %v", p, n, err)
 				}
 			}
 			_ = f.Close()
 		}
 		for _, p := range []string{"/dev/null", "/dev/zero"} {
-			f, err := os.OpenFile(p, os.O_WRONLY, 0)
+			f, err := openFileFlags(p, os.O_WRONLY, 0)
 			if err != nil {
-				e.fail("open %s for writing: %v", p, err)
+				e.failf("open %s for writing: %v", p, err)
 				continue
 			}
-			if _, err := f.Write([]byte("x")); err != nil {
-				e.fail("write %s: %v", p, err)
+			if _, err := f.WriteString("x"); err != nil {
+				e.failf("write %s: %v", p, err)
 			}
 			_ = f.Close()
 		}
 		// Each descriptor is opened in the mode it has, since the kernel refuses
 		// a wider one by itself: standard input is read, and output written.
 		for fd, mode := range map[string]int{"0": os.O_RDONLY, "1": os.O_WRONLY, "2": os.O_WRONLY} {
-			f, err := os.OpenFile("/dev/fd/"+fd, mode|syscall.O_NONBLOCK, 0)
+			f, err := openFileFlags("/dev/fd/"+fd, mode|syscall.O_NONBLOCK, 0)
 			if err != nil {
-				e.fail("open /dev/fd/%s: %v", fd, err)
+				e.failf("open /dev/fd/%s: %v", fd, err)
 				continue
 			}
 			_ = f.Close()
@@ -913,7 +935,7 @@ func init() {
 		// A descriptor handed in works through /dev/fd as well, which is what a
 		// shell's <(...) opens.
 		if _, err := os.Stat("/dev/fd"); err != nil {
-			e.fail("stat /dev/fd: %v", err)
+			e.failf("stat /dev/fd: %v", err)
 		}
 	}
 }
@@ -925,6 +947,7 @@ func init() {
 // serial port rw-rw-rw-). Each entry of /dev here is tried, and the ones a
 // program uses work.
 func TestEscapeDevices(t *testing.T) {
+	t.Parallel()
 	ents, err := os.ReadDir("/dev")
 	if err != nil {
 		t.Skipf("no /dev listing: %v", err)
@@ -933,13 +956,13 @@ func TestEscapeDevices(t *testing.T) {
 	var denied []string
 	for _, e := range ents {
 		if !allowed[e.Name()] {
-			denied = append(denied, filepath.Join("/dev", e.Name()))
+			denied = append(denied, "/dev/"+e.Name())
 		}
 	}
 	// A device that may not be on this machine is named anyway: it is refused
 	// whether or not it exists.
 	for _, name := range []string{"console", "cu.usbserial-0001", "uart.debug", "tty", "ptmx", "bpf0", "disk0", "rdisk0", "ttys000", "ptyp0", "klog", "pf"} {
-		if p := filepath.Join("/dev", name); !slices.Contains(denied, p) {
+		if p := "/dev/" + name; !slices.Contains(denied, p) {
 			denied = append(denied, p)
 		}
 	}
@@ -994,6 +1017,7 @@ _exit(0);`
 // finds it, and the teardown stops only when a scan proves the sandbox empty.
 // The chain ends by itself after 10 seconds whatever happens.
 func TestEscapeReforkingProcessEnds(t *testing.T) {
+	t.Parallel()
 	home := realTemp(t)
 	c, err := Command(t.Context(), Spec{Home: home, Command: []string{"/usr/bin/perl", "-e", reforkScript, "10"}})
 	if err != nil {
@@ -1026,13 +1050,15 @@ func TestEscapeReforkingProcessEnds(t *testing.T) {
 // settled in the caller's scan, stands for a chain that kept ahead of the scan
 // until the budget ran out. The error wraps the command's own result.
 func TestTeardownReportsWhatItCouldNotConfirm(t *testing.T) {
-	defer func(b time.Duration) { teardownBudget = b }(teardownBudget)
+	t.Parallel()
 	run := func(budget time.Duration, script string) error {
-		teardownBudget = budget
-		unprovable(t, budget == 0)
 		c, err := Command(t.Context(), Spec{Home: realTemp(t), Command: []string{"/bin/sh", "-c", script}})
 		if err != nil {
 			t.Fatal(err)
+		}
+		c.run.budget = budget
+		if budget == 0 {
+			unprovable(c)
 		}
 		c.Env = []string{shellPath}
 		if err := c.Start(); err != nil {
@@ -1060,14 +1086,14 @@ func TestTeardownReportsWhatItCouldNotConfirm(t *testing.T) {
 
 // ------------------------------------------------- a listener handed in
 
-func init() {
+func registerInheritServe() {
 	// inherit-serve serves the listener handed in as descriptor 3, and tries to
 	// bind the port itself on each address after the first argument, which
 	// must be refused. It says hello to one connection.
 	escChecks["inherit-serve"] = func(e *escT, args []string) {
 		l, err := net.FileListener(os.NewFile(3, "listener"))
 		if err != nil {
-			e.fail("file listener: %v", err)
+			e.failf("file listener: %v", err)
 			return
 		}
 		for _, a := range args[1:] {
@@ -1076,7 +1102,7 @@ func init() {
 		_ = l.(*net.TCPListener).SetDeadline(time.Now().Add(8 * time.Second))
 		c, err := l.Accept()
 		if err != nil {
-			e.fail("accept: %v", err)
+			e.failf("accept: %v", err)
 			return
 		}
 		_, _ = c.Write([]byte("hello\n"))
@@ -1091,7 +1117,8 @@ func init() {
 // refused, so unlike a Loopback port it is on 127.0.0.1 and nowhere else. A
 // connection from the LAN address is refused too.
 func TestEscapeInheritedListenerIsLoopbackOnly(t *testing.T) {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+	t.Parallel()
+	l, err := listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1121,7 +1148,7 @@ func TestEscapeInheritedListenerIsLoopbackOnly(t *testing.T) {
 	endAtCleanup(t, c)
 	var got string
 	eventually(t, 10*time.Second, "the command did not serve the listener it was handed", func() bool {
-		conn, err := net.DialTimeout("tcp", "127.0.0.1:"+port, time.Second)
+		conn, err := dialTimeout("tcp", "127.0.0.1:"+port, time.Second)
 		if err != nil {
 			return false
 		}
@@ -1137,8 +1164,8 @@ func TestEscapeInheritedListenerIsLoopbackOnly(t *testing.T) {
 		t.Errorf("the command: %v\n%s", err, stderr.buf.String())
 	}
 	if lan != "" {
-		if conn, err := net.DialTimeout("tcp", net.JoinHostPort(lan, port), time.Second); err == nil {
-			conn.Close()
+		if conn, err := dialTimeout("tcp", net.JoinHostPort(lan, port), time.Second); err == nil {
+			conn.Close() //nolint:gosec // G104: nothing can be done about a failed close here, and the test is over or has what it needs.
 			t.Error("the LAN address reached a listener bound on 127.0.0.1")
 		}
 	}
@@ -1152,6 +1179,7 @@ func TestEscapeInheritedListenerIsLoopbackOnly(t *testing.T) {
 // profile is refused with EPERM, and the sandbox's processes still answer as
 // the sandbox's afterwards.
 func TestEscapeNestedProfileRefused(t *testing.T) {
+	t.Parallel()
 	base := realTemp(t)
 	read := mkdirs(t, base, "r")
 	cover := mkdirs(t, read, "c")
@@ -1167,6 +1195,7 @@ func TestEscapeNestedProfileRefused(t *testing.T) {
 		{"rlimits and kernel open", Spec{Kernel: KernelOpen, Rlimits: []Rlimit{{ResourceCPU, 600, 600}}}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			for _, prof := range []string{
 				"(version 1)(allow default)",
 				`(version 1)(allow default)(deny mach-lookup (global-name "com.die-net.sandbox.in.x"))`,
@@ -1218,7 +1247,7 @@ func TestEscapeNestedProfileRefused(t *testing.T) {
 
 // ------------------------------------------------- roots, every spelling
 
-func init() {
+func registerRootsChecks() {
 	escChecks["roots-ops"] = escRootsOps
 	escChecks["roots-modes"] = escRootsModes
 }
@@ -1236,20 +1265,20 @@ func escRootsOps(e *escT, args []string) {
 	// Each op's name, so a failure says which.
 	try := func(name string, err error) {
 		if err == nil {
-			e.fail("WORKED: %s", name)
+			e.failf("WORKED: %s", name)
 		}
 	}
 	n := 0
 	fresh := func() string {
 		n++
 		p := filepath.Join(home, "e"+strconv.Itoa(n))
-		_ = os.Mkdir(p, 0o755)
+		_ = os.Mkdir(p, 0o750) //nolint:gosec // G703: the test touches only paths it made, or was passed, to see whether a sandbox allows it.
 		return p
 	}
 	freshFile := func() string {
 		n++
 		p := filepath.Join(home, "f"+strconv.Itoa(n))
-		_ = os.WriteFile(p, []byte("planted\n"), 0o644)
+		_ = os.WriteFile(p, []byte("planted\n"), 0o600) //nolint:gosec // G703: the test touches only paths it made, or was passed, to see whether a sandbox allows it.
 		return p
 	}
 	freshLink := func() string {
@@ -1265,7 +1294,7 @@ func escRootsOps(e *escT, args []string) {
 		}
 		return m
 	}
-	_ = os.Remove(filepath.Join(home, "tmp"))
+	_ = os.Remove(filepath.Join(home, "tmp")) //nolint:gosec // G703: the path is an argument the test passed to this child, whose job is to try it.
 	for name, p := range spell(w, volW, true) {
 		try("rmdir W "+name, unix.Rmdir(p))
 		try("rename W away "+name, unix.Rename(p, filepath.Join(home, "stolen-"+name)))
@@ -1274,7 +1303,7 @@ func escRootsOps(e *escT, args []string) {
 		try("swap file with W "+name, unix.RenamexNp(freshFile(), p, unix.RENAME_SWAP))
 		try("symlink at W "+name, unix.Symlink(private, p))
 	}
-	_ = os.Mkdir(filepath.Join(w, "sw"), 0o755)
+	_ = os.Mkdir(filepath.Join(w, "sw"), 0o750) //nolint:gosec // G703: the test touches only paths it made, or was passed, to see whether a sandbox allows it.
 	for name, p := range spell(home, volHome, true) {
 		try("rmdir HOME "+name, unix.Rmdir(p))
 		try("rename HOME away "+name, unix.Rename(p, w+"/stolen-"+name))
@@ -1298,11 +1327,11 @@ func escRootsOps(e *escT, args []string) {
 		try("swap file with sock "+p, unix.RenamexNp(freshFile(), p, unix.RENAME_SWAP))
 	}
 	// What a root is for still works.
-	if err := os.WriteFile(filepath.Join(w, "inside"), []byte("ok"), 0o644); err != nil {
-		e.fail("write inside W: %v", err)
+	if err := os.WriteFile(filepath.Join(w, "inside"), []byte("ok"), 0o600); err != nil { //nolint:gosec // G703: the test touches only paths it made, or was passed, to see whether a sandbox allows it.
+		e.failf("write inside W: %v", err)
 	}
-	if err := os.WriteFile(f, []byte("rewritten\n"), 0o644); err != nil {
-		e.fail("write the file root: %v", err)
+	if err := os.WriteFile(f, []byte("rewritten\n"), 0o600); err != nil { //nolint:gosec // G703: the test touches only paths it made, or was passed, to see whether a sandbox allows it.
+		e.failf("write the file root: %v", err)
 	}
 }
 
@@ -1322,11 +1351,11 @@ func escRootsModes(e *escT, args []string) {
 		{"mkfifo in home", func() error { return unix.Mkfifo(filepath.Join(home, "fifo"), 0o644) }, func() error { return unix.Unlink(filepath.Join(home, "fifo")) }},
 	} {
 		if err := op.do(); err != nil {
-			e.fail("%s: %v: the gap closed", op.name, err)
+			e.failf("%s: %v: the gap closed", op.name, err)
 			continue
 		}
 		if err := op.undo(); err != nil {
-			e.fail("undo %s: %v", op.name, err)
+			e.failf("undo %s: %v", op.name, err)
 		}
 	}
 }
@@ -1339,6 +1368,7 @@ func escRootsModes(e *escT, args []string) {
 // or through "x/..". The names carry a non-ASCII letter. The review ran the same
 // attempts and none worked.
 func TestEscapeRootsEveryName(t *testing.T) {
+	t.Parallel()
 	base := realTemp(t)
 	home := mkdirs(t, base, "homé")
 	w := mkdirs(t, base, "wé")
@@ -1349,7 +1379,7 @@ func TestEscapeRootsEveryName(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(short) })
 	sock := filepath.Join(short, "b.sock")
-	l, err := net.Listen("unix", sock)
+	l, err := listen("unix", sock)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1379,7 +1409,7 @@ func TestEscapeRootsEveryName(t *testing.T) {
 			t.Errorf("%s is a different file now: inode %d, was %d", x.p, got, x.ino)
 		}
 	}
-	if b, err := os.ReadFile(filepath.Join(home, "out.png")); err == nil {
+	if b, err := readFile(filepath.Join(home, "out.png")); err == nil {
 		t.Errorf("Home leads to the caller's private directory: %q", b)
 	}
 }
@@ -1390,6 +1420,7 @@ func TestEscapeRootsEveryName(t *testing.T) {
 // opens a result by name and blocks on a FIFO, is seeing this. The test fails
 // when it stops being so.
 func TestGapRootModeAndFifo(t *testing.T) {
+	t.Parallel()
 	home := realTemp(t)
 	w := mkdirs(t, realTemp(t), "w")
 	escRun(t, Spec{Home: home, Write: []string{w}}, "roots-modes", home, w)
@@ -1408,7 +1439,8 @@ func TestGapRootModeAndFifo(t *testing.T) {
 // it. (Footprint counts a member of the group only if the stage is its
 // ancestor, and Wait kills by the profile's marker only.)
 func TestWaitAndFootprintIgnoreAReusedGroupNumber(t *testing.T) {
-	canary := exec.Command(self(t), "esc", "alloc", "300")
+	t.Parallel()
+	canary := exec.CommandContext(t.Context(), self(t), "esc", "alloc", "300") //nolint:gosec // G204: the test binary or a tool the test names, run as the test's own child.
 	canary.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	out, err := canary.StdoutPipe()
 	if err != nil {
@@ -1422,7 +1454,7 @@ func TestWaitAndFootprintIgnoreAReusedGroupNumber(t *testing.T) {
 		t.Fatalf("the canary said %q", line)
 	}
 	home := realTemp(t)
-	c := escCmd(t, t.Context(), Spec{Home: home}, "hold", filepath.Join(home, "pid"))
+	c := escCmd(t.Context(), t, Spec{Home: home}, "hold", filepath.Join(home, "pid"))
 	if err := c.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -1456,9 +1488,10 @@ func TestWaitAndFootprintIgnoreAReusedGroupNumber(t *testing.T) {
 // whose stage has been killed, and then runs the cleanup Start's failure path
 // runs.
 func TestStartFailureEndsACommandWhoseStageDied(t *testing.T) {
+	t.Parallel()
 	home := realTemp(t)
 	pidfile := filepath.Join(home, "pid")
-	c := escCmd(t, t.Context(), Spec{Home: home}, "leave", "setpgid", pidfile, "1")
+	c := escCmd(t.Context(), t, Spec{Home: home}, "leave", "setpgid", pidfile, "1")
 	if err := c.Start(); err != nil {
 		t.Fatal(err)
 	}

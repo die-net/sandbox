@@ -102,10 +102,6 @@ type Spec struct {
 	ScratchSize int64 `json:"scratch_size,omitempty"`
 }
 
-// maxListen is the most Listen and Loopback may each be, which keeps their
-// fixed Linux ports apart.
-const maxListen = 1000
-
 // Network is what a sandbox's command can reach of the network.
 type Network int
 
@@ -193,41 +189,6 @@ type Rlimit struct {
 	Hard     uint64   `json:"hard"`
 }
 
-// checkRequest checks the parts of spec that need no host: the
-// network and listener counts, the limits, and the files. It is shared by
-// every backend.
-func (s Spec) checkRequest() error {
-	if len(s.Command) == 0 {
-		return errors.New("no command")
-	}
-	if s.Network != NetworkNone && s.Network != NetworkHost {
-		return fmt.Errorf("unknown network %d", int(s.Network))
-	}
-	if s.Listen < 0 || s.Listen > maxListen || s.Loopback < 0 || s.Loopback > maxListen {
-		return fmt.Errorf("listen and loopback must each be from 0 to %d", maxListen)
-	}
-	if s.Network == NetworkHost && (s.Listen > 0 || s.Loopback > 0) {
-		return errors.New("listeners and loopback ports need NetworkNone, since the host's network has no private loopback")
-	}
-	if s.ScratchSize < 0 {
-		return fmt.Errorf("scratch size %d is negative", s.ScratchSize)
-	}
-	for _, f := range s.Files {
-		if f == nil {
-			return errors.New("a nil file in Files")
-		}
-	}
-	for _, r := range s.Rlimits {
-		if r.Resource < ResourceCPU || r.Resource > ResourceAddressSpace {
-			return fmt.Errorf("unknown resource %d", int(r.Resource))
-		}
-		if r.Soft > r.Hard {
-			return fmt.Errorf("limit %d has a soft limit above its hard limit", int(r.Resource))
-		}
-	}
-	return nil
-}
-
 // Kernel is how much of the kernel's system calls a sandbox may reach.
 type Kernel string
 
@@ -261,13 +222,27 @@ func (k *Kernel) Set(v string) error {
 	return fmt.Errorf("kernel %q is not strict, nested, or open", v)
 }
 
+// hostView is what prepare needs of the host, which a test replaces with a
+// fake one.
+type hostView struct {
+	// fs is the host's root, as [os.DirFS] gives it.
+	fs fs.FS
+	// homes are the people's homes on the host, which may live outside /home.
+	homes []string
+	// mounts is the host's mount table, which shows where else a covered
+	// file can be reached.
+	mounts []mount
+	// cover is defaultCover. aliases is coverAliases, the paths that lead to a
+	// default cover through a link, which prepare uses to tell which links in
+	// /etc lead under one. Linux has none that its mount table does not show.
+	cover, aliases []string
+}
+
 // prepare checks spec and returns it with every path absolute, clean, and
 // with symlinks resolved. Cover gains the defaults and homes, the people's
 // homes found on the host, which may live outside /home, and loses each cover
 // that another already hides. Read gains the files that links in the host's
-// /etc lead to under a default cover. host is the host's root, as [os.DirFS]
-// gives it, and mounts is its mount table, which shows where else a covered
-// file can be reached.
+// /etc lead to under a default cover. h is what prepare needs of the host.
 //
 // The home and the Write paths are what some sandbox can write, so a link
 // inside one of them may have been planted by an earlier run to point this
@@ -275,7 +250,8 @@ func (k *Kernel) Set(v string) error {
 // other path is resolved without following a link inside one of them, a cover inside one of them that has gone missing is refused, since
 // a sandbox could have moved it away to uncover what it hid, and so is any
 // other path inside one of them, since bubblewrap would mount on it.
-func prepare(spec Spec, homes []string, host fs.FS, mounts []mount) (Spec, error) {
+func prepare(spec Spec, h hostView) (Spec, error) {
+	host, homes, mounts := h.fs, h.homes, h.mounts
 	if len(spec.Command) == 0 {
 		return Spec{}, errors.New("no command")
 	}
@@ -314,7 +290,7 @@ func prepare(spec Spec, homes []string, host fs.FS, mounts []mount) (Spec, error
 	if spec.Read, err = resolveAll(host, spec.Read, writable, nil); err != nil {
 		return Spec{}, err
 	}
-	shared, err := resolveAll(host, defaultCover, writable, nil)
+	shared, err := resolveAll(host, h.cover, writable, nil)
 	if err != nil {
 		return Spec{}, err
 	}
@@ -329,7 +305,7 @@ func prepare(spec Spec, homes []string, host fs.FS, mounts []mount) (Spec, error
 	spec.Home = home
 	binds := slices.Concat([]string{home}, spec.Write, spec.Read)
 	spec.Cover = covers(slices.Concat(shared, private, elsewhere), binds)
-	linked, err := linkedFiles(host, "etc", slices.Concat(shared, coverAliases), slices.Concat(private, []string{home}, spec.Write))
+	linked, err := linkedFiles(host, "etc", slices.Concat(shared, h.aliases), slices.Concat(private, []string{home}, spec.Write))
 	if err != nil {
 		return Spec{}, err
 	}

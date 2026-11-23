@@ -24,6 +24,7 @@ const denyProfile = `(version 1)(deny default)(allow process-exec*)(allow file-r
 // must say it does not know, whatever the profile: a gone pid, a zombie, and
 // this process, which the kernel finds and which is not a member.
 func TestMemberOfGonePids(t *testing.T) {
+	t.Parallel()
 	m, err := newMarker()
 	if err != nil {
 		t.Fatal(err)
@@ -41,7 +42,7 @@ func TestMemberOfGonePids(t *testing.T) {
 	if kernelFinds(z) {
 		t.Error("kernelFinds(zombie) = true")
 	}
-	cmd := exec.Command("/usr/bin/true")
+	cmd := exec.CommandContext(t.Context(), "/usr/bin/true")
 	if err := cmd.Run(); err != nil {
 		t.Fatal(err)
 	}
@@ -50,7 +51,7 @@ func TestMemberOfGonePids(t *testing.T) {
 	}
 	// A process under another deny-default profile is found, and known not to be
 	// a member of this one.
-	live := exec.Command("/usr/bin/sandbox-exec", "-p", denyProfile, "/bin/sleep", "2")
+	live := exec.CommandContext(t.Context(), "/usr/bin/sandbox-exec", "-p", denyProfile, "/bin/sleep", "2")
 	if err := live.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -69,7 +70,8 @@ func TestMemberOfGonePids(t *testing.T) {
 // has begun to exit answers sandbox_check as a denial, and the 4000 children
 // of the review's run had 16841 such answers.
 func TestMemberNeverClearsAnExitingChild(t *testing.T) {
-	uid := uint32(os.Geteuid())
+	t.Parallel()
+	uid := euid()
 	base, _ := listUIDPids(uid)
 	old := map[int]bool{}
 	for _, p := range base {
@@ -91,7 +93,10 @@ func TestMemberNeverClearsAnExitingChild(t *testing.T) {
 loop:
 	for {
 		select {
-		case <-done:
+		case err := <-done:
+			if err != nil {
+				t.Errorf("Wait: %v", err)
+			}
 			break loop
 		default:
 		}
@@ -133,22 +138,21 @@ loop:
 // a member of a profile that has nothing to do with it. Asked In then Out, about
 // a third of the starts gave a false match; Out then In, none.
 func TestMemberNeverMatchesAProcessApplyingAProfile(t *testing.T) {
+	t.Parallel()
 	m, err := newMarker()
 	if err != nil {
 		t.Fatal(err)
 	}
 	false1, checks := 0, 0
 	for range 200 {
-		cmd := exec.Command("/usr/bin/sandbox-exec", "-p", denyProfile, "/usr/bin/true")
+		cmd := exec.CommandContext(t.Context(), "/usr/bin/sandbox-exec", "-p", denyProfile, "/usr/bin/true")
 		if err := cmd.Start(); err != nil {
 			t.Fatal(err)
 		}
 		pid := cmd.Process.Pid
 		stop := make(chan struct{})
 		var wg sync.WaitGroup
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for {
 				select {
 				case <-stop:
@@ -160,7 +164,7 @@ func TestMemberNeverMatchesAProcessApplyingAProfile(t *testing.T) {
 					false1++
 				}
 			}
-		}()
+		})
 		_ = cmd.Wait()
 		close(stop)
 		wg.Wait()
@@ -181,6 +185,7 @@ func TestMemberNeverMatchesAProcessApplyingAProfile(t *testing.T) {
 // that only the chain is measured, and the scan's kill is a count, so that the
 // chain lives on.
 func TestRealScanIsNeverCleanWhileAChainLives(t *testing.T) {
+	t.Parallel()
 	c, err := Command(t.Context(), Spec{Home: realTemp(t), Command: []string{"/bin/sh", "-c", `/usr/bin/perl -e "$0" 6 & /bin/sleep 3`, reforkScript}})
 	if err != nil {
 		t.Fatal(err)
@@ -206,7 +211,7 @@ func TestRealScanIsNeverCleanWhileAChainLives(t *testing.T) {
 	p.list = func() ([]int, error) {
 		pids, err := list()
 		// The scanner is off the processor for a while.
-		for end := time.Now().Add(400 * time.Microsecond); time.Now().Before(end); {
+		for end := time.Now().Add(400 * time.Microsecond); time.Now().Before(end); { //nolint:revive // empty-block: the loop spins on purpose, to keep the scanner off the processor.
 		}
 		return pids, err
 	}
@@ -245,6 +250,7 @@ func TestRealScanIsNeverCleanWhileAChainLives(t *testing.T) {
 // the sandbox. The test holds one there, blocked on reading its profile from a
 // pipe it never writes to, and no scan is clean while it waits.
 func TestRealScanIsNotCleanWhileSandboxExecWaitsForItsProfile(t *testing.T) {
+	t.Parallel()
 	m, err := newMarker()
 	if err != nil {
 		t.Fatal(err)
@@ -253,7 +259,7 @@ func TestRealScanIsNotCleanWhileSandboxExecWaitsForItsProfile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command("/usr/bin/sandbox-exec", "-f", "/dev/fd/3", "--", "/usr/bin/true")
+	cmd := exec.CommandContext(t.Context(), "/usr/bin/sandbox-exec", "-f", "/dev/fd/3", "--", "/usr/bin/true")
 	cmd.ExtraFiles = []*os.File{pr}
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
@@ -284,6 +290,7 @@ func TestRealScanIsNotCleanWhileSandboxExecWaitsForItsProfile(t *testing.T) {
 // ----------------------------------------------------------- stage messages
 
 func TestStageMessagesRefuseTheWrongKind(t *testing.T) {
+	t.Parallel()
 	enc := func(v any) *json.Decoder {
 		b, err := json.Marshal(v)
 		if err != nil {
@@ -314,23 +321,24 @@ func TestStageMessagesRefuseTheWrongKind(t *testing.T) {
 // ----------------------------------------------------------- the list's size
 
 func TestListPidsAsksAgainWhenTheListMayBeCut(t *testing.T) {
+	t.Parallel()
 	// fake is the kernel, asked for the size, then the list, then the size
 	// again, over and over. The list holds n pids, or as many as fit.
 	fake := func(before, n, after int) listCall {
 		calls := 0
 		return func(buf []int32) (int, error) {
 			calls++
-			switch {
-			case calls%3 == 1:
+			switch calls % 3 {
+			case 1:
 				return before * 4, nil
-			case calls%3 == 0:
+			case 0:
 				return after * 4, nil
 			}
-			n := min(n, len(buf))
-			for j := range n {
+			fit := min(n, len(buf))
+			for j := range fit {
 				buf[j] = int32(1000 + j)
 			}
-			return n * 4, nil
+			return fit * 4, nil
 		}
 	}
 	// Whole: shorter than both sizes.
@@ -363,6 +371,7 @@ func TestListPidsAsksAgainWhenTheListMayBeCut(t *testing.T) {
 // syntax error, and sandbox-exec exits without running the command (but for
 // a cut right after the version, which is a profile that denies everything).
 func TestProfileCutShortDoesNotRun(t *testing.T) {
+	t.Parallel()
 	m, err := newMarker()
 	if err != nil {
 		t.Fatal(err)
@@ -377,7 +386,7 @@ func TestProfileCutShortDoesNotRun(t *testing.T) {
 		t.Errorf("the marker (at %d) is not before the file rules (at %d)", i, j)
 	}
 	run := func(p string) error {
-		cmd := exec.Command("/usr/bin/sandbox-exec", "-f", "/dev/stdin", "--", "/usr/bin/true")
+		cmd := exec.CommandContext(t.Context(), "/usr/bin/sandbox-exec", "-f", "/dev/stdin", "--", "/usr/bin/true")
 		cmd.Stdin = strings.NewReader(p)
 		return cmd.Run()
 	}
@@ -385,7 +394,7 @@ func TestProfileCutShortDoesNotRun(t *testing.T) {
 		t.Fatalf("the whole profile does not run /usr/bin/true: %v", err)
 	}
 	cuts, ran := 0, 0
-	for i := 0; i < len(prof)-1; i++ {
+	for i := range len(prof) - 1 {
 		// Every end of a line, and a spot in the middle of each.
 		if prof[i] != '\n' && i%7 != 0 {
 			continue
@@ -410,7 +419,7 @@ func TestProfileCutShortDoesNotRun(t *testing.T) {
 		}
 	}
 	t.Logf("%d cuts tried", cuts)
-	if strings.Index(prof, "(begin") < 0 {
+	if !strings.Contains(prof, "(begin") {
 		t.Error("the profile has no (begin")
 	}
 }
@@ -421,6 +430,7 @@ func TestProfileCutShortDoesNotRun(t *testing.T) {
 // scans itself. The stage here is the test binary again, which TestMain gives a
 // scan that is never clean and a short budget when its environment says so.
 func TestTeardownStageThatCannotProveLeavesItToTheCaller(t *testing.T) {
+	t.Parallel()
 	c, err := Command(t.Context(), Spec{Home: realTemp(t), Command: []string{"/usr/bin/true"}})
 	if err != nil {
 		t.Fatal(err)
@@ -444,6 +454,7 @@ func TestTeardownStageThatCannotProveLeavesItToTheCaller(t *testing.T) {
 // the stage's own watcher has no tick before Wait returns: Wait's scan alone
 // ends what the stage left.
 func TestWaitScansWhenTheStageWasKilledAndNothingHoldsTheOutput(t *testing.T) {
+	t.Parallel()
 	c, err := Command(t.Context(), Spec{Home: realTemp(t), Command: []string{"/bin/sleep", "30"}})
 	if err != nil {
 		t.Fatal(err)
@@ -479,6 +490,7 @@ func TestWaitScansWhenTheStageWasKilledAndNothingHoldsTheOutput(t *testing.T) {
 
 // The fields of a proc_bsdinfo that a scan reads.
 func TestProcStatOfReadsTheFlagsAndTheName(t *testing.T) {
+	t.Parallel()
 	b := bsdInfo{Flags: flagInExit | 1, Status: 2, StartSec: 1700000000, StartUsec: 25}
 	copy(b.Comm[:], "sandbox-exec")
 	st := procStatOf(b)
@@ -495,7 +507,7 @@ func TestProcStatOfReadsTheFlagsAndTheName(t *testing.T) {
 
 // ------------------------------------------- another sandbox's sandbox-exec
 
-func init() {
+func registerSleepForever() {
 	childModes["sleep-forever"] = func([]string) int { time.Sleep(time.Minute); return 0 }
 }
 
@@ -504,13 +516,14 @@ func init() {
 // profile cannot take another's name for this. It must not make the teardown of
 // an unrelated sandbox wait for the whole budget, then report survivors.
 func TestSandboxExecInAnotherSandboxDoesNotStallTeardown(t *testing.T) {
+	t.Parallel()
 	homeA := realTemp(t)
 	body, err := os.ReadFile(self(t))
 	if err != nil {
 		t.Fatal(err)
 	}
 	named := homeA + "/" + sandboxExecName
-	if err := os.WriteFile(named, body, 0o700); err != nil {
+	if err := os.WriteFile(named, body, 0o700); err != nil { //nolint:gosec // G306: the file is a program the test runs, which needs its owner to execute it.
 		t.Fatal(err)
 	}
 	a, err := Command(t.Context(), Spec{Home: homeA, Command: []string{named, "sleep-forever"}})
@@ -563,14 +576,15 @@ func TestSandboxExecInAnotherSandboxDoesNotStallTeardown(t *testing.T) {
 // service and option on, as a rule added later would be, and a command started
 // under it must still read as a member.
 func TestMarkerSurvivesEveryServiceAndOption(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name string
 		spec func(t *testing.T) Spec
 	}{
-		{"no network", func(t *testing.T) Spec {
+		{"no network", func(*testing.T) Spec {
 			return Spec{Listen: 1, Loopback: 1}
 		}},
-		{"host network", func(t *testing.T) Spec {
+		{"host network", func(*testing.T) Spec {
 			return Spec{Network: NetworkHost}
 		}},
 		{"no network, files and covers", func(t *testing.T) Spec {
@@ -579,6 +593,7 @@ func TestMarkerSurvivesEveryServiceAndOption(t *testing.T) {
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			spec := tc.spec(t)
 			spec.Home = realTemp(t)
 			spec.Command = []string{"/bin/sleep", "30"}

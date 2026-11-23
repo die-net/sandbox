@@ -62,7 +62,7 @@ Without `SBX_APPARMOR=1`, the same Ubuntu run fails 159 of the tests that start 
 | Target | How | Pass | Subtests | Skip | Fail |
 |---|---|---|---|---|---|
 | macOS 27.2.1, arm64, Apple silicon, Go 1.27 | `go test` | 131 | 91 | 1 | 0 |
-| the same | `go test -race` (about 6.5 minutes, since each sandbox starts a race-built binary) | 131 | 91 | 1 | 0 |
+| the same | `go test -race` (about 1 minute, since each sandbox starts a race-built binary) | 131 | 91 | 1 | 0 |
 | macOS 27.2.1, amd64 under Rosetta 2 on the same Mac, Go 1.27, cross-built with `GOARCH=amd64` | `go test` (`CGO_ENABLED=0`, about 1 minute) | 130 | 91 | 2 | 0 |
 | the same | `go test -race` (`CGO_ENABLED=1`, about 6.5 minutes) | 130 | 91 | 2 | 0 |
 
@@ -97,6 +97,17 @@ go test -race ./...
 ```
 
 `go test -race` is slow, since every sandbox starts a race-built binary. Read [the host-safety rules](#host-safety-on-macos) before changing or adding a darwin test.
+
+### Parallel tests
+
+Every test and subtest calls `t.Parallel`, so a test that shares state with another fails here and not in a user's program. A test stays serial only for a reason. Where the linter would ask for the call, the test carries `//nolint:paralleltest // <reason>` above its function. The reasons are:
+
+- It uses `t.Setenv`, directly or through a helper, which Go refuses in a parallel test.
+- It measures the machine: the start overhead, or teardown under process churn. Other tests' load would change the figure.
+
+Some things a test varies are per sandbox, so that tests that run at once don't share them. Fields of `run` hold a sandbox's teardown budget, a hook that changes its teardown's prober, and whether it ignores the stage's report, and `commandAs` and `runAs` take the uid that `Command` and `Run` refuse when it is 0. The stage is another process, so a test binary's `TestMain` sets its budget and hook from the environment, once, before any test runs.
+
+A test that counts its own process's descriptors or children can't run beside others, since they open and close theirs. It runs the count in a fresh process, which `leakCheck` does on Linux.
 
 ### On Linux
 

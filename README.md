@@ -39,29 +39,33 @@ func main() {
 	if code, ok := sandbox.Stage(); ok {
 		os.Exit(code)
 	}
-	home, err := os.MkdirTemp("", "sandbox-")
-	if err != nil {
+	if err := run(); err != nil {
 		log.Fatal(err)
 	}
-	defer os.RemoveAll(home)
-	home, err = filepath.EvalSymlinks(home) // Home may not contain a link.
+}
+
+func run() (err error) {
+	dir, err := os.MkdirTemp("", "sandbox-")
 	if err != nil {
-		log.Fatal(err)
+		return err
+	}
+	defer func() { err = errors.Join(err, os.RemoveAll(dir)) }()
+	home, err := filepath.EvalSymlinks(dir) // Home may not contain a link.
+	if err != nil {
+		return err
 	}
 	cmd, err := sandbox.Command(context.Background(), sandbox.Spec{
 		Command: []string{"/bin/sh", "-c", "echo hello from $HOME"},
 		Home:    home,
 	})
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 	if err := cmd.Start(); err != nil {
-		log.Fatal(err)
+		return err
 	}
-	if err := cmd.Wait(); err != nil {
-		log.Fatal(err)
-	}
+	return cmd.Wait()
 }
 ```
 

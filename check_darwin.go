@@ -27,8 +27,9 @@ func foreignPIDs() ([]int, error) {
 	}
 	ppid := map[int]int{}
 	mine := map[int]bool{}
-	uid := uint32(os.Geteuid())
-	for _, p := range procs {
+	uid := euid()
+	for i := range procs {
+		p := &procs[i]
 		ppid[int(p.Proc.P_pid)] = int(p.Eproc.Ppid)
 		mine[int(p.Proc.P_pid)] = p.Eproc.Ucred.Uid == uid
 	}
@@ -80,12 +81,11 @@ func procEnvironment(pid int) bool {
 	argc := int(binary.NativeEndian.Uint32(b[:4]))
 	rest := b[4:]
 	// The path, then the NULs that pad it.
-	if i := bytes.IndexByte(rest, 0); i >= 0 {
-		rest = rest[i:]
-	} else {
+	i := bytes.IndexByte(rest, 0)
+	if i < 0 {
 		return false
 	}
-	rest = bytes.TrimLeft(rest, "\x00")
+	rest = bytes.TrimLeft(rest[i:], "\x00")
 	for range argc {
 		i := bytes.IndexByte(rest, 0)
 		if i < 0 {
@@ -158,7 +158,7 @@ func platformHints(spec *Spec) checkHints {
 	}
 	slices.Sort(homes)
 	homes = slices.Compact(homes)
-	var secrets []string
+	secrets := make([]string, 0, len(homes)*len(secretFiles))
 	for _, h := range homes {
 		for _, s := range secretFiles {
 			secrets = append(secrets, filepath.Join(h, s))

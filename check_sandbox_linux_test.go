@@ -3,7 +3,6 @@ package sandbox
 import (
 	"bytes"
 	"context"
-	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -16,13 +15,14 @@ import (
 // TestCheckSandbox runs the suite in a sandbox built from a Spec with no
 // network and a home.
 func TestCheckSandbox(t *testing.T) {
+	t.Parallel()
 	home := t.TempDir()
 	secret := filepath.Join(t.TempDir(), "secret")
 	if err := os.WriteFile(secret, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	inHome := filepath.Join(home, "inside-home")
-	if err := os.Mkdir(inHome, 0o755); err != nil {
+	if err := os.Mkdir(inHome, 0o750); err != nil {
 		t.Fatal(err)
 	}
 	spec := Spec{Home: home, Network: NetworkNone}
@@ -72,13 +72,15 @@ func TestCheckSandbox(t *testing.T) {
 // without a Spec, and requires that no command line holds the payload, and
 // that the check child's is only the binary and the marker, or for a namespace attempt a fixed mode.
 func TestCheckArgvHoldsNoSettings(t *testing.T) {
+	t.Parallel()
 	for _, withSpec := range []bool{false, true} {
 		t.Run("spec="+strconv.FormatBool(withSpec), func(t *testing.T) {
+			t.Parallel()
 			const marker = "/nonexistent/argv-marker-7c1e"
 			// A proxy that accepts and never answers keeps the child
 			// running for netTimeout, long enough to be seen. It needs the
 			// host's network.
-			silent, err := net.Listen("tcp", "127.0.0.1:0")
+			silent, err := listenLocal()
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -95,9 +97,7 @@ func TestCheckArgvHoldsNoSettings(t *testing.T) {
 				leaks    []string
 				stop     = make(chan struct{})
 			)
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
+			wg.Go(func() {
 				for {
 					select {
 					case <-stop:
@@ -106,7 +106,7 @@ func TestCheckArgvHoldsNoSettings(t *testing.T) {
 					}
 					files, _ := filepath.Glob("/proc/[0-9]*/cmdline")
 					for _, f := range files {
-						b, err := os.ReadFile(f)
+						b, err := readFile(f)
 						if err != nil {
 							continue
 						}
@@ -128,7 +128,7 @@ func TestCheckArgvHoldsNoSettings(t *testing.T) {
 					}
 					time.Sleep(time.Millisecond)
 				}
-			}()
+			})
 			_, err = Check(ctx, spec, Expect{Unreadable: []string{marker}, Proxy: silent.Addr().String(), Allowed: []string{"x.example:443"}})
 			close(stop)
 			wg.Wait()

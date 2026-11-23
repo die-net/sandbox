@@ -21,6 +21,13 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// backend is what the platform's implementation holds in a Cmd.
+type backend struct {
+	ctx  context.Context
+	spec Spec
+	run  run
+}
+
 // run is what a started Cmd holds.
 type run struct {
 	started, waited bool
@@ -51,6 +58,29 @@ type run struct {
 	// keepOpen stops the close of the unstarted Cmd's sockets that ctx's end
 	// would make, and reports false if that close has begun.
 	keepOpen func() bool
+	// budget is how long the caller's teardown keeps scanning before it gives
+	// up (teardownBudget, which Command sets). A test sets it, and the fields
+	// below, on its own Cmd between Command and Start, so that sandboxes that
+	// run at the same time do not share a setting. They stay as they are in a
+	// program.
+	budget time.Duration
+	// proberHook changes the prober of the caller's teardown, to give it a
+	// system that a scan cannot settle, or signals that land nowhere.
+	proberHook func(*prober)
+	// ignoreStageReport makes Wait act as if the stage had sent no report that
+	// it proved the sandbox empty.
+	ignoreStageReport bool
+}
+
+// teardown ends every process under the sandbox's profile from the caller's
+// side, and says how many scans it took and how it ended. It scans for
+// run.budget, with the prober that run.proberHook changed.
+func (c *Cmd) teardown() (scans int, end endKind) {
+	p := c.run.mark.prober(c.run.group)
+	if c.run.proberHook != nil {
+		c.run.proberHook(&p)
+	}
+	return p.run(c.run.budget)
 }
 
 // resources maps each Resource to its macOS number. ResourceAddressSpace has
@@ -63,9 +93,6 @@ var resources = map[Resource]int{
 	ResourceOpenFiles: unix.RLIMIT_NOFILE,
 	ResourceProcesses: unix.RLIMIT_NPROC,
 }
-
-// geteuid is os.Geteuid, a variable so that a test can be root without being.
-var geteuid = os.Geteuid
 
 // tmpName is the directory in the home that TMPDIR and XDG_RUNTIME_DIR name,
 // since there is no private /tmp on macOS.
@@ -102,7 +129,13 @@ var SelfPath = selfPath()
 // another account. It refuses a Service it does not know, and a resource limit
 // macOS does not enforce: ResourceAddressSpace.
 func Command(ctx context.Context, spec Spec) (*Cmd, error) {
-	if geteuid() == 0 {
+	return commandAs(ctx, spec, os.Geteuid())
+}
+
+// commandAs is Command for a process whose effective uid is uid, which a test
+// sets to be root without being it.
+func commandAs(ctx context.Context, spec Spec, uid int) (*Cmd, error) {
+	if uid == 0 {
 		return nil, errors.New("the sandbox will not run as root: switch to the sandbox's own uid first")
 	}
 	if err := spec.checkRequest(); err != nil {
@@ -128,7 +161,8 @@ func Command(ctx context.Context, spec Spec) (*Cmd, error) {
 	spec.Files = slices.Clone(spec.Files)
 	spec.Rlimits = slices.Clone(spec.Rlimits)
 	spec.Services = slices.Clone(spec.Services)
-	c := &Cmd{ctx: ctx, spec: spec, CgroupFD: -1}
+	c := &Cmd{backend: backend{ctx: ctx, spec: spec}, CgroupFD: -1}
+	c.run.budget = teardownBudget
 	closeAll := func() {
 		for _, l := range slices.Concat(c.run.listeners, c.run.reservedPort) {
 			_ = l.Close()
@@ -162,7 +196,10 @@ func Command(ctx context.Context, spec Spec) (*Cmd, error) {
 // before Start, and the profile lets the command connect to exactly those
 // ports.
 func (c *Cmd) ListenAddrs() []string {
-	var addrs []string
+	if len(c.run.listeners) == 0 {
+		return nil
+	}
+	addrs := make([]string, 0, len(c.run.listeners))
 	for _, l := range c.run.listeners {
 		addrs = append(addrs, l.Addr().String())
 	}
@@ -174,7 +211,10 @@ func (c *Cmd) ListenAddrs() []string {
 // allows the command exactly those. Another process could take one between
 // Start closing its reservation and the command binding it.
 func (c *Cmd) LoopbackPorts() []int {
-	var ports []int
+	if len(c.run.reservedPort) == 0 {
+		return nil
+	}
+	ports := make([]int, 0, len(c.run.reservedPort))
 	for _, l := range c.run.reservedPort {
 		ports = append(ports, l.Addr().(*net.TCPAddr).Port)
 	}
@@ -239,7 +279,7 @@ func (c *Cmd) Start() error {
 		}
 	}()
 	if fi, err := os.Stat(sandboxExec); err != nil || fi.Mode()&0o111 == 0 {
-		return fmt.Errorf("find %s, which the sandbox needs on macOS: %v", sandboxExec, err)
+		return fmt.Errorf("find %s, which the sandbox needs on macOS: %w", sandboxExec, err)
 	}
 	self := selfPath()
 	if self == "" {
@@ -257,7 +297,7 @@ func (c *Cmd) Start() error {
 	if spec.Dir == "" {
 		spec.Dir = spec.Home
 	}
-	spec, err = prepare(spec, homes, os.DirFS("/"), nil)
+	spec, err = prepare(spec, hostView{fs: os.DirFS("/"), homes: homes, cover: defaultCover, aliases: coverAliases})
 	if err != nil {
 		return err
 	}
@@ -313,10 +353,7 @@ func (c *Cmd) Start() error {
 			}
 		}
 	}()
-	pipe := func() (r, w *os.File, err error) {
-		r, w, err = os.Pipe()
-		return
-	}
+	pipe := os.Pipe
 	lifeR, lifeW, err := pipe()
 	if err != nil {
 		return err
@@ -357,7 +394,7 @@ func (c *Cmd) Start() error {
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = c.Stdin, c.Stdout, c.Stderr
 	cmd.WaitDelay = c.WaitDelay
 	cmd.ExtraFiles = extra
-	// Cancelling ctx closes the lifeline, so that the stage ends the command's
+	// Canceling ctx closes the lifeline, so that the stage ends the command's
 	// whole group. A stage that has not gone a little later is killed.
 	cmd.Cancel = func() error {
 		c.stop()
@@ -377,7 +414,7 @@ func (c *Cmd) Start() error {
 		abortStart(c, cmd, mark, sent)
 		var ee *exec.ExitError
 		if errors.As(err, &ee) {
-			return fmt.Errorf("the sandbox did not start: %v", ee)
+			return fmt.Errorf("the sandbox did not start: %w", ee)
 		}
 		return err
 	}
@@ -409,7 +446,7 @@ func abortStart(c *Cmd, cmd *exec.Cmd, mark marker, sent <-chan error) {
 	// that has yet to apply the profile.
 	mark.kill(time.Second, 0)
 	_ = cmd.Wait()
-	<-sent
+	<-sent //nolint:errcheck // Start is already failing and returns its own error. This only waits for the settings writer to end.
 }
 
 // rlimitFor returns r as a macOS limit. A limit of none is the most this
@@ -486,7 +523,7 @@ func (c *Cmd) Wait() error {
 		// budget would go the same way.
 		err = &survivorsError{err}
 	default:
-		scans, end := c.run.mark.kill(teardownBudget, c.run.group)
+		scans, end := c.teardown()
 		c.run.callerScans.Add(int64(scans))
 		if end != endEmpty {
 			err = &survivorsError{err}
@@ -506,7 +543,7 @@ func (c *Cmd) Wait() error {
 // pipe.
 func (c *Cmd) stageReport() (done stageDone, ok bool) {
 	defer c.run.status.Close()
-	if testIgnoreStageReport {
+	if c.run.ignoreStageReport {
 		return stageDone{}, false
 	}
 	_ = c.run.status.SetReadDeadline(time.Now().Add(time.Second))
@@ -538,7 +575,7 @@ func (e *survivorsError) Unwrap() error { return e.cause }
 
 // Is makes the error match ErrSurvivors, which Unwrap alone would not, since
 // it leads to the cause.
-func (e *survivorsError) Is(target error) bool { return target == ErrSurvivors }
+func (*survivorsError) Is(target error) bool { return target == ErrSurvivors }
 
 // watchStage ends the sandbox's processes once the stage has exited, which is
 // when the stage did not, as when it was killed, and is harmless when it did.
@@ -566,7 +603,7 @@ func (c *Cmd) watchStage() func() {
 			// Keep at it while Wait still waits, since a survivor may hold
 			// the command's output open.
 			for {
-				scans, end := c.run.mark.kill(teardownBudget, c.run.group)
+				scans, end := c.teardown()
 				c.run.callerScans.Add(int64(scans))
 				if end == endEmpty {
 					return
@@ -596,6 +633,12 @@ func (c *Cmd) watchStage() func() {
 // nothing here serves a listener. Like Wait, it returns an error that matches [ErrSurvivors] when
 // teardown could not confirm the sandbox empty, with the status still returned.
 func Run(ctx context.Context, spec Spec) (int, error) {
+	return runAs(ctx, spec, os.Geteuid())
+}
+
+// runAs is Run for a process whose effective uid is uid, as command is for
+// Command.
+func runAs(ctx context.Context, spec Spec, uid int) (int, error) {
 	if spec.Listen > 0 {
 		return 0, errors.New("Run cannot serve listeners; use Command")
 	}
@@ -606,7 +649,7 @@ func Run(ctx context.Context, spec Spec) (int, error) {
 		}
 		spec.Dir = dir
 	}
-	c, err := Command(ctx, spec)
+	c, err := commandAs(ctx, spec, uid)
 	if err != nil {
 		return 0, err
 	}

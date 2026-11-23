@@ -4,7 +4,6 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
-	"os"
 	"syscall"
 	"time"
 	"unsafe"
@@ -30,11 +29,11 @@ import (
 //go:cgo_import_dynamic libc_sandbox_check sandbox_check "/usr/lib/libSystem.B.dylib"
 //go:cgo_import_dynamic _ _ "/usr/lib/libSystem.B.dylib"
 
-//go:linkname syscall_syscall9 syscall.syscall9
-func syscall_syscall9(fn, a1, a2, a3, a4, a5, a6, a7, a8, a9 uintptr) (r1, r2 uintptr, err syscall.Errno)
+//go:linkname syscallSyscall9 syscall.syscall9
+func syscallSyscall9(fn, a1, a2, a3, a4, a5, a6, a7, a8, a9 uintptr) (r1, r2 uintptr, err syscall.Errno)
 
-// libc_sandbox_check_trampoline_addr is the address of the assembly trampoline.
-var libc_sandbox_check_trampoline_addr uintptr
+// libcSandboxCheckTrampolineAddr is the address of the assembly trampoline.
+var libcSandboxCheckTrampolineAddr uintptr
 
 const (
 	// filterGlobalName is SANDBOX_FILTER_GLOBAL_NAME, which makes the check
@@ -81,10 +80,10 @@ func lookupAllowed(pid int, name string) (allowed, ok bool) {
 	// amd64, and the first stack slot on arm64, where Apple puts every variadic
 	// argument. syscall9 puts its ninth argument there on arm64 and its seventh
 	// to ninth on the stack on amd64, which nothing reads.
-	r, _, _ := syscall_syscall9(libc_sandbox_check_trampoline_addr,
-		uintptr(pid), uintptr(unsafe.Pointer(op)), filterGlobalName|noReport, uintptr(unsafe.Pointer(n)),
-		0, 0, 0, 0, uintptr(unsafe.Pointer(n)))
-	switch int32(r) {
+	r, _, _ := syscallSyscall9(libcSandboxCheckTrampolineAddr,
+		uintptr(pid), uintptr(unsafe.Pointer(op)), filterGlobalName|noReport, uintptr(unsafe.Pointer(n)), //nolint:gosec // G103: the pointers are converted in the call's own argument list, which keeps them valid until it returns.
+		0, 0, 0, 0, uintptr(unsafe.Pointer(n))) //nolint:gosec // G103: as above.
+	switch int32(r) { //nolint:gosec // G115: sandbox_check returns a C int, so only the low 32 bits of the register mean anything.
 	case 0:
 		return true, true
 	case 1:
@@ -104,10 +103,10 @@ func kernelFinds(pid int) bool {
 	if err != nil {
 		return false
 	}
-	r, _, _ := syscall_syscall9(libc_sandbox_check_trampoline_addr,
-		uintptr(pid), uintptr(unsafe.Pointer(op)), noReport, 0,
+	r, _, _ := syscallSyscall9(libcSandboxCheckTrampolineAddr,
+		uintptr(pid), uintptr(unsafe.Pointer(op)), noReport, 0, //nolint:gosec // G103: the pointer is converted in the call's own argument list, which keeps it valid until it returns.
 		0, 0, 0, 0, 0)
-	return int32(r) == -1
+	return int32(r) == -1 //nolint:gosec // G115: sandbox_check returns a C int, so only the low 32 bits of the register mean anything.
 }
 
 // lookup is what a check of one pid found.
@@ -178,7 +177,8 @@ func (m marker) processes() ([]int, error) {
 		return nil, fmt.Errorf("list processes: %w", err)
 	}
 	var out []int
-	for _, p := range procs {
+	for i := range procs {
+		p := &procs[i]
 		if p.Proc.P_stat == stateZombie {
 			continue
 		}
@@ -189,19 +189,18 @@ func (m marker) processes() ([]int, error) {
 	return out, nil
 }
 
-// testProberHook and testIgnoreStageReport are set by tests, to make a
-// teardown that cannot prove the sandbox empty without a process that keeps
-// ahead of it. They are nil and false in a program.
-var (
-	testProberHook        func(*prober)
-	testIgnoreStageReport bool
-)
+// testProberHook changes the prober of every teardown in this process, to
+// make one that cannot prove the sandbox empty without a process that keeps
+// ahead of it. A test binary's TestMain sets it, once, in a stage process
+// before anything runs, since the stage has no Cmd to carry a hook (see
+// run.proberHook). It is nil in a program.
+var testProberHook func(*prober)
 
 // prober returns the scan's view of the system for m: the account's pids
 // from proc_listpids in one atomic list (procinfo_darwin.go), sandbox_check, and
 // the process's bsdinfo.
 func (m marker) prober(execPid int) prober {
-	uid := uint32(os.Geteuid())
+	uid := euid()
 	p := prober{
 		execPid: execPid,
 		list:    func() ([]int, error) { return listUIDPids(uid) },

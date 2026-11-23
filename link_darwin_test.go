@@ -42,7 +42,7 @@ func TestRootLinkRefusedByFileLink(t *testing.T) {
 		t.Fatalf("%d roots carry a file-link deny, want 2 (Home and the Write file):\n%s", kept, prof)
 	}
 	dest := filepath.Join(home, "hard")
-	out, err := exec.CommandContext(t.Context(), "/usr/bin/sandbox-exec", "-p", strings.Join(lines, "\n"), "/bin/ln", f, dest).CombinedOutput()
+	out, err := exec.CommandContext(t.Context(), "/usr/bin/sandbox-exec", "-p", strings.Join(lines, "\n"), "/bin/ln", f, dest).CombinedOutput() //nolint:gosec // G204: the test binary or a tool the test names, run as the test's own child.
 	if _, statErr := os.Lstat(dest); statErr == nil || err == nil {
 		t.Errorf("a hard link of the Write file into the home worked: %v %s", err, out)
 	}
@@ -55,6 +55,7 @@ func TestRootLinkRefusedByFileLink(t *testing.T) {
 		}
 	}
 	_ = os.Remove(dest)
+	//nolint:gosec // G204: the test binary or a tool the test names, run as the test's own child.
 	if out, err := exec.CommandContext(t.Context(), "/usr/bin/sandbox-exec", "-p", strings.Join(open, "\n"), "/bin/ln", f, dest).CombinedOutput(); err != nil {
 		t.Errorf("control: the link failed without the file-link deny, so this test shows nothing: %v %s", err, out)
 	}

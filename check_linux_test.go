@@ -10,6 +10,7 @@ import (
 )
 
 func TestParseStatus(t *testing.T) {
+	t.Parallel()
 	const in = "Name:\tx\nCapInh:\t0000000000000000\nCapPrm:\t000001ffffffffff\nCapEff:\t0000000000000400\nCapBnd:\t000001ffffffffff\nNoNewPrivs:\t1\nSeccomp:\t2\nSeccomp_filters:\t3\nGroups:\t4 5\n"
 	st, err := parseStatus(strings.NewReader(in))
 	if err != nil {
@@ -32,6 +33,7 @@ func TestParseStatus(t *testing.T) {
 }
 
 func TestParseUIDMap(t *testing.T) {
+	t.Parallel()
 	for in, want := range map[string]bool{
 		"         0          0 4294967295\n":         true,
 		"         0       1000          1\n":         false,
@@ -46,6 +48,7 @@ func TestParseUIDMap(t *testing.T) {
 }
 
 func TestParseGateway(t *testing.T) {
+	t.Parallel()
 	const in = `Iface	Destination	Gateway 	Flags	RefCnt	Use	Metric	Mask		MTU	Window	IRTT
 eth0	00000000	0100A8C0	0003	0	0	100	00000000	0	0	0
 eth0	0000A8C0	00000000	0001	0	0	100	00FFFFFF	0	0	0
@@ -60,6 +63,7 @@ eth0	0000A8C0	00000000	0001	0	0	100	00FFFFFF	0	0	0
 }
 
 func TestParseStatPPID(t *testing.T) {
+	t.Parallel()
 	for in, want := range map[string]int{
 		"12 (bash) S 7 12 12 0": 7,
 		"12 (a b) c) S 9 1":     9,
@@ -74,6 +78,7 @@ func TestParseStatPPID(t *testing.T) {
 }
 
 func TestMountPointAndSnapshots(t *testing.T) {
+	t.Parallel()
 	mounts := []mount{{point: "/"}, {point: "/data"}, {point: "/data/deep"}, {point: "/datum"}}
 	if m, _ := mountPoint(mounts, "/data/deep/x/y"); m.point != "/data/deep" {
 		t.Errorf("mountPoint = %q", m.point)
@@ -101,6 +106,7 @@ func TestMountPointAndSnapshots(t *testing.T) {
 // isolates the test binary. It goes through the check marker, which this
 // package's init dispatches until Stage does.
 func TestCheckVM(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	res, err := Check(ctx, nil, Expect{})
@@ -192,6 +198,7 @@ func osNeutralNames() []string {
 }
 
 func TestProbeVM(t *testing.T) {
+	t.Parallel()
 	rep, err := Probe()
 	if err != nil {
 		for _, c := range rep.Checks {
@@ -233,6 +240,7 @@ func TestProbeNoBubblewrap(t *testing.T) {
 // TestNestedAttempts runs the nested extras in the VM against paths that are
 // not mounts, so each is refused, and checks the data-driven plumbing.
 func TestNestedAttempts(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	spec := &Spec{Kernel: KernelNested, Home: dir, Read: []string{dir}, Cover: []string{dir}}
 	res := checkNested(&checkEnv{spec: spec})

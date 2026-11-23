@@ -68,7 +68,20 @@ const iptSoSetReplace = 64
 
 // TestMain lets the test binary be each part of a sandbox: the process that
 // starts it, its first stage, and the command inside it.
+// listenTCP listens on a TCP address, with a context that is never canceled,
+// for the processes the tests run inside a sandbox, which have none of their
+// own to give.
+func listenTCP(addr string) (net.Listener, error) {
+	var lc net.ListenConfig
+	return lc.Listen(context.Background(), "tcp", addr)
+}
+
 func TestMain(m *testing.M) {
+	registerAPIModes()
+	registerAPIAllocCheck()
+	registerEscapeModes()
+	registerEscRoot()
+	registerHardeningChecks()
 	if code, ok := Stage(); ok {
 		os.Exit(code)
 	}
@@ -770,6 +783,7 @@ func sandboxCmd(t *testing.T, spec Spec, fakeHost bool, args ...string) *exec.Cm
 }
 
 func TestRenameBetweenDirs(t *testing.T) {
+	t.Parallel()
 	code, out := runSandbox(t, Spec{Home: t.TempDir()}, false, "rename")
 	if code != 0 {
 		t.Fatalf("rename in the sandbox's home exited %d: %s", code, out)
@@ -777,6 +791,7 @@ func TestRenameBetweenDirs(t *testing.T) {
 }
 
 func TestCoverHomes(t *testing.T) {
+	t.Parallel()
 	// withFakeHost writes the secrets as the account that then starts the
 	// sandbox, so a pass means the sandbox hid them.
 	if code, out := runSandbox(t, Spec{Home: t.TempDir()}, true, "homes"); code != 0 {
@@ -785,14 +800,17 @@ func TestCoverHomes(t *testing.T) {
 }
 
 func TestEtcLinks(t *testing.T) {
+	t.Parallel()
 	if code, out := runSandbox(t, Spec{Home: t.TempDir()}, true, "links"); code != 0 {
 		t.Fatalf("links from /etc in the sandbox, exit %d: %s", code, out)
 	}
 }
 
 func TestKernelLevels(t *testing.T) {
+	t.Parallel()
 	for _, level := range []Kernel{KernelStrict, KernelNested, KernelOpen} {
 		t.Run(string(level), func(t *testing.T) {
+			t.Parallel()
 			spec := Spec{Home: t.TempDir(), Kernel: level}
 			if code, out := runSandbox(t, spec, false, "kernel", string(level)); code != 0 {
 				t.Fatalf("system calls under kernel %s, exit %d: %s", level, code, out)
@@ -808,6 +826,7 @@ func TestKernelLevels(t *testing.T) {
 // stands for serve. The open level shows what the namespaces refuse without
 // the filter in front of them.
 func TestIsolation(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		level   Kernel
 		network Network
@@ -819,6 +838,7 @@ func TestIsolation(t *testing.T) {
 	} {
 		level := tc.level
 		t.Run(string(level)+"/"+tc.network.String(), func(t *testing.T) {
+			t.Parallel()
 			other := filepath.Join(t.TempDir(), "f")
 			if err := os.WriteFile(other, []byte("other"), 0o600); err != nil {
 				t.Fatal(err)
@@ -861,6 +881,7 @@ func TestIsolation(t *testing.T) {
 // TestNestedMounts checks that code under kernel nested that makes a user
 // and mount namespace of its own cannot use it to undo the sandbox's view.
 func TestNestedMounts(t *testing.T) {
+	t.Parallel()
 	exe, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
@@ -901,6 +922,7 @@ func sessionStore(t *testing.T, home string) string {
 // away, and when anything would be mounted inside its home at all, which a
 // sandbox could have prepared for bubblewrap to follow.
 func TestRefusedLayouts(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name  string
 		plant func(t *testing.T, store string)
@@ -925,6 +947,7 @@ func TestRefusedLayouts(t *testing.T) {
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			home := t.TempDir()
 			store := sessionStore(t, home)
 			tc.plant(t, store)
@@ -941,6 +964,7 @@ func TestRefusedLayouts(t *testing.T) {
 // writable when it is also covered, by name or as the account's own home,
 // as a deployment's is when the sandbox's home is the account's.
 func TestHomeCovered(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name  string
 		cover []string
@@ -950,6 +974,7 @@ func TestHomeCovered(t *testing.T) {
 		{"the account's own home", nil, "HOME=" + ownHome},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			cmd := sandboxCmd(t, Spec{Home: ownHome, Cover: tc.cover}, true, "rename")
 			if tc.env != "" {
 				cmd.Env = append(cmd.Env, tc.env)
@@ -965,6 +990,7 @@ func TestHomeCovered(t *testing.T) {
 // started, here a bind of a covered directory to a path the sandbox can
 // see, does not appear inside it.
 func TestLateMounts(t *testing.T) {
+	t.Parallel()
 	home := t.TempDir()
 	spec := Spec{Home: home, Cover: []string{appDir}}
 	if code, out := runSandbox(t, spec, true, "late"); code != 0 {

@@ -19,9 +19,14 @@ var SelfPath = func() string {
 	return exe
 }()
 
-// run is what a started Cmd holds, which is nothing where there is no
-// backend yet.
-type run struct{}
+// backend is what a Cmd holds for the platform's implementation, which is
+// nothing where there is no backend yet.
+type backend struct{}
+
+// Cmd's backend field is for the backends that have state to keep. Naming it
+// here keeps the checks for unused code from reporting it, since nothing here
+// reads it.
+var _ backend = (&Cmd{}).backend
 
 // Command is not supported off Linux yet.
 func Command(context.Context, Spec) (*Cmd, error) {
@@ -29,25 +34,25 @@ func Command(context.Context, Spec) (*Cmd, error) {
 }
 
 // Start is not supported off Linux yet.
-func (c *Cmd) Start() error { return errors.ErrUnsupported }
+func (*Cmd) Start() error { return errors.ErrUnsupported }
 
 // Wait is not supported off Linux yet.
-func (c *Cmd) Wait() error { return errors.ErrUnsupported }
+func (*Cmd) Wait() error { return errors.ErrUnsupported }
 
 // Pid is zero where there is no backend yet.
-func (c *Cmd) Pid() int { return 0 }
+func (*Cmd) Pid() int { return 0 }
 
 // ListenAddrs is empty where there is no backend yet.
-func (c *Cmd) ListenAddrs() []string { return nil }
+func (*Cmd) ListenAddrs() []string { return nil }
 
 // LoopbackPorts is empty where there is no backend yet.
-func (c *Cmd) LoopbackPorts() []int { return nil }
+func (*Cmd) LoopbackPorts() []int { return nil }
 
 // Listeners is empty where there is no backend yet.
-func (c *Cmd) Listeners() []net.Listener { return nil }
+func (*Cmd) Listeners() []net.Listener { return nil }
 
 // Footprint is not supported where there is no backend yet.
-func (c *Cmd) Footprint() (int64, error) { return 0, errors.ErrUnsupported }
+func (*Cmd) Footprint() (int64, error) { return 0, errors.ErrUnsupported }
 
 // Run is not supported off Linux yet.
 func Run(context.Context, Spec) (int, error) {
