@@ -1547,16 +1547,10 @@ func TestEscapeLaunchServices(t *testing.T) {
 		}
 	}()
 	url := "http://" + ln.Addr().String() + "/sandbox-lsopen-beacon"
-	// Anything that is running already is not this test's, and anything this
-	// test starts is ended with it, so a miscount cannot carry to a later run.
+	// Anything that is running already is not this test's. An app that appears
+	// is reported once, by its pid and path, and is not signaled: it is not a
+	// process this test started, and may be one its user opened.
 	before := calculators(t)
-	t.Cleanup(func() {
-		for pid := range calculators(t) {
-			if _, old := before[pid]; !old {
-				_ = syscall.Kill(pid, syscall.SIGKILL)
-			}
-		}
-	})
 	for _, services := range [][]Service{nil, {ServiceFirefox}, {ServiceFirefox, ServiceDirectory}} {
 		spec := Spec{Services: services, BroadLoopback: true}
 		for _, cmd := range []string{
@@ -1574,8 +1568,7 @@ func TestEscapeLaunchServices(t *testing.T) {
 			time.Sleep(300 * time.Millisecond)
 			for pid, comm := range calculators(t) {
 				if _, old := before[pid]; !old {
-					t.Errorf("services %v: %q launched an app outside the profile: pid %d, %s", services, cmd, pid, comm)
-					_ = syscall.Kill(pid, syscall.SIGKILL)
+					t.Errorf("services %v: %q launched an app outside the profile, or one was opened meanwhile: pid %d, %s, left running", services, cmd, pid, comm)
 					before[pid] = comm
 				}
 			}
@@ -2081,13 +2074,6 @@ func TestEscapeLaunchServicesRawXPC(t *testing.T) {
 	}()
 	url := "http://" + ln.Addr().String() + "/raw-xpc-beacon"
 	before := calculators(t)
-	t.Cleanup(func() {
-		for pid := range calculators(t) {
-			if _, old := before[pid]; !old {
-				_ = syscall.Kill(pid, syscall.SIGKILL)
-			}
-		}
-	})
 	without := sh(t, Spec{Home: dir, Read: []string{dir}}, bin+" "+url+" 2>&1")
 	with := sh(t, Spec{Home: dir, Read: []string{dir}, Services: []Service{ServiceFirefox}, BroadLoopback: true}, bin+" "+url+" 2>&1")
 	if !strings.Contains(without.stdout, "Connection invalid") {
@@ -2104,7 +2090,7 @@ func TestEscapeLaunchServicesRawXPC(t *testing.T) {
 	}
 	for pid, comm := range calculators(t) {
 		if _, old := before[pid]; !old {
-			t.Errorf("an app was launched outside the profile: pid %d, %s", pid, comm)
+			t.Errorf("an app was launched outside the profile, or one was opened meanwhile: pid %d, %s, left running", pid, comm)
 		}
 	}
 }

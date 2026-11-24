@@ -152,7 +152,7 @@ The darwin tests run code that tries to escape a sandbox, on the developer's own
 So these rules hold for every darwin test:
 
 - **No signal but 0 or `SIGWINCH` to a process the test didn't start.** Signal 0 reports the check without delivering anything. `SIGWINCH` is ignored by default. Processes a test ends are found by the sandbox's own marker, which names only processes under that sandbox's profile.
-- **No app launches.** A test may try `open` or LaunchServices from inside a sandbox, and asserts that nothing started. It counts executables by path before and after. It never allows `lsopen` to see what happens: the one experiment that did launch Calculator was run by hand.
+- **No app launches.** A test may try `open` or LaunchServices from inside a sandbox, and asserts that nothing started. It counts executables by path before and after. An app that appears is reported, with its pid and path, and never ended: the test did not start it, and it may be one its user opened, so a failure leaves it running. It never allows `lsopen` to see what happens: the one experiment that did launch Calculator was run by hand.
 - **No changes to settings, launchd, TCC or the keychain.** A test may try to read these from inside a sandbox, and only checks that the attempt failed.
 - **Write only to temp directories the test made.**
 - **Mutation checks only on a copy of the tree**, never in place. A mutation that allows signals is run with probes that signal nothing (`kill` with 0, or a harmless signal for the broadcasts), since a profile that fails open would otherwise signal the caller's own processes.
