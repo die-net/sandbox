@@ -162,8 +162,12 @@ func TestAPICommandErrors(t *testing.T) {
 		})
 	}
 	// A root caller is refused, and so is one that the tests make look like it.
-	if _, err := commandAs(t.Context(), Spec{Command: []string{"true"}, Home: home}, 0); err == nil || !strings.Contains(err.Error(), "root") {
+	if _, err := commandAs(t.Context(), Spec{Command: []string{"true"}, Home: home}, 0, 0); err == nil || !strings.Contains(err.Error(), "root") {
 		t.Errorf("Command as euid 0 = %v, want a refusal", err)
+	}
+	// So is one whose real uid is not its effective uid.
+	if _, err := commandAs(t.Context(), Spec{Command: []string{"true"}, Home: home}, 501, 0); err == nil || !strings.Contains(err.Error(), "real uid") {
+		t.Errorf("Command as ruid 0, euid 501 = %v, want a refusal", err)
 	}
 }
 
