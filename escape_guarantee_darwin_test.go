@@ -1957,14 +1957,34 @@ func TestEscapeDescriptorsHandedIn(t *testing.T) {
 }
 
 // Row: "Root launcher ... Test the euid-0 refusal": a Command made as root is
-// refused, checked by making the check think it is root.
+// refused, checked by making the check think it is root. So is one whose real
+// uid is not its effective uid, since teardown lists the sandbox's processes by
+// effective uid and the command could set its own to the real one.
 func TestEscapeRefusesEuid0(t *testing.T) {
 	t.Parallel()
-	if _, err := commandAs(t.Context(), Spec{Command: []string{"/usr/bin/true"}, Home: realTemp(t)}, 0); err == nil {
-		t.Error("Command as root succeeded")
+	spec := Spec{Command: []string{"/usr/bin/true"}, Home: realTemp(t)}
+	for _, tc := range []struct {
+		name       string
+		euid, ruid int
+	}{
+		{"root", 0, 0},
+		{"real uid root, effective not", 501, 0},
+		{"effective uid root, real not", 0, 501},
+		{"two other ids", 501, 502},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if _, err := commandAs(t.Context(), spec, tc.euid, tc.ruid); err == nil {
+				t.Error("Command succeeded")
+			}
+			if _, err := runAs(t.Context(), spec, tc.euid, tc.ruid); err == nil {
+				t.Error("Run succeeded")
+			}
+		})
 	}
-	if _, err := runAs(t.Context(), Spec{Command: []string{"/usr/bin/true"}, Home: realTemp(t)}, 0); err == nil {
-		t.Error("Run as root succeeded")
+	// With the same id for both, only root is refused.
+	if _, err := commandAs(t.Context(), spec, os.Geteuid(), os.Geteuid()); err != nil {
+		t.Errorf("Command with one id for both: %v", err)
 	}
 }
 

@@ -126,17 +126,27 @@ var SelfPath = selfPath()
 // answers before Start.
 //
 // It refuses to run as root, as on Linux, and there is no way to ask for
-// another account. It refuses a Service it does not know, and a resource limit
+// another account. It also refuses a process whose real uid differs from its
+// effective uid: the command inherits both, and teardown lists the sandbox's
+// processes by effective uid, so a command that set its effective uid to its
+// real one would leave the list. It refuses a Service it does not know, and a resource limit
 // macOS does not enforce: ResourceAddressSpace.
 func Command(ctx context.Context, spec Spec) (*Cmd, error) {
-	return commandAs(ctx, spec, os.Geteuid())
+	return commandAs(ctx, spec, os.Geteuid(), os.Getuid())
 }
 
-// commandAs is Command for a process whose effective uid is uid, which a test
-// sets to be root without being it.
-func commandAs(ctx context.Context, spec Spec, uid int) (*Cmd, error) {
-	if uid == 0 {
+// commandAs is Command for a process whose effective uid is euid and real uid
+// is ruid, which a test sets to be root, or a setuid process, without being one.
+func commandAs(ctx context.Context, spec Spec, euid, ruid int) (*Cmd, error) {
+	if euid == 0 {
 		return nil, errors.New("the sandbox will not run as root: switch to the sandbox's own uid first")
+	}
+	if ruid != euid {
+		// The command gets both ids, and can set its effective uid to the real
+		// one. Teardown finds the sandbox's processes among those of the
+		// effective uid (PROC_UID_ONLY compares the credential's uid), so the
+		// command would leave the list, and a scan would be clean with it alive.
+		return nil, fmt.Errorf("the sandbox will not run with real uid %d and effective uid %d: make them the same first", ruid, euid)
 	}
 	if err := spec.checkRequest(); err != nil {
 		return nil, err
@@ -633,12 +643,12 @@ func (c *Cmd) watchStage() func() {
 // nothing here serves a listener. Like Wait, it returns an error that matches [ErrSurvivors] when
 // teardown could not confirm the sandbox empty, with the status still returned.
 func Run(ctx context.Context, spec Spec) (int, error) {
-	return runAs(ctx, spec, os.Geteuid())
+	return runAs(ctx, spec, os.Geteuid(), os.Getuid())
 }
 
-// runAs is Run for a process whose effective uid is uid, as command is for
-// Command.
-func runAs(ctx context.Context, spec Spec, uid int) (int, error) {
+// runAs is Run for a process whose effective uid is euid and real uid is ruid,
+// as commandAs is for Command.
+func runAs(ctx context.Context, spec Spec, euid, ruid int) (int, error) {
 	if spec.Listen > 0 {
 		return 0, errors.New("Run cannot serve listeners; use Command")
 	}
@@ -649,7 +659,7 @@ func runAs(ctx context.Context, spec Spec, uid int) (int, error) {
 		}
 		spec.Dir = dir
 	}
-	c, err := commandAs(ctx, spec, uid)
+	c, err := commandAs(ctx, spec, euid, ruid)
 	if err != nil {
 		return 0, err
 	}
