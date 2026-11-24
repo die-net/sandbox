@@ -1559,7 +1559,7 @@ func TestEscapeCommandForksAndExitsAfterTheList(t *testing.T) {
 	stage, command, mark := c.Pid(), c.run.group, c.run.mark
 	// The stage runs again before the sandbox is ended, so that nothing is left
 	// stopped. Cleanups run last first.
-	t.Cleanup(func() { _ = syscall.Kill(stage, syscall.SIGCONT) })
+	t.Cleanup(func() { _ = continueStage(c) })
 	var started procStat
 	eventually(t, 5*time.Second, "the command is not under the profile", func() bool {
 		st, err := statPid(command)
@@ -1606,7 +1606,7 @@ func TestEscapeCommandForksAndExitsAfterTheList(t *testing.T) {
 	if got, err := mark.processes(); err != nil || len(got) == 0 {
 		t.Errorf("the child ended by itself, so the test shows nothing: %v, %v", got, err)
 	}
-	if err := syscall.Kill(stage, syscall.SIGCONT); err != nil {
+	if err := continueStage(c); err != nil {
 		t.Fatal(err)
 	}
 	if err := waitWithin(t, c, 9*time.Second); err != nil {
@@ -1614,5 +1614,38 @@ func TestEscapeCommandForksAndExitsAfterTheList(t *testing.T) {
 	}
 	if got, err := mark.processes(); err != nil || len(got) != 0 {
 		t.Errorf("processes of the sandbox after Wait: %v, %v", got, err)
+	}
+}
+
+// continueStage sends SIGCONT to c's stage, which a test stopped. It signals
+// through the stage's os.Process, which sends nothing once Wait has reaped the
+// stage: the stage's number may be another process's by then, and a SIGCONT by
+// number would resume a job the user stopped.
+func continueStage(c *Cmd) error {
+	return c.run.cmd.Process.Signal(syscall.SIGCONT)
+}
+
+// A cleanup that continues the stage runs after Wait has reaped it, and it must
+// send nothing then, since its pid is free for another process to take. The
+// number's reuse can't be made to happen, so this checks what tells the two
+// ways apart: a signal by number to a pid that is free fails with ESRCH, and one
+// through the os.Process is refused with ErrProcessDone, before anything is sent.
+func TestContinueStageSendsNothingAfterWait(t *testing.T) {
+	t.Parallel()
+	c, err := Command(t.Context(), Spec{Home: realTemp(t), Command: []string{"/usr/bin/true"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := continueStage(c); err != nil {
+		t.Errorf("continueStage on a stage that has not been waited for: %v", err)
+	}
+	if err := waitWithin(t, c, 9*time.Second); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if err := continueStage(c); !errors.Is(err, os.ErrProcessDone) {
+		t.Errorf("continueStage after Wait: %v, want %v, which means nothing was sent", err, os.ErrProcessDone)
 	}
 }
