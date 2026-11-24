@@ -81,14 +81,14 @@ Seatbelt checks the path a file has when it is opened, not one opened earlier. S
 
 `Start` runs this binary again, as the stage, with `Stage` finding it first in `main`, outside the profile and as the caller. It can't exec `sandbox-exec` and be done, since macOS has no `Pdeathsig` and nothing else ends a command when its caller dies. The stage:
 
-1. Takes its settings, the profile and the limits, from a pipe, and sets the limits on itself, so it holds them as pid 1 does on Linux.
+1. Takes its settings, the profile, the marker and the limits, from a pipe, and refuses them if the marker has no names (a teardown with none finds no process under the profile and would call the sandbox empty without looking). It sets the limits on itself, so it holds them as pid 1 does on Linux.
 2. Marks every inherited descriptor but the command's close-on-exec, from `/dev/fd`, and never closes one by number.
 3. Starts `sandbox-exec -f /dev/fd/N -- command` in a process group of its own, with the profile on a pipe, so no command line names it, and the caller's `Files` at 3 and up. The command's group is in the caller's session and isn't the caller's group, so `kill(0)` and `kill(-1)` from inside reach only the sandbox.
 4. Sends the caller a reply, the command's group or the setup error, so `Start` returns once the command has been started. Each message on the pipe says its kind (`reply` or `done`), and a reader refuses the wrong one: a lifeline that closes during `Start` can make the stage's last message the first the caller reads (`TestStageMessagesRefuseTheWrongKind`).
 5. Relays `SIGTERM`, `SIGHUP` and `SIGINT` to the command, and waits for it.
 6. When the command exits, ends the command's group and then every process under the sandbox's profile with `SIGKILL`, until none is left. Then it exits with the command's status, or 128 plus the signal.
 
-The lifeline is a pipe the caller holds the write end of, as on Linux. The stage reads it from its first moment. When it reaches EOF, which is when the caller closes it or dies, however it dies, the stage ends the sandbox and exits.
+The lifeline is a pipe the caller holds the write end of, as on Linux. The stage reads it from its first moment. When it reaches EOF, which is when the caller closes it or dies, however it dies, the stage ends the sandbox and exits. If the stage's main path has already ended the sandbox, because the command ended first, the watcher does nothing and the stage exits with the command's status: the command is reaped by then, and a second kill of its group's number could reach someone else's process (`TestLifelineClosedAfterTheStageFinished`).
 
 If the stage itself is killed it can't end anything, so `Wait` watches for that and ends the sandbox as soon as the stage is gone. A process the stage left behind could hold the command's output open and keep `Wait` from returning.
 
@@ -118,7 +118,7 @@ The sandbox's processes are found by the profile instead:
 
 ### Teardown
 
-The stage ends the command's process group, then scans until a scan proves that nothing runs under the profile, or until it has reason to stop (below). `Wait` skips its own scan when the stage says it did, and returns `ErrSurvivors` without one when the stage says it gave up on members. The scan code is `scan_darwin.go`, and the two `proc_info` calls it makes are `procinfo_darwin.go`.
+The stage ends the command's process group, then scans until a scan proves that nothing runs under the profile, or until it has reason to stop (below). `Wait` skips its own scan when the stage says it did, and returns `ErrSurvivors` without one when the stage says it gave up on members. A report that says both is taken as the second (`TestJudgeReport`). The scan code is `scan_darwin.go`, and the two `proc_info` calls it makes are `procinfo_darwin.go`.
 
 #### What a scan proves
 

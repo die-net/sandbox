@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -622,5 +623,173 @@ func TestMarkerSurvivesEveryServiceAndOption(t *testing.T) {
 			c.stop()
 			_ = c.Wait()
 		})
+	}
+}
+
+// ------------------------------------------- the stage's lifeline and settings
+
+// The lifeline reaching EOF ends the sandbox, once. If the main path has
+// already ended it, the command is reaped and its group number may be no one's
+// or someone else's, so the watcher must not end the group again, and must not
+// exit, which would take the command's status over with 137.
+func TestLifelineClosedAfterTheStageFinished(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name     string
+		finished bool
+		group    int
+		wantEnd  int  // how many times the sandbox is ended
+		wantExit bool // whether the stage exits at once
+	}{
+		{"the main path finished", true, 7, 0, false},
+		{"the main path has not finished", false, 7, 1, true},
+		{"the command has not started", false, 0, 0, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			// finish writes the report to this pipe and closes it.
+			r, w, err := os.Pipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer r.Close()
+			s := &stageState{group: tc.group, finished: tc.finished, status: w}
+			ended := 0
+			exit := s.lifelineClosed(func(group int, _ marker) (int, endKind) {
+				ended++
+				if group != tc.group {
+					t.Errorf("ended group %d, want %d", group, tc.group)
+				}
+				return 1, endEmpty
+			})
+			if ended != tc.wantEnd || exit != tc.wantExit {
+				t.Errorf("ended %d times, exit = %v; want %d and %v", ended, exit, tc.wantEnd, tc.wantExit)
+			}
+			// The lock is held when the stage is to exit, so that nothing runs on and
+			// changes its status, and free when it is not.
+			if free := s.mu.TryLock(); free == tc.wantExit {
+				t.Errorf("the lock is free = %v after the call, want %v", free, !tc.wantExit)
+			}
+		})
+	}
+}
+
+// A stage given settings with no marker refuses them and starts nothing, since
+// a teardown with no marker takes every pid for one outside the sandbox and
+// would call the sandbox empty without looking.
+func TestStageRefusesSettingsWithoutAMarker(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name   string
+		marker marker
+		want   bool // whether the stage refuses
+	}{
+		{"no names", marker{}, true},
+		{"no name to look up", marker{Out: "out"}, true},
+		{"no name to refuse", marker{In: "in"}, true},
+		{"both names", marker{In: "in", Out: "out"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if err := (stageSettings{Marker: tc.marker}).check(); (err != nil) != tc.want {
+				t.Errorf("check = %v, want a refusal = %v", err, tc.want)
+			}
+		})
+	}
+	// The stage itself, run as the test binary does: it answers with the error
+	// and does not start the command.
+	lifeR, lifeW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = lifeW.Close() })
+	setR, setW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	statR, statW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = statR.Close() })
+	body, err := json.Marshal(stageSettings{Profile: "(version 1)(allow default)"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := setW.Write(body); err != nil {
+		t.Fatal(err)
+	}
+	_ = setW.Close()
+	cmd := exec.CommandContext(t.Context(), selfPath(), stageArg, "--", "/usr/bin/true") //nolint:gosec // G204: the stage is this test binary, which TestMain runs as one.
+	cmd.ExtraFiles = []*os.File{lifeR, setR, statW}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	_ = lifeR.Close()
+	_ = setR.Close()
+	_ = statW.Close()
+	reply, rerr := readReply(json.NewDecoder(statR))
+	if err := cmd.Wait(); err == nil {
+		t.Error("the stage exited 0 with settings that have no marker")
+	}
+	if rerr != nil || !strings.Contains(reply.Error, "marker") || reply.Group != 0 {
+		t.Errorf("reply = %+v, %v; want an error that names the marker and no group", reply, rerr)
+	}
+}
+
+// ------------------------------------------------------------- Wait's report
+
+// Wait takes the stage's report only for what it says, and a report that says
+// both that the sandbox is empty and that members are left is taken as the
+// worse: the stage never sends one, so it is wrong, and wrong fails closed.
+func TestJudgeReport(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name     string
+		done     stageDone
+		reported bool
+		want     reportVerdict
+	}{
+		{"no report", stageDone{}, false, reportNone},
+		{"no report, though the message says empty", stageDone{Empty: true}, false, reportNone},
+		{"neither", stageDone{Kind: kindDone}, true, reportNone},
+		{"empty", stageDone{Empty: true}, true, reportEmpty},
+		{"members", stageDone{Members: true}, true, reportGaveUp},
+		{"both", stageDone{Empty: true, Members: true}, true, reportGaveUp},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := judgeReport(tc.done, tc.reported); got != tc.want {
+				t.Errorf("judgeReport = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// A sandbox-exec that is missing or has no execute bit is an error that says
+// which, and one that has no error behind it doesn't print a nil wrapped.
+func TestCheckSandboxExec(t *testing.T) {
+	t.Parallel()
+	dir := realTemp(t)
+	plain := filepath.Join(dir, "plain")
+	if err := os.WriteFile(plain, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	exe := filepath.Join(dir, "exe")
+	if err := os.WriteFile(exe, nil, 0o700); err != nil { //nolint:gosec // G306: the test needs an executable file.
+		t.Fatal(err)
+	}
+	if err := checkSandboxExec(sandboxExec); err != nil {
+		t.Errorf("the real %s: %v", sandboxExec, err)
+	}
+	if err := checkSandboxExec(exe); err != nil {
+		t.Errorf("an executable file: %v", err)
+	}
+	if err := checkSandboxExec(filepath.Join(dir, "gone")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("a missing file: %v, want one that wraps ErrNotExist", err)
+	}
+	err := checkSandboxExec(plain)
+	if err == nil || !strings.Contains(err.Error(), "not executable") || strings.Contains(err.Error(), "%!") {
+		t.Errorf("a file with no execute bit: %v, want an error that says it is not executable", err)
 	}
 }

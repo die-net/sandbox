@@ -260,11 +260,28 @@ func (c *Cmd) stop() {
 	})
 }
 
+// checkSandboxExec reports whether path is an executable file, as the sandbox
+// needs of /usr/bin/sandbox-exec. A missing file is wrapped in its error, and a
+// file with no execute bit has none to wrap.
+func checkSandboxExec(path string) error {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("find %s, which the sandbox needs on macOS: %w", path, err)
+	}
+	if fi.Mode()&0o111 == 0 {
+		return fmt.Errorf("%s, which the sandbox needs on macOS, is not executable", path)
+	}
+	return nil
+}
+
 // Start resolves the spec's paths, writes the profile, and starts the stage,
 // which runs sandbox-exec. It returns once the stage has started the command,
 // or has failed to, and before the command's own start, so a command that
 // fails to run shows in Wait's status.
 func (c *Cmd) Start() error {
+	if c.run.keepOpen == nil {
+		return errors.New("sandbox: the Cmd was not made by Command")
+	}
 	if c.run.started {
 		return errors.New("sandbox: already started")
 	}
@@ -288,8 +305,8 @@ func (c *Cmd) Start() error {
 			}
 		}
 	}()
-	if fi, err := os.Stat(sandboxExec); err != nil || fi.Mode()&0o111 == 0 {
-		return fmt.Errorf("find %s, which the sandbox needs on macOS: %w", sandboxExec, err)
+	if err := checkSandboxExec(sandboxExec); err != nil {
+		return err
 	}
 	self := selfPath()
 	if self == "" {
@@ -525,13 +542,10 @@ func (c *Cmd) Wait() error {
 	// this scans, from outside the profile. Only the profile's marker names the
 	// processes: the command's process group is a number that the kernel may
 	// have given to someone else by now.
-	done, reported := c.stageReport()
-	switch {
-	case reported && done.Empty:
-	case reported && done.Members:
-		// The stage scanned until members kept turning up, and gave up. Another
-		// budget would go the same way.
+	switch judgeReport(c.stageReport()) {
+	case reportGaveUp:
 		err = &survivorsError{err}
+	case reportEmpty:
 	default:
 		scans, end := c.teardown()
 		c.run.callerScans.Add(int64(scans))
@@ -544,6 +558,32 @@ func (c *Cmd) Wait() error {
 		err = serr
 	}
 	return err
+}
+
+// reportVerdict is what Wait takes from the stage's last message.
+type reportVerdict int
+
+const (
+	// reportNone is that there is no usable report, and Wait scans for itself.
+	reportNone reportVerdict = iota
+	// reportEmpty is that the stage proved the sandbox empty.
+	reportEmpty
+	// reportGaveUp is that the stage scanned until members kept turning up, and
+	// gave up. Another budget would go the same way.
+	reportGaveUp
+)
+
+// judgeReport says what a report that was read, or not, comes to. A report that
+// says both that the sandbox is empty and that members are left is one the stage
+// never sends, so it fails closed: the members come first.
+func judgeReport(done stageDone, reported bool) reportVerdict {
+	switch {
+	case reported && done.Members:
+		return reportGaveUp
+	case reported && done.Empty:
+		return reportEmpty
+	}
+	return reportNone
 }
 
 // stageReport reads the stage's last message, which is there if the stage has
