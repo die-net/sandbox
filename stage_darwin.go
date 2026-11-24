@@ -187,16 +187,25 @@ func supervise(command []string) (int, error) {
 		return 0, err
 	}
 	st.mark = settings.Marker
-	child, err := startCommand(settings, command, &st.mu, &st.group)
+	child, send, err := startCommand(settings, command, &st.mu, &st.group)
 	if err != nil {
 		_ = json.NewEncoder(st.status).Encode(stageReply{Kind: kindReply, Error: err.Error()})
 		_ = st.status.Close()
 		return 0, err
 	}
+	if testBeforeReply != nil {
+		testBeforeReply()
+	}
 	// The pipe stays open for the last message.
 	st.mu.Lock()
-	_ = json.NewEncoder(st.status).Encode(stageReply{Kind: kindReply, Group: st.group})
+	replied := json.NewEncoder(st.status).Encode(stageReply{Kind: kindReply, Group: st.group}) == nil
 	st.mu.Unlock()
+	// Only now, with the caller holding the pid, does sandbox-exec get its
+	// profile, and so a command to run. A caller that could not be told has gone,
+	// and the lifeline ends the command's group.
+	if replied {
+		go send()
+	}
 	stop := relayToChild(child)
 	defer stop()
 	var ws unix.WaitStatus
@@ -282,15 +291,31 @@ func (s stageSettings) check() error {
 	return nil
 }
 
+// testBeforeReply is called by the stage once sandbox-exec has started and
+// before the stage replies, so that a test can end the stage there. It is nil
+// in a program, and only a test binary's TestMain sets it, before the tests run.
+var testBeforeReply func()
+
 // startCommand sets the limits and starts sandbox-exec, which applies the
 // profile and runs the command. It holds mu until the command's group is
 // recorded in group.
-func startCommand(s stageSettings, command []string, mu *sync.Mutex, group *int) (*os.Process, error) {
+//
+// It does not give sandbox-exec the profile: sandbox-exec waits for it on its
+// pipe, and send writes it, which the caller of startCommand does once the
+// caller of the stage has the reply. A stage that is killed before then leaves
+// a sandbox-exec, or the child that is to become one, with no profile, and
+// that one reads an empty one and refuses it (sandbox-exec exits with status
+// 65, "no version specified") without running the command. Written before the
+// start, as it was, a profile was in the pipe whole already, and the child of a
+// stage killed after the fork and before the exec went on to apply it and run
+// the command, which the caller, with no reply, had no pid to look for
+// (docs/findings.md).
+func startCommand(s stageSettings, command []string, mu *sync.Mutex, group *int) (p *os.Process, send func(), err error) {
 	// The command is looked up on the PATH the stage was given, which is the
 	// command's, from the working directory the command starts in.
 	path, err := exec.LookPath(command[0])
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	command = append([]string{path}, command[1:]...)
 	// The limits go before the command starts, and apply to the stage too,
@@ -299,7 +324,7 @@ func startCommand(s stageSettings, command []string, mu *sync.Mutex, group *int)
 	// for the child.
 	for _, r := range s.Rlimits {
 		if err := syscall.Setrlimit(r.Resource, &syscall.Rlimit{Cur: r.Soft, Max: r.Hard}); err != nil {
-			return nil, fmt.Errorf("set limit %d: %w", r.Resource, err)
+			return nil, nil, fmt.Errorf("set limit %d: %w", r.Resource, err)
 		}
 	}
 	// Every inherited descriptor but the command's own is marked close-on-exec,
@@ -313,17 +338,11 @@ func startCommand(s stageSettings, command []string, mu *sync.Mutex, group *int)
 	}
 	profR, profW, err := os.Pipe()
 	if err != nil {
-		return nil, fmt.Errorf("make the profile pipe: %w", err)
+		return nil, nil, fmt.Errorf("make the profile pipe: %w", err)
 	}
 	defer profR.Close()
 	profFd := len(files)
 	files = append(files, profR)
-	// The profile is written from here, in the background, since
-	// sandbox-exec reads it all before it starts anything.
-	go func() {
-		_, _ = profW.WriteString(s.Profile)
-		_ = profW.Close()
-	}()
 	args := make([]string, 0, 4+len(command))
 	args = append(args, "sandbox-exec", "-f", "/dev/fd/"+strconv.Itoa(profFd), "--")
 	args = append(args, command...)
@@ -341,17 +360,23 @@ func startCommand(s stageSettings, command []string, mu *sync.Mutex, group *int)
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	p, err := os.StartProcess(sandboxExec, args, attr) //nolint:gosec // G702: sandboxExec is a constant path, and running the configured command under it is the library's job.
+	p, err = os.StartProcess(sandboxExec, args, attr) //nolint:gosec // G702: sandboxExec is a constant path, and running the configured command under it is the library's job.
 	runtime.KeepAlive(files)
 	if err != nil {
-		return nil, fmt.Errorf("start %s: %w", sandboxExec, err)
+		_ = profW.Close()
+		return nil, nil, fmt.Errorf("start %s: %w", sandboxExec, err)
 	}
 	// The caller's files are the command's now, and the profile's pipe too.
 	for _, f := range files[3:profFd] {
 		_ = f.Close()
 	}
 	*group = p.Pid
-	return p, nil
+	// sandbox-exec reads the whole profile before it starts anything, so this
+	// is written in the background, in case it is larger than the pipe.
+	return p, func() {
+		_, _ = profW.WriteString(s.Profile)
+		_ = profW.Close()
+	}, nil
 }
 
 // markCloseOnExec sets close-on-exec on every open descriptor from 3 up,
