@@ -1516,3 +1516,103 @@ func TestStartFailureEndsACommandWhoseStageDied(t *testing.T) {
 	}
 	eventually(t, 5*time.Second, "the escapee outlived Start's cleanup", func() bool { return !alive(escapee) })
 }
+
+// Row: "Teardown": the command is a member whose parent, the stage, is not one,
+// so a scan that excuses a dying process by its parent can't excuse it. This is
+// the race that rule opened. The command forks a child after the scan's list is
+// taken and exits before the scan reads it. The scan then reads the command as
+// a zombie or exiting, with the stage, which is no member, as its parent, and
+// the child, which is not in the list, runs under the profile. The scan must
+// not be clean.
+//
+// The scan's window is under a millisecond, and a zombie of the command lasts
+// as long as the stage takes to reap it, so the test fixes the order. The list's
+// hook releases the command and waits until its child runs and the command is
+// gone, and the scan's read of the command is the one thing that is not the
+// kernel's: it answers as the kernel does for a process that is exiting, with
+// the command's own start time and the stage as its parent. Everything else is
+// real. The stage, which the test started, is stopped with SIGSTOP so that it
+// doesn't end the child before the scan has run, and continued with SIGCONT.
+// Nothing else is signaled. The list is cut to the stage and the command so
+// that other tests' processes can't make the scan unclean for another reason.
+func TestEscapeCommandForksAndExitsAfterTheList(t *testing.T) {
+	t.Parallel()
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = pw.Close() })
+	c, err := Command(t.Context(), Spec{
+		Home:    realTemp(t),
+		Command: []string{"/bin/sh", "-c", "read x; /bin/sleep 60 & exit 0"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Env = []string{shellPath}
+	c.Stdin = pr
+	if err := c.Start(); err != nil {
+		t.Fatal(err)
+	}
+	_ = pr.Close()
+	endAtCleanup(t, c)
+	stage, command, mark := c.Pid(), c.run.group, c.run.mark
+	// The stage runs again before the sandbox is ended, so that nothing is left
+	// stopped. Cleanups run last first.
+	t.Cleanup(func() { _ = syscall.Kill(stage, syscall.SIGCONT) })
+	var started procStat
+	eventually(t, 5*time.Second, "the command is not under the profile", func() bool {
+		st, err := statPid(command)
+		started = st
+		return err == nil && st.Comm != sandboxExecName && mark.inSandbox(command)
+	})
+	if err := syscall.Kill(stage, syscall.SIGSTOP); err != nil {
+		t.Fatal(err)
+	}
+	p := mark.prober(command)
+	list, stat := p.list, p.stat
+	p.list = func() ([]int, error) {
+		pids, err := list()
+		if err != nil {
+			return nil, err
+		}
+		// The command forks after the list was taken, and exits.
+		if _, err := pw.WriteString("go\n"); err != nil {
+			t.Error(err)
+		}
+		eventually(t, 5*time.Second, "the command did not exit", func() bool {
+			_, err := statPid(command)
+			return errors.Is(err, unix.ESRCH)
+		})
+		eventually(t, 5*time.Second, "the command's child is not under the profile", func() bool {
+			got, err := mark.processes()
+			return err == nil && len(got) > 0
+		})
+		return slices.DeleteFunc(pids, func(pid int) bool { return pid != stage && pid != command }), nil
+	}
+	p.stat = func(pid int) (procStat, error) {
+		if pid == command {
+			return procStat{Exiting: true, Start: started.Start, Comm: started.Comm, PPid: stage}, nil
+		}
+		return stat(pid)
+	}
+	clean, _, err := p.scan(memory{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if clean {
+		t.Error("the scan was clean while the command's child runs under the profile")
+	}
+	if got, err := mark.processes(); err != nil || len(got) == 0 {
+		t.Errorf("the child ended by itself, so the test shows nothing: %v, %v", got, err)
+	}
+	if err := syscall.Kill(stage, syscall.SIGCONT); err != nil {
+		t.Fatal(err)
+	}
+	if err := waitWithin(t, c, 9*time.Second); err != nil {
+		t.Errorf("Wait: %v", err)
+	}
+	if got, err := mark.processes(); err != nil || len(got) != 0 {
+		t.Errorf("processes of the sandbox after Wait: %v, %v", got, err)
+	}
+}

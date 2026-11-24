@@ -11,6 +11,7 @@ Each finding says how it worked, what stops it now, and the test that checks it.
 - [Processes and the kernel](#processes-and-the-kernel)
 - [Found by the security review of the Linux backend](#found-by-the-security-review-of-the-linux-backend)
 - [Found while building the macOS backend](#found-while-building-the-macos-backend)
+- [Found by the review of the macOS teardown proof](#found-by-the-review-of-the-macos-teardown-proof)
 - [Found in the code and plans of the projects that adopt it](#found-in-the-code-and-plans-of-the-projects-that-adopt-it)
 
 ## Covered files reached another way
@@ -282,6 +283,23 @@ A review of the finished backend by Fable 5.2 found four issues and no full esca
 - **What wasn't checked.** The message the XPC client sends is rejected by `launchservicesd` outside the sandbox as well, since the real request is private to LaunchServices. The library's calls to it don't go through any public `xpc_connection_create*` function, so interposing couldn't capture one to replay. The `lsopen` denial is logged against the calling process, which suggests the check is on the caller's side. Whether `launchservicesd` checks it on the server side is untested, and a review should look at it.
 - **Test.** `TestEscapeLaunchServices` snapshots the Calculator processes by executable path before, looks after each attempt, and ends any it didn't find. `TestEscapeLaunchServicesRawXPC` is the raw client.
 - **A false alarm.** An earlier run of this test reported "an app was launched: 2 processes of Calculator, was 0", and the profile-in-argv test saw profile text in `ps`. Both were the suite's own checks matching command lines of other programs. The Calculator count matched any command line that named `Calculator.app`, including a hand-run `lsopen` experiment that did launch it. The argv check looked at every process on the machine, where other tools run `sandbox-exec -p` with a profile. The tests now count executables by path, snapshot before, and look only at the sandbox's own process tree.
+
+## Found by the review of the macOS teardown proof
+
+A Fable review of the proof-based teardown, reading the code against XNU's source.
+
+### The scan excused the command itself as a dying child of the stage
+
+- **How it worked.** A scan excused a zombie, or a process that is exiting, when its parent was a process the scan had found not to be a member: a non-member can't have a member for a child, since `fork` gives a child its parent's profile. One member breaks that. `sandbox-exec` applies the profile to itself and becomes the command, so the command is a member whose parent, the stage, is under none. The command could leave the stage's group and wait for the teardown, then fork a child after the scan took its list of pids and exit before the scan read its pid. The scan read a zombie or an exiting process whose parent was cleared, excused it, and was clean with the child running under the profile. `Wait` then returned nil. The child isn't in the list, so only a scan that found nothing else wrong could miss it, and the command could time it: its list is taken about a millisecond after the first signal to its group.
+- **What stops it.** A scan never excuses a pid that may be the `sandbox-exec` of this sandbox (`mayApply`) by its parent. It counts as unknown until a later scan finds it dying with the same start time, as a process that is stuck in exit does. Where the caller doesn't know the pid (`abortStart`), no dying child is excused by its parent. That costs one more scan, since the next scan has seen it.
+- **Test.** `TestScanDyingCommandIsNotExcusedByItsParent` runs the cases with a fake system. `TestEscapeCommandForksAndExitsAfterTheList` runs a real sandbox whose command forks and exits after the list is taken, with the stage stopped so that it can't end the child, and checks that the scan isn't clean. Both fail with the `mayApply` test taken out of the scan. The scan's read of the command is the one thing in the second that isn't the kernel's: the window in which a real zombie shows is too short to hit, so the test answers as the kernel does for a process that is exiting.
+
+### A scan remembered the stage's child before it execed `sandbox-exec`
+
+- **How it worked.** A scan remembers a pid it found not to be a member, with its start time, and a later scan doesn't ask about it again. The one process that can become a member is the `sandbox-exec` that applies the profile, so a pid that may be it was never remembered. It was checked only by its name, though, and the stage's child has the stage's name until it execs `sandbox-exec`. Where the caller has no pid for the one it started (`abortStart`), every process counts as one that may be it, and such a pid was remembered once it was found free under another name. If the stage was killed between its child's `dup2` of the status pipe and the `execve`, and the first scan wasn't clean for another reason, the next scan took the child as cleared by its start time alone. It then execed `sandbox-exec` and ran the command with nothing watching it. Found by reading, and not run: the window is a few microseconds inside the child's fork and exec.
+- **What stops it.** With no pid for its `sandbox-exec`, a scan remembers no pid it found free. The next scan looks again, and finds the command a member. That costs the failure path a second look at each process of the account on every scan.
+- **Not stopped.** A first scan that is clean ends the teardown, and it is clean if it finds that child free under the stage's name, so a stage killed in that window can still leave the command running. The child can't be told from an ordinary process of the account before it execs, and nothing under the profile starts it.
+- **Test.** `TestScanWithNoExecPidLooksAgainAtWhatItFoundFree` fails if the pid is remembered.
 
 ## Found in the code and plans of the projects that adopt it
 
