@@ -328,9 +328,10 @@ func TestWaitGivesUpOnMembersItCannotEnd(t *testing.T) {
 	if err := c.Start(); err != nil {
 		t.Fatal(err)
 	}
-	endAtCleanup(t, c) // runs last, with the hook gone
+	endAtCleanup(t, c) // ends what the no-op kill left
+	// The hook stays: it is on this test's own Cmd, and a Wait that waitWithin
+	// abandoned on a timeout may still read it, so no cleanup writes it.
 	c.run.proberHook = func(p *prober) { p.kill = func(int) {} }
-	t.Cleanup(func() { c.run.proberHook = nil })
 	eventually(t, 5*time.Second, "the command did not start under the profile", func() bool {
 		in, _ := c.run.mark.member(c.run.group)
 		return in
