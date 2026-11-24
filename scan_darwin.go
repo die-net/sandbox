@@ -23,8 +23,13 @@ import "time"
 // it. The child exists only because its parent is inside fork, so the parent is
 // alive and on the list at the snapshot, and if the child will be a member so is
 // the parent: the scan kills it, or finds it exiting or gone, and is not clean
-// either way. fork1 ends the child if the parent has begun to exit. So if every
-// pid in the list is shown not to be under the profile, then
+// either way. fork() in bsd/kern/kern_fork.c ends a child that fork1 made for a
+// parent that has begun to exit (task_terminate_internal on the child, when
+// P_LEXIT is set), but posix_spawn in bsd/kern/kern_exec.c, which calls fork1
+// itself, has no such check, so an exiting process can still make a child
+// until its last thread has gone. Only a zombie is past that: proc_exit, which
+// sets SZOMB, is called by the last thread to terminate (bsd/kern/kern_exit.c).
+// So if every pid in the list is shown not to be under the profile, then
 // nobody under the profile existed at that moment, and nothing can under it
 // ever again, since a process gets the profile only from a parent that has it,
 // or from sandbox-exec applying it to itself (handled below).
@@ -78,13 +83,15 @@ import "time"
 //   - A zombie (pbi_status SZOMB, found because proc_pidinfo is told to look
 //     for them: proc_find_zombref) cannot be asked about, and was alive at the
 //     snapshot as far as one scan knows, perhaps as a member that had children.
-//     So can a process that is exiting and not yet a zombie. Either is safe if
-//     the previous scan's check already saw it so with the same start time: it
-//     was dead or dying before this snapshot, so it can fork nothing (fork1
-//     ends a child whose parent has begun to exit), and the children it made
-//     before are in this snapshot and are asked about themselves. Remembering
-//     them from one scan to the next is what stops a zombie that is never reaped,
-//     or a process stuck in exit, from making every scan unknown.
+//     So can a process that is exiting and not yet a zombie. A zombie is safe if
+//     the previous scan's check already saw it a zombie with the same start
+//     time: it had no thread left before this snapshot, so it can fork nothing,
+//     and the children it made before are in this snapshot and are asked about
+//     themselves. Remembering zombies from one scan to the next is what stops
+//     one that is never reaped from making every scan unknown. A process that
+//     is exiting and not yet a zombie is never remembered: a thread of it may be
+//     inside posix_spawn, with no check of the parent's exit, and a child it
+//     adds after this snapshot is not in the list.
 //   - A zombie or exiting process that is new to the scan is also safe if its
 //     parent (pbi_ppid) is a process that this scan found not to be a member
 //     (it is in the list too, or the child's parent would not have been alive at
@@ -173,9 +180,10 @@ type memory struct {
 	// cleared maps each pid that a scan found not to be a member to its start
 	// time. The pid stays so for as long as the process lives.
 	cleared map[int]int64
-	// dying maps each pid that a scan found exiting or a zombie to its start
-	// time.
-	dying map[int]int64
+	// zombies maps each pid that a scan found a zombie to its start time. A
+	// zombie has no thread left, so it forks nothing. A process that is exiting
+	// and not yet a zombie is not kept: one of its threads may still be spawning.
+	zombies map[int]int64
 	// killed is how many members of the sandbox the scan found and signaled.
 	killed int
 }
@@ -196,7 +204,7 @@ func (p prober) scan(prev memory) (clean bool, next memory, err error) {
 		return false, memory{}, err
 	}
 	clean = true
-	next = memory{cleared: make(map[int]int64), dying: make(map[int]int64)}
+	next = memory{cleared: make(map[int]int64), zombies: make(map[int]int64)}
 	var kids []dyingKid
 	// check is the whole check of one pid.
 	check := func(pid int) {
@@ -211,12 +219,15 @@ func (p prober) scan(prev memory) (clean bool, next memory, err error) {
 		switch {
 		case err != nil || st.Forking || st.Start >= t:
 			clean = false
-		case st.Zombie || st.Exiting:
-			// A zombie keeps PROC_FLAG_INEXIT, and so is either.
-			next.dying[pid] = st.Start
-			if start, ok := prev.dying[pid]; !ok || start != st.Start {
+		case st.Zombie:
+			// A zombie keeps PROC_FLAG_INEXIT, so this is asked before Exiting.
+			next.zombies[pid] = st.Start
+			if start, ok := prev.zombies[pid]; !ok || start != st.Start {
 				kids = append(kids, dyingKid{pid, st.PPid, st.Start})
 			}
+		case st.Exiting:
+			// Not remembered, and so unknown every time but for its parent.
+			kids = append(kids, dyingKid{pid, st.PPid, st.Start})
 		case !l.Known:
 			clean = false
 		case l.Free && p.mayApply(pid):
@@ -268,7 +279,7 @@ func (p prober) scan(prev memory) (clean bool, next memory, err error) {
 	for _, k := range kids {
 		// The pid that may have applied the profile is a member whose parent, the
 		// stage, is not one, so its parent says nothing about it. It is settled
-		// only by an earlier scan that saw it dying.
+		// only by an earlier scan that saw it a zombie.
 		if p.mayApply(k.pid) || !parentCleared(next.cleared, k) {
 			clean = false
 		}
