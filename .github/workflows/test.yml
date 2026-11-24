@@ -63,12 +63,17 @@ jobs:
   # which Probe would refuse. Firefox is on the runner image, so
   # TestFirefoxScreenshot and TestFirefoxNetwork run, and skip where it is not.
   # The race detector needs cgo on macOS, so only that leg runs it.
+  #
+  # Seatbelt's rules differ between releases: macOS 15 and 26 allowed a hard
+  # link that 27 refuses (docs/findings.md). So each release a runner offers
+  # is named here, rather than macos-latest, which moves without notice.
   macos:
-    name: test macos cgo=${{ matrix.cgo }}
-    runs-on: macos-latest
+    name: test ${{ matrix.os }} cgo=${{ matrix.cgo }}
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: [macos-15, macos-26]
         cgo: ["0", "1"]
     env:
       CGO_ENABLED: ${{ matrix.cgo }}
