@@ -293,6 +293,17 @@ func TestAPICmdMisuse(t *testing.T) {
 	for _, l := range c.Listeners() {
 		_ = l.Close()
 	}
+	// A Cmd that Command did not make is refused, and does not panic.
+	z := &Cmd{}
+	if err := z.Start(); err == nil {
+		t.Error("Start of a zero Cmd returned nil")
+	}
+	if err := z.Wait(); err == nil {
+		t.Error("Wait of a zero Cmd returned nil")
+	}
+	if z.Pid() != 0 || z.ListenAddrs() != nil || z.LoopbackPorts() != nil || z.Listeners() != nil {
+		t.Error("a zero Cmd has a pid, addresses or listeners")
+	}
 }
 
 func TestAPIStdio(t *testing.T) {

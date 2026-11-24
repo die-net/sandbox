@@ -492,8 +492,15 @@ func dnsProbe(name, addr string) Result {
 		return pass(name, "%s: %v", what, err)
 	}
 	defer c.Close()
+	return dnsQueryOn(name, what, c)
+}
+
+// dnsQueryOn sends the query on c, which is connected to a resolver, and fails
+// if an answer comes back. If it can't set a deadline the read could wait for
+// good, and nothing was asked, so the check is skipped and not passed.
+func dnsQueryOn(name, what string, c net.Conn) Result {
 	if err := c.SetDeadline(time.Now().Add(netTimeout)); err != nil {
-		return pass(name, "%s: %v", what, err)
+		return skipped(name, "%s: could not set a deadline, so nothing was sent: %v", what, err)
 	}
 	if _, err := c.Write(dnsQuery); err == nil {
 		var buf [512]byte

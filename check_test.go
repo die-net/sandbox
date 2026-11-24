@@ -3,6 +3,8 @@ package sandbox
 import (
 	"bufio"
 	"context"
+	"errors"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -220,5 +222,42 @@ func TestSpecDrivenChecks(t *testing.T) {
 	}
 	if entries, _ := os.ReadDir(ro); len(entries) != 0 {
 		t.Errorf("writes.outside left %v", entries)
+	}
+}
+
+// noDeadlineConn is a connection that refuses a deadline, and records a write.
+type noDeadlineConn struct {
+	net.Conn
+	wrote bool
+}
+
+func (*noDeadlineConn) SetDeadline(time.Time) error { return errors.New("no deadlines here") }
+
+func (c *noDeadlineConn) Write([]byte) (int, error) {
+	c.wrote = true
+	return 0, errors.New("nothing should be sent")
+}
+
+// A DNS probe that can't bound its wait sends nothing and says so, as skipped.
+// It used to pass without probing, which counted as a guarantee shown.
+func TestDNSQueryOnNeedsADeadline(t *testing.T) {
+	t.Parallel()
+	c := &noDeadlineConn{}
+	res := dnsQueryOn("egress.test", "a query", c)
+	if res.Status != Skipped || c.wrote {
+		t.Errorf("status = %v, wrote = %v; want Skipped and nothing sent: %+v", res.Status, c.wrote, res)
+	}
+	// With a deadline it asks, and an answer is a failure.
+	client, server := net.Pipe()
+	defer client.Close()
+	go func() {
+		defer server.Close()
+		var buf [512]byte
+		if _, err := server.Read(buf[:]); err == nil {
+			_, _ = server.Write(make([]byte, 20))
+		}
+	}()
+	if res := dnsQueryOn("egress.test", "a query", client); res.Status != Fail {
+		t.Errorf("status = %v for a resolver that answered, want Fail: %+v", res.Status, res)
 	}
 }

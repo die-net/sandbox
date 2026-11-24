@@ -153,21 +153,7 @@ func Stage() (int, bool) {
 // scan proves none is left (scan_darwin.go). It then tells the caller whether
 // it did (stageDone), and exits with the command's status.
 func supervise(command []string) (int, error) {
-	var mu sync.Mutex
-	group := 0
-	var mark marker
-	// status is the pipe to the caller. finish sends the last message once,
-	// and mu is held when it runs.
-	var status *os.File
-	finished := false
-	finish := func(scans int, end endKind) {
-		if finished {
-			return
-		}
-		finished = true
-		_ = json.NewEncoder(status).Encode(stageDone{Kind: kindDone, Empty: end == endEmpty, Members: end == endMembers, Scans: scans})
-		_ = status.Close()
-	}
+	var st stageState
 	// Watch from the first moment, so a caller that died during setup leaves
 	// no command running. The lock is held from before the command starts
 	// until its group is known, so either this ends the process before the
@@ -179,11 +165,9 @@ func supervise(command []string) (int, error) {
 				break
 			}
 		}
-		mu.Lock()
-		if group != 0 {
-			finish(killAll(group, mark))
+		if st.lifelineClosed(killAll) {
+			os.Exit(128 + int(unix.SIGKILL)) //nolint:revive // deep-exit: the stage must end from this goroutine once the lifeline closes, and nothing above it could take an exit status.
 		}
-		os.Exit(128 + int(unix.SIGKILL)) //nolint:revive // deep-exit: the stage must end from this goroutine once the lifeline closes, and nothing above it could take an exit status.
 	}()
 	// Without the lifeline the watcher's first read fails and ends the
 	// process, racing the clean error below. Fail here instead.
@@ -196,18 +180,23 @@ func supervise(command []string) (int, error) {
 	if err := json.NewDecoder(os.NewFile(fdSettings, "settings")).Decode(&settings); err != nil {
 		return 0, fmt.Errorf("read the settings: %w", err)
 	}
-	status = os.NewFile(fdStatus, "status")
-	mark = settings.Marker
-	child, err := startCommand(settings, command, &mu, &group)
+	st.status = os.NewFile(fdStatus, "status")
+	if err := settings.check(); err != nil {
+		_ = json.NewEncoder(st.status).Encode(stageReply{Kind: kindReply, Error: err.Error()})
+		_ = st.status.Close()
+		return 0, err
+	}
+	st.mark = settings.Marker
+	child, err := startCommand(settings, command, &st.mu, &st.group)
 	if err != nil {
-		_ = json.NewEncoder(status).Encode(stageReply{Kind: kindReply, Error: err.Error()})
-		_ = status.Close()
+		_ = json.NewEncoder(st.status).Encode(stageReply{Kind: kindReply, Error: err.Error()})
+		_ = st.status.Close()
 		return 0, err
 	}
 	// The pipe stays open for the last message.
-	mu.Lock()
-	_ = json.NewEncoder(status).Encode(stageReply{Kind: kindReply, Group: group})
-	mu.Unlock()
+	st.mu.Lock()
+	_ = json.NewEncoder(st.status).Encode(stageReply{Kind: kindReply, Group: st.group})
+	st.mu.Unlock()
 	stop := relayToChild(child)
 	defer stop()
 	var ws unix.WaitStatus
@@ -224,14 +213,73 @@ func supervise(command []string) (int, error) {
 	// The command is reaped, so its pid is no one's yet. A signal relayed now
 	// would go to the number, and the teardown below can take seconds.
 	stop()
-	mu.Lock()
-	finish(killAll(group, mark))
-	mu.Unlock()
-	giveBackTerminal(group)
+	st.mu.Lock()
+	st.finish(killAll(st.group, st.mark))
+	st.mu.Unlock()
+	giveBackTerminal(st.group)
 	if ws.Signaled() {
 		return 128 + int(ws.Signal()), nil
 	}
 	return ws.ExitStatus(), nil
+}
+
+// stageState is what the stage's main path and its lifeline watcher share.
+type stageState struct {
+	// mu is held from before the command starts until group is set, and while a
+	// teardown runs, so that only one of the two ends the sandbox.
+	mu sync.Mutex
+	// group is the command's process group, which is 0 until it is started.
+	group int
+	mark  marker
+	// status is the pipe to the caller. finish sends the last message on it.
+	status *os.File
+	// finished is whether finish has run.
+	finished bool
+}
+
+// finish sends the caller the stage's last message, once, and closes the pipe.
+// mu is held.
+func (s *stageState) finish(scans int, end endKind) {
+	if s.finished {
+		return
+	}
+	s.finished = true
+	_ = json.NewEncoder(s.status).Encode(stageDone{Kind: kindDone, Empty: end == endEmpty, Members: end == endMembers, Scans: scans})
+	_ = s.status.Close()
+}
+
+// lifelineClosed is what the stage does when the lifeline reaches EOF, which
+// is when the caller has closed it or gone. It ends the command's group and the
+// sandbox with end, if the command has started, and reports that the stage
+// should now exit at once with the status of a killed one. It holds mu then, so
+// that the main path cannot go on and take the command's status over this one.
+//
+// If the main path has already ended the sandbox, which it did if it finished
+// before the lifeline closed or while this waited for mu, there is nothing left
+// to end, and the command has been reaped: a second kill of its group's number
+// would go to a number that is no one's, or someone else's. This returns false
+// with mu released, and the main path exits with the command's status.
+func (s *stageState) lifelineClosed(end func(group int, m marker) (int, endKind)) (exit bool) {
+	s.mu.Lock()
+	if s.finished {
+		s.mu.Unlock()
+		return false
+	}
+	if s.group != 0 {
+		s.finish(end(s.group, s.mark))
+	}
+	return true
+}
+
+// check refuses settings that would leave the stage unable to find the
+// sandbox's processes. A marker with no names matches nothing, so a teardown
+// would take every pid for a process outside the sandbox and report the
+// sandbox empty without looking.
+func (s stageSettings) check() error {
+	if s.Marker.In == "" || s.Marker.Out == "" {
+		return errors.New("the settings carry no marker, so the sandbox's processes could not be found")
+	}
+	return nil
 }
 
 // startCommand sets the limits and starts sandbox-exec, which applies the
