@@ -66,7 +66,7 @@ Other links in `/etc` that lead into a covered path are rebound read-only, as on
 
 ### Paths and quoting
 
-`Read`, `Write`, `Home`, `Dir` and `Cover` go through the same resolution as on Linux, in the shared `prepare`, so the same layouts are refused. There are no bind mounts, so the rule that no mount may lie inside a writable directory is kept for another reason. A cover inside the home is a path-based deny, and a sandbox that can rename a directory it can write could move the covered one away and uncover what it hid.
+`Read`, `Write`, `Home`, `Dir` and `Cover` go through the same resolution as on Linux, in the shared `prepare`, so the same layouts are refused. There are no bind mounts, so the rule that no mount may lie inside a writable directory is kept for another reason, and so is the rule that `Home` may not lie inside a `Write` path: the profile pins `Home`'s own path only, so a sandbox that renamed a directory above it could put a link or a new tree there, and the caller would follow it. A cover inside the home is a path-based deny, and a sandbox that can rename a directory it can write could move the covered one away and uncover what it hid.
 
 A path goes into the profile only as a `subpath` or `literal` filter, never a regular expression, with a backslash and a double quote escaped. One with a control character, or bytes that aren't UTF-8, is refused by `Start`, since nothing here can say what the parser makes of it.
 

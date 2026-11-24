@@ -194,6 +194,10 @@ func TestPrepare(t *testing.T) {
 			Spec{Command: []string{"true"}, Home: "/srv/agent", Write: []string{"/srv/agent/.claude/projects/a"}},
 		},
 		{
+			"a home inside a write path", host,
+			Spec{Command: []string{"true"}, Home: "/srv/agent/.claude", Write: []string{"/srv/agent"}},
+		},
+		{
 			"a read path inside a write path", host,
 			Spec{Command: []string{"true"}, Home: "/home", Write: []string{"/srv/agent"}, Read: []string{"/srv/agent/.claude"}},
 		},

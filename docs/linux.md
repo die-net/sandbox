@@ -71,7 +71,7 @@ A sandbox's home and `Write` paths are untrusted: an earlier run, or another san
 - Any other path is followed through a link only where the link lies outside every directory the sandbox can write.
 - The working directory is resolved the same way. It must be the home, a `Write` or `Read` path, or a path no cover hides, so a sandbox never starts in an empty cover.
 - A covered path inside a writable directory that has gone missing stops the sandbox from starting, since a sandbox could have moved it away to uncover what it hid.
-- No mount may lie inside the home or a `Write` path at all. So every mount point is inside a tmpfs bubblewrap made or a read-only host path, never content a sandbox wrote.
+- No mount may lie inside the home or a `Write` path at all, and the home may not lie inside a `Write` path, since a sandbox that can rename a directory above it can put a link or a new tree there. So every mount point is inside a tmpfs bubblewrap made or a read-only host path, never content a sandbox wrote.
 - Each bind source is opened with `openat2` and `RESOLVE_NO_SYMLINKS` and passed as a descriptor. A cover that has become a link since it was resolved stops the sandbox, so nothing swapped in between the check and the mount can redirect it.
 
 ## The first stage

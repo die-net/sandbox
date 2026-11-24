@@ -316,8 +316,11 @@ func prepare(spec Spec, h hostView) (Spec, error) {
 	}
 	// bubblewrap before 0.12.0 follows a link it finds while it makes a
 	// mount point (CVE-2026-87766), so no mount may land inside content a
-	// sandbox could have written, where it could have planted one.
-	for _, p := range slices.Concat(spec.Write, spec.Read, spec.Cover) {
+	// sandbox could have written, where it could have planted one. That includes
+	// the home inside a write path: a sandbox that can rename a directory above
+	// the home can put a link or a new tree there, and the caller's reads and
+	// cleanup by the home's name follow it.
+	for _, p := range slices.Concat([]string{home}, spec.Write, spec.Read, spec.Cover) {
 		for _, w := range slices.Concat([]string{home}, spec.Write) {
 			if p != w && within(p, w) {
 				return Spec{}, fmt.Errorf("%s lies inside %s, which a sandbox can write, so nothing may be mounted there", p, w)
