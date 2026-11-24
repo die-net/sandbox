@@ -70,13 +70,15 @@ The counts are top-level tests and their subtests. The arm64 skip is `TestWriteA
 
 The suite found that macOS 27.0.1 and 27.2.0 differ: curl needed one more Mach service on 27.2.0 ([findings.md](findings.md#tls-needed-a-mach-service-from-272)).
 
+The full suite also passes on GitHub's 3-core arm64 runners, macOS 15.8.2 (`macos-15`) and 26.7.2 (`macos-26`), which CI runs on every pull request. Those runs found that 15 and 26 allowed a hard link of a root that 27 refuses ([findings.md](findings.md#a-write-file-could-be-hard-linked-into-the-home-on-macos-15-and-26)), and that slow machines need more scans to end a re-forking program ([macos.md](macos.md#teardown)).
+
 ### CI
 
 `.github/workflows/test.yml` runs on every push and pull request. It has not run yet, since this repository has no GitHub remote.
 
 - **Vet:** `go vet` for linux amd64, arm64 and arm, with `CGO_ENABLED=0`.
 - **Linux:** the tests on `ubuntu-24.04` with apt's bubblewrap, with cgo off and on. The runner keeps `kernel.apparmor_restrict_unprivileged_userns` at 1 and loads the test binary's profile, so CI exercises the fix users get (`SBX_LOCAL=1 SBX_APPARMOR=1`).
-- **macOS:** `go build`, `go vet` for arm64 and amd64, and `go test` on `macos-latest`, with cgo off and on, and `go test -race` on the cgo leg.
+- **macOS:** `go build`, `go vet` for arm64 and amd64, and `go test` on `macos-15` and `macos-26`, with cgo off and on, and `go test -race` on the cgo leg.
 
 ### What the tests can't cover
 
