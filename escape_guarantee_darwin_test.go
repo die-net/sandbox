@@ -893,6 +893,7 @@ func TestEscapeStartRefusesLayouts(t *testing.T) {
 		{"a cover inside the home", Spec{Home: home, Cover: []string{state}}, "inside"},
 		{"a cover that moved away from the home", Spec{Home: home, Cover: []string{filepath.Join(home, "gone")}}, "missing"},
 		{"a write path inside the home", Spec{Home: home, Write: []string{state}}, "inside"},
+		{"a home inside a write path", Spec{Home: state, Write: []string{home}}, "inside"},
 		{"a read path inside the home", Spec{Home: home, Read: []string{state}}, "inside"},
 		{"a dir under a cover", Spec{Home: home, Dir: "/Users"}, "covered"},
 	} {
