@@ -4,9 +4,13 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -386,36 +390,36 @@ func TestProfileCutShortDoesNotRun(t *testing.T) {
 	if i, j := strings.Index(prof, m.In), strings.Index(prof, "(allow file-read*"); i < 0 || j < 0 || i > j {
 		t.Errorf("the marker (at %d) is not before the file rules (at %d)", i, j)
 	}
-	run := func(p string) error {
-		cmd := exec.CommandContext(t.Context(), "/usr/bin/sandbox-exec", "-f", "/dev/stdin", "--", "/usr/bin/true")
-		cmd.Stdin = strings.NewReader(p)
-		return cmd.Run()
+	// The profile is read from a pipe by sandbox-exec, which a shell runs, so that
+	// how sandbox-exec ended is reported even if it was killed by a signal. The
+	// command it runs writes to a pipe of its own, which shows it started. A
+	// failure then says which of three things happened: sandbox-exec refused the
+	// profile, it died before it ran the command, or the command ran.
+	run := func(p string) cutRun { return runCut(t, p) }
+	if r := run(prof); r.rc != 0 || !r.ran {
+		t.Fatalf("the whole profile does not run the command: %+v", r)
 	}
-	if err := run(prof); err != nil {
-		t.Fatalf("the whole profile does not run /usr/bin/true: %v", err)
-	}
-	cuts, ran := 0, 0
+	cuts, bad := 0, 0
 	for i := range len(prof) - 1 {
 		// Every end of a line, and a spot in the middle of each.
 		if prof[i] != '\n' && i%7 != 0 {
 			continue
 		}
 		cuts++
-		err := run(prof[:i])
+		r := run(prof[:i])
 		// 65 is a syntax error. 71 is a profile that denies everything, so the
 		// command could not be started, and only a cut before the (begin makes
 		// one: what is left is the version alone. Anything else, 0 included,
 		// means the command was started under a profile that is not the one asked
-		// for.
-		var ee *exec.ExitError
+		// for, or that sandbox-exec did not end as it should.
 		want := 65
 		if i >= len("(version 1)") && i <= strings.Index(prof, "(begin") {
 			want = 71
 		}
-		if err == nil || !errors.As(err, &ee) || ee.ExitCode() != want {
-			ran++
-			if ran <= 3 {
-				t.Errorf("a profile cut at byte %d of %d, after %q, was started or not refused: %v", i, len(prof), prof[max(0, i-40):i], err)
+		if r.ran || r.rc != want {
+			bad++
+			if bad <= 3 {
+				t.Errorf("a profile cut at byte %d of %d, after %q: want sandbox-exec to exit %d without running the command, got %s", i, len(prof), prof[max(0, i-40):i], want, r)
 			}
 		}
 	}
@@ -792,4 +796,131 @@ func TestCheckSandboxExec(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "not executable") || strings.Contains(err.Error(), "%!") {
 		t.Errorf("a file with no execute bit: %v, want an error that says it is not executable", err)
 	}
+}
+
+// cutRun is how one run of sandbox-exec under runCut ended.
+type cutRun struct {
+	// rc is the status sandbox-exec ended with as the shell saw it, 128 plus the
+	// signal if it was killed, or -1 if the shell reported nothing.
+	rc int
+	// ran is whether the command it was to run started.
+	ran bool
+	// shell is how the shell itself ended, which is an error only if the shell
+	// was killed, and the crash reports that appeared during the run.
+	shell   error
+	reports string
+}
+
+func (r cutRun) String() string {
+	return fmt.Sprintf("rc %d, command ran %v, shell %v%s", r.rc, r.ran, r.shell, r.reports)
+}
+
+// runCut runs sandbox-exec with profile p on its standard input, and a command
+// that says it ran. A shell runs sandbox-exec and reports its status on
+// descriptor 3, so a crash of sandbox-exec is told from a crash of whatever
+// started it. The command reports on descriptor 4.
+func runCut(t *testing.T, p string) cutRun {
+	t.Helper()
+	pipe := func() (r, w *os.File) {
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r, w
+	}
+	rcR, rcW := pipe()
+	ranR, ranW := pipe()
+	defer rcR.Close()
+	defer ranR.Close()
+	const script = `/usr/bin/sandbox-exec -f /dev/stdin -- /bin/sh -c 'echo ran >&4'; echo $? >&3`
+	cmd := exec.CommandContext(t.Context(), "/bin/sh", "-c", script)
+	cmd.Stdin = strings.NewReader(p)
+	cmd.ExtraFiles = []*os.File{rcW, ranW}
+	start := time.Now()
+	err := cmd.Run()
+	_ = rcW.Close()
+	_ = ranW.Close()
+	r := cutRun{rc: -1, shell: err}
+	if b, _ := io.ReadAll(rcR); len(b) > 0 {
+		if n, err := strconv.Atoi(strings.TrimSpace(string(b))); err == nil {
+			r.rc = n
+		}
+	}
+	b, _ := io.ReadAll(ranR)
+	r.ran = strings.Contains(string(b), "ran")
+	if r.rc > 128 || err != nil {
+		r.reports = crashReports(start)
+	}
+	return r
+}
+
+// crashReports describes the crash reports macOS wrote since start, for a
+// process that was killed by a signal, so that a failure says what crashed. It
+// waits a little, since ReportCrash writes them after the process is gone.
+func crashReports(start time.Time) string {
+	dir := os.DirFS(filepath.Join(os.Getenv("HOME"), "Library", "Logs", "DiagnosticReports"))
+	var out strings.Builder
+	for range 20 {
+		time.Sleep(250 * time.Millisecond)
+		out.Reset()
+		files, _ := fs.Glob(dir, "*.ips")
+		for _, f := range files {
+			if fi, err := fs.Stat(dir, f); err != nil || fi.ModTime().Before(start) {
+				continue
+			}
+			b, err := fs.ReadFile(dir, f)
+			if err != nil {
+				continue
+			}
+			fmt.Fprintf(&out, "\ncrash report %s: %s", f, crashSummary(b))
+		}
+		if out.Len() > 0 {
+			break
+		}
+	}
+	if out.Len() == 0 {
+		return "\nno crash report appeared"
+	}
+	return out.String()
+}
+
+// crashSummary pulls the process, the exception and the top of the faulting
+// thread out of a crash report, which is a JSON header line and then a JSON body.
+func crashSummary(b []byte) string {
+	_, body, ok := bytes.Cut(b, []byte("\n"))
+	if !ok {
+		return "unreadable"
+	}
+	var r struct {
+		ProcName  string          `json:"procName"`
+		Exception json.RawMessage `json:"exception"`
+		Faulting  int             `json:"faultingThread"`
+		Threads   []struct {
+			Frames []struct {
+				Symbol     string `json:"symbol"`
+				SymbolLoc  int    `json:"symbolLocation"`
+				ImageIndex int    `json:"imageIndex"`
+			} `json:"frames"`
+		} `json:"threads"`
+		UsedImages []struct {
+			Name string `json:"name"`
+		} `json:"usedImages"`
+	}
+	if err := json.Unmarshal(body, &r); err != nil {
+		return "unreadable: " + err.Error()
+	}
+	var frames []string
+	if r.Faulting >= 0 && r.Faulting < len(r.Threads) {
+		for i, f := range r.Threads[r.Faulting].Frames {
+			if i == 8 {
+				break
+			}
+			img := ""
+			if f.ImageIndex >= 0 && f.ImageIndex < len(r.UsedImages) {
+				img = r.UsedImages[f.ImageIndex].Name + ":"
+			}
+			frames = append(frames, img+f.Symbol)
+		}
+	}
+	return fmt.Sprintf("process %s, exception %s, top frames %v", r.ProcName, r.Exception, frames)
 }
