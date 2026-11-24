@@ -89,9 +89,12 @@ import "time"
 //     parent (pbi_ppid) is a process that this scan found not to be a member
 //     (it is in the list too, or the child's parent would not have been alive at
 //     the snapshot), and that started no later than the child. A process that
-//     fork makes has its parent's
-//     profile, and a non-member cannot become a member, so the child is not
-//     one. A parent can change by one of two routes only: the parent exits, and
+//     fork makes has its parent's profile, and a non-member cannot become a
+//     member, so the child is not one. The pid that may be the sandbox-exec that
+//     applied the profile (mayApply) is the exception: it is a member whose
+//     parent, the stage, is not one, so its parent says nothing about it, and it
+//     is settled only as the previous bullet says. A parent can change by one of
+//     two routes only: the parent exits, and
 //     the child goes to launchd (pid 1, never a cleared parent), or a debugger
 //     attaches with ptrace, and the child's pbi_ppid is the debugger until it
 //     detaches (bsd/kern/mach_process.c; reparenting in proc_exit,
@@ -104,7 +107,8 @@ import "time"
 // and a later scan that finds the same process at that pid with the same start
 // time does not ask again, whatever has become of it since: a process cannot
 // become a member (it can be made one only by sandbox-exec applying the
-// profile, and a process that may be that one is never remembered). This keeps
+// profile, and a process that may be that one is never remembered, which is any
+// process when the caller has no pid for it). This keeps
 // the processes that are long lived from costing a scan, whatever they do while
 // it runs. It does not help for a pid that is gone before the scan reads it,
 // which the scan cannot know anything about. Heavy process churn of the
@@ -230,6 +234,10 @@ func (p prober) scan(prev memory) (clean bool, next memory, err error) {
 				clean = false
 			case !again.Known || !again.Free:
 				clean = false
+			case p.execPid == 0:
+				// Not remembered: with no pid to go by, this may be the stage's child
+				// before it execs sandbox-exec, which has the stage's name until then,
+				// and a remembered pid is not looked at again.
 			default:
 				next.cleared[pid] = st.Start
 			}
@@ -258,7 +266,10 @@ func (p prober) scan(prev memory) (clean bool, next memory, err error) {
 		check(pid)
 	}
 	for _, k := range kids {
-		if !parentCleared(next.cleared, k) {
+		// The pid that may have applied the profile is a member whose parent, the
+		// stage, is not one, so its parent says nothing about it. It is settled
+		// only by an earlier scan that saw it dying.
+		if p.mayApply(k.pid) || !parentCleared(next.cleared, k) {
 			clean = false
 		}
 	}

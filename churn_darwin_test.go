@@ -79,7 +79,7 @@ func TestChurnCleanScanRate(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		p := m.prober(0)
+		p := m.prober(otherExec)
 		var mem memory
 		scans, clean := 0, 0
 		begin := time.Now()
@@ -104,7 +104,7 @@ func TestChurnCleanScanRate(t *testing.T) {
 		total, most, gaveUp := 0, 0, 0
 		for range tries {
 			s := time.Now()
-			n, end := m.kill(budget, 0)
+			n, end := m.kill(budget, otherExec)
 			worst = max(worst, time.Since(s))
 			total += n
 			most = max(most, n)

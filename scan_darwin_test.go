@@ -98,6 +98,10 @@ func newFake(lists ...[]int) *fakeSystem {
 
 var errGone = errors.New("no such process")
 
+// otherExec is a prober's execPid for a test whose processes are none of them
+// the sandbox-exec that was started to apply the profile. 0 would be any pid.
+const otherExec = -1
+
 func TestScanCleanFirstScanEnds(t *testing.T) {
 	t.Parallel()
 	f := newFake([]int{10, 20, 30})
@@ -420,6 +424,7 @@ func TestScanRemembersWhatItCleared(t *testing.T) {
 	t.Parallel()
 	f := newFake([]int{10, 20})
 	p := f.prober()
+	p.execPid = otherExec
 	old := f.t0.Add(-time.Second).UnixMicro()
 	clean, mem, _ := p.scan(memory{})
 	if !clean || mem.cleared[10] != old || mem.cleared[20] != old {
@@ -469,8 +474,33 @@ func TestScanDoesNotRememberWhatMayStillBeAMember(t *testing.T) {
 	if _, ok := mem.cleared[30]; ok {
 		t.Error("a member was remembered as cleared")
 	}
-	if _, ok := mem.cleared[10]; !ok {
-		t.Error("an ordinary process was not remembered")
+}
+
+// A caller with no pid for the sandbox-exec it started (abortStart, after a stage
+// that was killed) cannot tell which process it is. The stage's child has the
+// stage's name until it execs sandbox-exec, so it looks like any other process
+// under no profile, and a scan that remembered it would never look at it again,
+// though it applies the profile and starts the command a moment later. So no
+// pid is remembered, and the next scan finds the command and ends it.
+func TestScanWithNoExecPidLooksAgainAtWhatItFoundFree(t *testing.T) {
+	t.Parallel()
+	f := newFake([]int{10, 20})
+	f.stat = func(_, pid int) (procStat, error) {
+		st := procStat{Start: f.t0.Add(-time.Second).UnixMicro()}
+		if pid == 20 {
+			st.Comm = "sandbox.test" // the stage's name, before it execs sandbox-exec
+		}
+		return st, nil
+	}
+	p := f.prober()
+	_, mem, _ := p.scan(memory{})
+	if _, ok := mem.cleared[20]; ok {
+		t.Fatal("a pid that may be the stage's child before its exec was remembered as cleared")
+	}
+	f.members = map[int]bool{20: true} // it has applied the profile since
+	clean, _, _ := p.scan(mem)
+	if clean || !slices.Equal(f.killed, []int{20}) {
+		t.Errorf("clean = %v, killed = %v; want the next scan to find pid 20 a member and end it", clean, f.killed)
 	}
 }
 
@@ -579,12 +609,64 @@ func TestScanDyingChildOfAClearedParent(t *testing.T) {
 			if tc.prev != nil {
 				prev = tc.prev(f)
 			}
-			clean, next, _ := f.prober().scan(prev)
+			p := f.prober()
+			p.execPid = otherExec
+			clean, next, _ := p.scan(prev)
 			if clean != tc.want {
 				t.Errorf("clean = %v, want %v", clean, tc.want)
 			}
 			if _, ok := next.dying[kid]; !ok {
 				t.Error("the child was not remembered as dying")
+			}
+		})
+	}
+}
+
+// The command is a member whose parent is not: sandbox-exec applied the profile
+// to itself, in place, and the stage that started it is under none. If it
+// forks after the scan's list is taken and exits before the scan reads it, its
+// parent being cleared says nothing about the child it left, which is not in
+// the list. So a scan never excuses that pid by its parent, only by an earlier
+// scan that saw it dying. The same layout with another pid is excused, which
+// TestScanDyingChildOfAClearedParent checks.
+func TestScanDyingCommandIsNotExcusedByItsParent(t *testing.T) {
+	t.Parallel()
+	const stage, command = 10, 20
+	old := func(f *fakeSystem) int64 { return f.t0.Add(-time.Hour).UnixMicro() }
+	young := func(f *fakeSystem) int64 { return f.t0.Add(-time.Minute).UnixMicro() }
+	for _, tc := range []struct {
+		name    string
+		dying   procStat // the command's state, with PPid and Start filled in below
+		execPid int
+		seen    bool // an earlier scan saw the command dying with the same start time
+		want    bool // whether the scan is clean
+	}{
+		{"zombie, new to the scan", procStat{Zombie: true}, command, false, false},
+		{"exiting, new to the scan", procStat{Exiting: true}, command, false, false},
+		{"zombie, seen dying by the earlier scan", procStat{Zombie: true}, command, true, true},
+		{"exiting, seen dying by the earlier scan", procStat{Exiting: true}, command, true, true},
+		{"zombie, another pid is the one", procStat{Zombie: true}, 99, false, true},
+		{"zombie, the caller does not know the pid", procStat{Zombie: true}, 0, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			f := newFake([]int{command, stage})
+			f.stat = func(_, pid int) (procStat, error) {
+				if pid == command {
+					st := tc.dying
+					st.PPid, st.Start = stage, young(f)
+					return st, nil
+				}
+				return procStat{Start: old(f)}, nil // the stage, which is under no profile
+			}
+			var prev memory
+			if tc.seen {
+				prev.dying = map[int]int64{command: young(f)}
+			}
+			p := f.prober()
+			p.execPid = tc.execPid
+			if clean, _, _ := p.scan(prev); clean != tc.want {
+				t.Errorf("clean = %v, want %v", clean, tc.want)
 			}
 		})
 	}
@@ -807,7 +889,7 @@ func TestRealScanExcusesAZombieOfANonMember(t *testing.T) {
 	only := func(p *prober) {
 		p.list = func() ([]int, error) { return []int{os.Getpid(), z}, nil }
 	}
-	p := m.prober(0)
+	p := m.prober(otherExec)
 	only(&p)
 	if clean, _, err := p.scan(memory{}); err != nil || !clean {
 		t.Errorf("a zombie child of this process: clean = %v, err = %v; want a clean scan", clean, err)
