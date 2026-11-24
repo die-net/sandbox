@@ -1076,3 +1076,35 @@ close $w; sysread($r, my $b, 1); _exit(0);`
 		t.Errorf("processes of the sandbox after Wait: %v, %v", got, err)
 	}
 }
+
+// ------------------------------------------ a stage killed after its fork
+
+// The stage starts sandbox-exec and then replies, and the caller learns the
+// command's pid from the reply. A stage killed in between leaves the child of
+// its fork, which may not have run sandbox-exec yet and which the caller, with
+// no pid, cannot tell from any other process of the account by its name. So
+// sandbox-exec is given the profile only after the reply, and one that is not
+// reads an empty profile and refuses it. A window of a few microseconds can't
+// be hit on purpose, so this ends the stage 300 ms after the fork, when a
+// command that had its profile has long run, and checks that the command did
+// not (Row: "Teardown ... on stage death").
+func TestStageKilledAfterItsForkLeavesNoCommandRunning(t *testing.T) {
+	t.Parallel()
+	home := realTemp(t)
+	ran := filepath.Join(home, "ran")
+	c, err := Command(t.Context(), Spec{Home: home, Command: []string{"/usr/bin/touch", ran}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Env = []string{shellPath, stageKillBeforeReplyEnv + "=1"}
+	if err := c.Start(); err == nil {
+		endAtCleanup(t, c)
+		t.Fatal("Start succeeded though the stage was killed before it replied")
+	}
+	// Start returned when the stage died, 300 ms after the fork. Allow the
+	// orphan the time to refuse its empty profile, or to run.
+	time.Sleep(500 * time.Millisecond)
+	if _, err := os.Stat(ran); err == nil {
+		t.Error("the command ran, though the stage that started it was killed before it replied")
+	}
+}

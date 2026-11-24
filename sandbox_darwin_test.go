@@ -44,6 +44,12 @@ const stageUnprovableEnv = "SANDBOX_TEST_STAGE_UNPROVABLE"
 // child and a lingering zombie costs the scan that sees it.
 const stageOrphanZombiesEnv = "SANDBOX_TEST_STAGE_ORPHAN_ZOMBIES"
 
+// stageKillBeforeReplyEnv, in the same place, makes the stage end itself with
+// SIGKILL 300 ms after it started sandbox-exec, before it replied: a stage
+// killed from outside after its fork, with time for a command it had started to
+// run, if it had been given its profile.
+const stageKillBeforeReplyEnv = "SANDBOX_TEST_STAGE_KILL_BEFORE_REPLY"
+
 // stageNoKillEnv, in the same place, makes the stage's scan signal nothing, so
 // that a member it finds is there again at the next scan, as a process that
 // keeps forking against the teardown is.
@@ -93,6 +99,12 @@ func TestMain(m *testing.M) {
 				return append(pids, math.MaxInt32), err
 			}
 		})
+	}
+	if os.Getenv(stageKillBeforeReplyEnv) != "" {
+		testBeforeReply = func() {
+			time.Sleep(300 * time.Millisecond)
+			_ = syscall.Kill(os.Getpid(), syscall.SIGKILL)
+		}
 	}
 	if len(hooks) > 0 {
 		testProberHook = func(p *prober) {
