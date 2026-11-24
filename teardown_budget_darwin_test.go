@@ -346,7 +346,7 @@ func TestWaitGivesUpOnMembersItCannotEnd(t *testing.T) {
 	if d := time.Since(start); d < giveUpAfter || d > giveUpAfter+3*time.Second {
 		t.Errorf("Wait took %v, want about %v", d, giveUpAfter)
 	}
-	if n := c.run.callerScans.Load(); n < 10 {
+	if n := callerSideScans(c); n < 10 {
 		t.Errorf("the caller made %d scans, want many", n)
 	}
 }
@@ -376,7 +376,7 @@ _exit(0);`
 		if err := waitWithin(t, c, 9*time.Second); err != nil {
 			t.Errorf("Wait with %d chains: %v", chains, err)
 		}
-		t.Logf("%d chains: stage scans %d, caller scans %d", chains, c.run.stageScans, c.run.callerScans.Load())
+		t.Logf("%d chains: stage scans %d, caller scans %d", chains, c.run.stageScans, callerSideScans(c))
 	}
 }
 

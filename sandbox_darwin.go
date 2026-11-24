@@ -43,10 +43,18 @@ type run struct {
 	// as it exits, says whether its teardown proved the sandbox empty.
 	status    *os.File
 	statusDec *json.Decoder
-	// stageScans is how many scans the stage's teardown made, and callerScans
-	// how many the caller's have, which tests read.
+	// readReport makes the one read of the stage's last message, which Wait and
+	// the watch of a stage that has gone both need, and report and reported are
+	// what it read.
+	readReport sync.Once
+	report     stageDone
+	reported   bool
+	// stageScans is how many scans the stage's teardown made, callerScans how
+	// many Wait's own have, and watchScans how many the watch of a stage that
+	// has gone has, which tests read.
 	stageScans  int
 	callerScans atomic.Int64
+	watchScans  atomic.Int64
 	// lifeline is the write end of the pipe the stage watches. Only this
 	// process holds it, and it is close-on-exec, so when this process goes,
 	// however it goes, the stage reads EOF and ends the command's group.
@@ -590,19 +598,22 @@ func judgeReport(done stageDone, reported bool) reportVerdict {
 // exited on its own and not been killed, and reports whether there was one. The
 // stage has exited, so the pipe holds the message and then ends, unless
 // something else holds its write end, so the read is bounded. It closes the
-// pipe.
+// pipe. It reads once, for whoever asks first, and gives the same answer after.
 func (c *Cmd) stageReport() (done stageDone, ok bool) {
-	defer c.run.status.Close()
-	if c.run.ignoreStageReport {
-		return stageDone{}, false
-	}
-	_ = c.run.status.SetReadDeadline(time.Now().Add(time.Second))
-	done, err := readDone(c.run.statusDec)
-	if err != nil {
-		return stageDone{}, false
-	}
-	c.run.stageScans = done.Scans
-	return done, true
+	c.run.readReport.Do(func() {
+		defer c.run.status.Close()
+		if c.run.ignoreStageReport {
+			return
+		}
+		_ = c.run.status.SetReadDeadline(time.Now().Add(time.Second))
+		done, err := readDone(c.run.statusDec)
+		if err != nil {
+			return
+		}
+		c.run.stageScans = done.Scans
+		c.run.report, c.run.reported = done, true
+	})
+	return c.run.report, c.run.reported
 }
 
 // survivorsError is Wait's error when teardown could not confirm that no
@@ -628,8 +639,12 @@ func (e *survivorsError) Unwrap() error { return e.cause }
 func (*survivorsError) Is(target error) bool { return target == ErrSurvivors }
 
 // watchStage ends the sandbox's processes once the stage has exited, which is
-// when the stage did not, as when it was killed, and is harmless when it did.
-// It returns a function that stops the watch.
+// when the stage did not, as when it was killed. A stage that exited after
+// reporting the sandbox empty has left nothing to end, so the watch reads that
+// report and stops: scans would only race Wait, which takes the stage's word. A
+// stage that reported it gave up has left members, and the watch keeps ending
+// them, since one may hold the command's output open and keep Wait from
+// returning. It returns a function that stops the watch.
 func (c *Cmd) watchStage() func() {
 	pid := c.run.cmd.Process.Pid
 	done := make(chan struct{})
@@ -649,12 +664,22 @@ func (c *Cmd) watchStage() func() {
 			if p, err := unix.SysctlKinfoProc("kern.proc.pid", pid); err == nil && p.Proc.P_stat != stateZombie {
 				continue
 			}
+			// The stage can be gone while Wait still reads the command's output, which
+			// the stage's exit does not end for a writer that is slow, and the stage sent
+			// its report before it exited. A stage that said the sandbox is empty has
+			// left nothing to end, and Wait takes its word, so a scan here would only
+			// race Wait. One that gave up, or sent nothing usable, has left members
+			// that nothing else ends before Wait returns: Wait itself scans only after
+			// the output is closed, which a member may hold open.
+			if judgeReport(c.stageReport()) == reportEmpty {
+				return
+			}
 			// Marker only: the group's number may be someone else's by now.
 			// Keep at it while Wait still waits, since a survivor may hold
 			// the command's output open.
 			for {
 				scans, end := c.teardown()
-				c.run.callerScans.Add(int64(scans))
+				c.run.watchScans.Add(int64(scans))
 				if end == endEmpty {
 					return
 				}

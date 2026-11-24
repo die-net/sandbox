@@ -567,7 +567,7 @@ func TestSandboxExecInAnotherSandboxDoesNotStallTeardown(t *testing.T) {
 	if d := time.Since(start); d > 2*time.Second {
 		t.Errorf("B's Wait took %v", d)
 	}
-	if n := b.run.callerScans.Load(); n != 0 {
+	if n := callerSideScans(b); n != 0 {
 		t.Errorf("B's caller made %d scans: the stage should have proved it empty", n)
 	}
 }
@@ -923,4 +923,156 @@ func crashSummary(b []byte) string {
 		}
 	}
 	return fmt.Sprintf("process %s, exception %s, top frames %v", r.ProcName, r.Exception, frames)
+}
+
+// -------------------------------------------- a stage that is gone and reported
+
+// holdWriter is a command's output that blocks the first write until it is
+// released, which keeps exec's Wait from returning, as a slow reader does, after
+// the command and the stage are gone.
+type holdWriter struct {
+	got     chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (w *holdWriter) Write(p []byte) (int, error) {
+	w.once.Do(func() { close(w.got) })
+	<-w.release
+	return len(p), nil
+}
+
+// callerSideScans is how many scans the caller made after the stage, Wait's own
+// and those of the watch of a stage that has gone.
+func callerSideScans(c *Cmd) int64 {
+	return c.run.callerScans.Load() + c.run.watchScans.Load()
+}
+
+// The stage reports before it exits, and Wait takes its word. While Wait is
+// still reading the command's output, though, the stage is gone, and the watch
+// that ends the sandbox of a stage that was killed sees that. It reads the
+// report as Wait does, and a stage that proved the sandbox empty is left alone:
+// a scan from the caller's side would only race Wait, which makes none, and
+// failed TestTeardownOneScanInTheStageAndNoneInTheCaller on a loaded machine,
+// when the stage's exit and the end of the output were far enough apart for a
+// tick of the watch to land between them. A stage that gave up has left members,
+// which the watch ends (TestWaitReturnsAfterAGiveUpWhileAMemberHoldsTheOutput),
+// and Wait, which takes its word, makes no scan of its own.
+func TestWatchStageDoesNotScanAfterTheStageReported(t *testing.T) {
+	t.Parallel()
+	// The member leaves the command's group, so the stage's signal to the group
+	// misses it, and it closes its output, which would otherwise hold Wait.
+	const leaver = `use POSIX qw(setsid _exit); pipe(my $r, my $w); my $pid = fork();
+if (!$pid) { setsid(); close STDOUT; close STDERR; syswrite($w, "x"); sleep 30; _exit(0) }
+close $w; sysread($r, my $b, 1); syswrite(STDOUT, "x"); _exit(0);`
+	for _, tc := range []struct {
+		name    string
+		command []string
+		env     []string
+		survive bool // whether Wait returns ErrSurvivors
+		timeout time.Duration
+	}{
+		{"empty", []string{"/bin/sh", "-c", "echo x"}, []string{shellPath}, false, 10 * time.Second},
+		{"members", []string{"/usr/bin/perl", "-e", leaver}, []string{shellPath, stageNoKillEnv + "=1"}, true, 30 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c, err := Command(t.Context(), Spec{Home: realTemp(t), Command: tc.command})
+			if err != nil {
+				t.Fatal(err)
+			}
+			c.Env = tc.env
+			out := &holdWriter{got: make(chan struct{}), release: make(chan struct{})}
+			c.Stdout = out
+			if err := c.Start(); err != nil {
+				t.Fatal(err)
+			}
+			endAtCleanup(t, c)
+			released := false
+			release := func() {
+				if !released {
+					released = true
+					close(out.release)
+				}
+			}
+			t.Cleanup(release)
+			waited := make(chan error, 1)
+			go func() { waited <- c.Wait() }()
+			// The command's output is in the copy that holds Wait.
+			select {
+			case <-out.got:
+			case <-time.After(tc.timeout):
+				t.Fatal("the command's output never reached the writer")
+			}
+			// The stage has exited and been reaped by exec: its pid is gone.
+			eventually(t, tc.timeout, "the stage to exit", func() bool {
+				return syscall.Kill(c.Pid(), 0) == syscall.ESRCH
+			})
+			// Several ticks of the watch, which is every 50 ms.
+			time.Sleep(400 * time.Millisecond)
+			if n := c.run.callerScans.Load(); n != 0 {
+				t.Errorf("Wait made %d scans of its own for a stage that had reported", n)
+			}
+			if n := c.run.watchScans.Load(); n != 0 && !tc.survive {
+				t.Errorf("the watch made %d scans for a stage that had proved the sandbox empty", n)
+			}
+			release()
+			err = <-waited
+			if got := errors.Is(err, ErrSurvivors); got != tc.survive || (err != nil) != tc.survive {
+				t.Errorf("Wait: %v, want ErrSurvivors = %v", err, tc.survive)
+			}
+			if n := c.run.callerScans.Load(); n != 0 {
+				t.Errorf("Wait made %d scans of its own in all", n)
+			}
+			if n := c.run.watchScans.Load(); n != 0 && !tc.survive {
+				t.Errorf("the watch made %d scans in all for a stage that had proved the sandbox empty", n)
+			}
+			if c.run.stageScans < 1 {
+				t.Errorf("the stage made %d scans, want at least 1", c.run.stageScans)
+			}
+		})
+	}
+}
+
+// A stage that gave up on members has left them running, and one may hold the
+// command's output open, as a process that the caller handed a buffer to would
+// find itself doing: exec's Wait then waits for the copy of the output to end,
+// which the member keeps from happening. Wait takes the stage's word and makes
+// no scan of its own, so the watch of a stage that has gone must keep ending
+// the sandbox's processes after a give-up, or Wait never returns. The member
+// here is bounded: it sleeps 30 s and ends by itself, and the test ends it too.
+func TestWaitReturnsAfterAGiveUpWhileAMemberHoldsTheOutput(t *testing.T) {
+	t.Parallel()
+	// The member leaves the command's group, so the stage's signal to the group
+	// misses it, and it keeps the command's output open.
+	const leaver = `use POSIX qw(setsid _exit); pipe(my $r, my $w); my $pid = fork();
+if (!$pid) { setsid(); syswrite($w, "x"); sleep 30; _exit(0) }
+close $w; sysread($r, my $b, 1); _exit(0);`
+	c, err := Command(t.Context(), Spec{Home: realTemp(t), Command: []string{"/usr/bin/perl", "-e", leaver}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Env = []string{shellPath, stageNoKillEnv + "=1"}
+	c.Stdout = &syncBuffer{}
+	if err := c.Start(); err != nil {
+		t.Fatal(err)
+	}
+	endAtCleanup(t, c)
+	start := time.Now()
+	err = waitWithin(t, c, 15*time.Second)
+	if !errors.Is(err, ErrSurvivors) {
+		t.Errorf("Wait: %v, want ErrSurvivors", err)
+	}
+	if d := time.Since(start); d > giveUpAfter+8*time.Second {
+		t.Errorf("Wait took %v, with the member due to end by itself at 30 s", d)
+	}
+	if n := c.run.callerScans.Load(); n != 0 {
+		t.Errorf("Wait made %d scans of its own after the stage said it gave up", n)
+	}
+	if n := c.run.watchScans.Load(); n < 1 {
+		t.Errorf("the watch made %d scans, want it to end the member", n)
+	}
+	if got, err := c.run.mark.processes(); err != nil || len(got) != 0 {
+		t.Errorf("processes of the sandbox after Wait: %v, %v", got, err)
+	}
 }
