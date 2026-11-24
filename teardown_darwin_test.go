@@ -38,7 +38,7 @@ func TestTeardownOneScanInTheStageAndNoneInTheCaller(t *testing.T) {
 		if err := c.Wait(); err != nil {
 			t.Fatal(err)
 		}
-		if n := c.run.callerScans.Load(); n != 0 {
+		if n := callerSideScans(c); n != 0 {
 			t.Fatalf("the caller made %d scans after the stage reported the sandbox empty", n)
 		}
 		if n := c.run.stageScans; n == 1 || (n == 2 && zombies) {
@@ -94,7 +94,7 @@ func TestTeardownLingeringZombie(t *testing.T) {
 	if d := time.Since(start); d > 2*time.Second {
 		t.Errorf("Wait took %v with a zombie lingering", d)
 	}
-	if n := c.run.callerScans.Load(); n != 0 {
+	if n := callerSideScans(c); n != 0 {
 		t.Errorf("the caller made %d scans", n)
 	}
 	// The zombie is new to the first scan, and known to the second. Other
@@ -140,7 +140,7 @@ func TestTeardownStageKilledMidTeardown(t *testing.T) {
 			delay /= 2
 			continue
 		}
-		if n := c.run.callerScans.Load(); n < 1 {
+		if n := callerSideScans(c); n < 1 {
 			t.Errorf("the caller made %d scans for a stage that never reported", n)
 		}
 		if d := time.Since(start); d > 5*time.Second {
