@@ -887,10 +887,21 @@ func TestAPIProcessGroup(t *testing.T) {
 		t.Errorf("the command is in the caller's process group %d", group)
 	}
 	sid, _ := unix.Getsid(0)
+	// Only the command's own processes, which are the ones in its group. Other
+	// tests' commands also name "esc hold", and one that exits between the list
+	// and the read has no session to show.
+	own := 0
 	for _, p := range pids(t, "esc hold") {
+		if g, err := syscall.Getpgid(p); err != nil || g != group {
+			continue
+		}
+		own++
 		if s, err := unix.Getsid(p); err != nil || s != sid {
 			t.Errorf("pid %d is in session %d, want the caller's %d (%v)", p, s, sid, err)
 		}
+	}
+	if own == 0 {
+		t.Errorf("none of the command's processes were in its group %d", group)
 	}
 	if g, err := syscall.Getpgid(c.Pid()); err != nil || g != self {
 		t.Errorf("the stage is in group %d (%v), want the caller's %d", g, err, self)
