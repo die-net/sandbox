@@ -120,7 +120,7 @@ func diagnose(f probeFacts) []Result {
 func firstBlock(f probeFacts) Result {
 	container := f.Container != "" && f.Container != "systemd-unit"
 	switch {
-	case apparmorApplies(f) && !apparmorInForce(f) && f.BwrapLabel != "" && f.BwrapLabel != f.AppArmor:
+	case apparmorApplies(f) && !apparmorInForce(f) && ubuntuBwrap(f.BwrapLabel) && f.BwrapLabel != f.AppArmor:
 		profile, name, err := apparmorProfile(f.Self)
 		if err != nil {
 			return fail("probe.apparmor-bwrap", "bubblewrap gets the AppArmor label %q when this program runs it, not this program's own %q, and the sandbox failed: %s\n"+
@@ -156,6 +156,15 @@ func firstBlock(f probeFacts) Result {
 		return fail("probe.systemd-unit", "this runs in a systemd service whose restrictions refuse namespaces or mounts. Fix, for this unit only: relax RestrictNamespaces=, and a SystemCallFilter= that lacks @mount, keeping the rest")
 	}
 	return fail("probe.userns", "bubblewrap could not start a sandbox, and no known cause matched: %s", f.TryErr)
+}
+
+// ubuntuBwrap reports whether label is that of the bwrap profile, which
+// Ubuntu's bwrap-userns-restrict attaches to /usr/bin/bwrap. bubblewrap's
+// own label reads "bwrap (enforce)" there (TestBwrapLabel on Ubuntu 26.04),
+// and what it starts is stacked with unpriv_bwrap. Another profile on
+// bubblewrap, such as one an operator wrote, is not blamed for the failure.
+func ubuntuBwrap(label string) bool {
+	return strings.HasPrefix(label, "bwrap (")
 }
 
 // masked reports whether anything is mounted on a path under /proc, as a

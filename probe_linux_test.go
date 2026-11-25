@@ -1,12 +1,78 @@
 package sandbox
 
 import (
+	"context"
+	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
+
+// labelsSeen is what the probe-labels child mode reports.
+type labelsSeen struct {
+	Pid              int
+	Self, Bubblewrap string
+}
+
+func registerProbeLabels() {
+	childModes["probe-labels"] = func([]string) int {
+		bwrap, err := exec.LookPath("bwrap")
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		var s labelsSeen
+		s.Pid = os.Getpid()
+		s.Self, s.Bubblewrap = labels(bwrap)
+		if err := json.NewEncoder(os.Stdout).Encode(s); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		return 0
+	}
+}
+
+// TestLabelsUnderAnotherPIDNamespace runs Probe's label reads in a process of
+// a new pid namespace that still sees the host's /proc, as under unshare
+// --pid without --mount-proc. There os.Getpid is 1, the host's init in that
+// /proc, and bubblewrap's pid names some other host process. The process's
+// own label must still be its own, and bubblewrap's must be left unknown.
+func TestLabelsUnderAnotherPIDNamespace(t *testing.T) {
+	t.Parallel()
+	want := readLabel("/proc/self/attr/")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "/proc/self/exe", "probe-labels")
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Cloneflags:  syscall.CLONE_NEWUSER | syscall.CLONE_NEWPID,
+		UidMappings: []syscall.SysProcIDMap{{ContainerID: os.Getuid(), HostID: os.Getuid(), Size: 1}},
+		GidMappings: []syscall.SysProcIDMap{{ContainerID: os.Getgid(), HostID: os.Getgid(), Size: 1}},
+	}
+	cmd.Stderr = os.Stderr
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("run the child in a new pid namespace: %v", err)
+	}
+	var s labelsSeen
+	if err := json.Unmarshal(out, &s); err != nil {
+		t.Fatalf("read %q: %v", out, err)
+	}
+	t.Logf("this process is %q, and the child saw %+v", want, s)
+	if s.Pid != 1 {
+		t.Fatalf("the child is pid %d, not 1 of a pid namespace of its own", s.Pid)
+	}
+	if s.Self != want {
+		t.Errorf("the child read its label as %q, want this process's %q, which it inherits", s.Self, want)
+	}
+	if s.Bubblewrap != "" {
+		t.Errorf("the child read bubblewrap's label as %q through a /proc whose pids aren't its own, want none", s.Bubblewrap)
+	}
+}
 
 // TestProbeTrialStartsTheFirstStage puts a bubblewrap on PATH that drops
 // every capability from what it starts, as Ubuntu 26.04's bwrap profile does
@@ -72,7 +138,9 @@ func hostLabels(t *testing.T, bwrap string) probeFacts {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return probeFacts{Self: self, AppArmor: readLabel(os.Getpid()), BwrapLabel: bwrapLabel(bwrap)}
+	f := probeFacts{Self: self}
+	f.AppArmor, f.BwrapLabel = labels(bwrap)
+	return f
 }
 
 // TestProbeTrialNotBuilt checks that a trial that can't be made is
