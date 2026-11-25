@@ -732,7 +732,7 @@ func TestMarkerSurvivesEveryServiceAndOption(t *testing.T) {
 			spec := tc.spec(t)
 			spec.Home = realTemp(t)
 			spec.Command = []string{"/bin/sleep", "30"}
-			spec.Services = []Service{ServiceFirefox, ServiceDirectory}
+			spec.Services = allServices
 			spec.BroadLoopback = true
 			c, err := Command(t.Context(), spec)
 			if err != nil {

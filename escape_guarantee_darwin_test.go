@@ -1660,7 +1660,7 @@ func TestEscapeKeychainFiles(t *testing.T) {
 	escRun(t, Spec{}, "denied", paths...)
 }
 
-// Row: "Seatbelt profile: ... never lsopen" and M3: opening an app or a URL
+// Row: "Seatbelt profile: ... never lsopen" and M2: opening an app or a URL
 // through LaunchServices fails under every Services group, even one that
 // allows the lookup of launchservicesd, and starts nothing outside the
 // profile: no app is launched, and the default browser does not fetch.
@@ -1671,7 +1671,7 @@ func TestEscapeLaunchServices(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	t.Cleanup(func() { _ = ln.Close() }) // after the attempts, which run after this returns
 	go func() {
 		for {
 			c, err := ln.Accept()
@@ -1688,35 +1688,44 @@ func TestEscapeLaunchServices(t *testing.T) {
 	// is reported once, by its pid and path, and is not signaled: it is not a
 	// process this test started, and may be one its user opened.
 	before := calculators(t)
-	for _, services := range [][]Service{nil, {ServiceFirefox}, {ServiceFirefox, ServiceDirectory}} {
-		spec := Spec{Services: services, BroadLoopback: true}
-		for _, cmd := range []string{
-			"/usr/bin/open -g /System/Applications/Calculator.app",
-			"/usr/bin/open -g " + url,
-			`/usr/bin/osascript -e 'tell application "Calculator" to launch'`,
-			`/usr/bin/open -g -a Calculator`,
-		} {
-			r := sh(t, spec, cmd+"; echo status $?")
-			if strings.Contains(r.stdout, "status 0") {
-				t.Errorf("services %v: %q succeeded: %s", services, cmd, r)
+	// The attempts run at once, each in a sandbox of its own, and the window
+	// for an app or a fetch to appear is shared: a failure names the launch
+	// but not the attempt that made it. The group's cleanup runs once its
+	// attempts are done.
+	t.Run("attempts", func(t *testing.T) {
+		t.Parallel()
+		t.Cleanup(func() {
+			// An app or a fetch would start a moment after it was asked for. The
+			// fetch is an event, which the wait ends on; an app is looked for
+			// once after it.
+			select {
+			case line := <-beacon:
+				t.Errorf("a URL opened from inside the sandbox reached the beacon: %q", line)
+			case <-time.After(500 * time.Millisecond):
 			}
-			// An app starts a moment after it is asked to, so look for it
-			// after each attempt, and say which attempt it followed.
-			time.Sleep(300 * time.Millisecond)
 			for pid, comm := range calculators(t) {
 				if _, old := before[pid]; !old {
-					t.Errorf("services %v: %q launched an app outside the profile, or one was opened meanwhile: pid %d, %s, left running", services, cmd, pid, comm)
-					before[pid] = comm
+					t.Errorf("an attempt launched an app outside the profile, or one was opened meanwhile: pid %d, %s, left running", pid, comm)
 				}
 			}
+		})
+		for _, services := range [][]Service{nil, {ServiceLaunchServices}, allServices} {
+			for i, cmd := range []string{
+				"/usr/bin/open -g /System/Applications/Calculator.app",
+				"/usr/bin/open -g " + url,
+				`/usr/bin/osascript -e 'tell application "Calculator" to launch'`,
+				`/usr/bin/open -g -a Calculator`,
+			} {
+				t.Run(fmt.Sprintf("%v %d", services, i), func(t *testing.T) {
+					t.Parallel()
+					r := sh(t, Spec{Services: services, BroadLoopback: true}, cmd+"; echo status $?")
+					if strings.Contains(r.stdout, "status 0") {
+						t.Errorf("%q succeeded: %s", cmd, r)
+					}
+				})
+			}
 		}
-	}
-	time.Sleep(500 * time.Millisecond)
-	select {
-	case line := <-beacon:
-		t.Errorf("a URL opened from inside the sandbox reached the beacon: %q", line)
-	default:
-	}
+	})
 }
 
 // calculators returns the pids of running Calculator apps, by the path of the
@@ -2011,14 +2020,14 @@ func TestEscapeProfileNeverAllows(t *testing.T) {
 	t.Parallel()
 	for _, in := range []profileInput{
 		{Home: "/h"},
-		{Home: "/h", Network: NetworkHost, Services: []Service{ServiceFirefox, ServiceDirectory}},
+		{Home: "/h", Network: NetworkHost, Services: allServices},
 		{Home: "/h", BroadLoopback: true, Listen: []int{1, 2}, Loopback: []int{3}, Write: []string{"/w"}, Read: []string{"/r"}, Cover: []string{"/c"}, Sockets: []string{"/w/s"}, Marker: marker{In: "com.die-net.sandbox.in.x", Out: "com.die-net.sandbox.out.x"}},
 	} {
 		p, err := profile(in)
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, bad := range []string{"lsopen", "iokit", "(allow default)", "(allow mach-lookup)", "(allow signal)", "(allow process-info*)", "(allow network*)", "(allow file-write*)\n", "mach-priv", "system-fsctl"} {
+		for _, bad := range []string{"lsopen", "iokit", "mach-register", "(allow default)", "(allow mach-lookup)", "(allow signal)", "(allow process-info*)", "(allow network*)", "(allow file-write*)\n", "mach-priv", "system-fsctl"} {
 			if strings.Contains(p, bad) {
 				t.Errorf("a profile contains %q:\n%s", bad, p)
 			}
@@ -2051,7 +2060,7 @@ func TestEscapeEveryFieldStarts(t *testing.T) {
 	_ = sock
 	spec := Spec{
 		Home: home, Dir: home, Write: []string{mkdirs(t, root, "w")}, Read: []string{mkdirs(t, root, "r")}, Cover: []string{mkdirs(t, root, "c")},
-		Kernel: KernelNested, Network: NetworkNone, BroadLoopback: true, Services: []Service{ServiceFirefox, ServiceDirectory},
+		Kernel: KernelNested, Network: NetworkNone, BroadLoopback: true, Services: allServices,
 		Listen: 1, Loopback: 1, Rlimits: []Rlimit{{ResourceCore, 0, 0}}, Hostname: "x", ScratchSize: 10,
 	}
 	spec.Command = []string{"/usr/bin/true"}
@@ -2166,87 +2175,67 @@ func TestEscapeAdminGroupWrites(t *testing.T) {
 
 var _ = sync.Mutex{}
 
-// rawXPCSource is a client that talks to launchservicesd without the
-// LaunchServices API, as a hand-written one would, so that no check in the
-// API's own code stands in the way. It connects, sends a message the shape of
-// a request to open something, and prints the reply's description.
-const rawXPCSource = `
-#include <xpc/xpc.h>
-#include <stdio.h>
-#include <stdlib.h>
-int main(int argc, char **argv) {
-  xpc_connection_t c = xpc_connection_create_mach_service("com.apple.coreservices.launchservicesd", NULL, 0);
-  if (!c) { printf("no connection\n"); return 2; }
-  xpc_connection_set_event_handler(c, ^(xpc_object_t e) { });
-  xpc_connection_resume(c);
-  xpc_object_t m = xpc_dictionary_create(NULL, NULL, 0);
-  xpc_dictionary_set_string(m, "op", "open");
-  xpc_dictionary_set_string(m, "url", argv[1]);
-  xpc_object_t r = xpc_connection_send_message_with_reply_sync(c, m);
-  char *d = xpc_copy_description(r);
-  printf("reply: %s\n", d);
-  free(d);
-  return 0;
+// serviceNames are the Mach services each Service lets a sandbox look up.
+var serviceNames = map[Service][]string{
+	ServiceSystemConfiguration: {"com.apple.SystemConfiguration.configd"},
+	ServiceLaunchServices:      {"com.apple.coreservices.launchservicesd"},
+	ServiceDirectory:           {"com.apple.system.opendirectoryd.libinfo"},
 }
-`
 
-// Row: "Launching apps and URLs" (docs/macos.md, M3), the raw-XPC case that
-// M3 left open: a client that talks to launchservicesd directly. With the
-// Firefox group, which allows the lookup, the connection is made, where
-// without it the sandbox refuses the lookup. Our message is rejected as it is
-// outside the sandbox too, since the real request is private to
-// LaunchServices, so this shows the lookup and that nothing opens from it, not
-// that lsd checks lsopen itself: a replay of a real open request was not
-// possible, and that stays untested.
-func TestEscapeLaunchServicesRawXPC(t *testing.T) {
+// allServices is every Service, for the tests that want the widest profile.
+var allServices = []Service{ServiceSystemConfiguration, ServiceLaunchServices, ServiceDirectory}
+
+// Row: "Launching apps and URLs", and the Services groups it rests on: each
+// Service lets a sandbox look up its own services and no other, and a real
+// client of each works with the group and is refused without it, so the group
+// is what reaches the service. ServiceLaunchServices is the lookup that
+// TestEscapeLaunchServices tries to open apps through. lsappinfo finds the
+// session's running apps through launchservicesd, and scutil reads the
+// network's state through configd. The test compares counts and refusals
+// only, and prints nothing of the user's session.
+func TestEscapeServiceLookups(t *testing.T) {
 	t.Parallel()
-	cc, err := exec.LookPath("cc")
-	if err != nil {
-		t.Skip("no C compiler")
-	}
-	dir := realTemp(t)
-	src := writeFile(t, rawXPCSource, dir, "rawxpc.c")
-	bin := filepath.Join(dir, "rawxpc")
-	if out, err := exec.CommandContext(t.Context(), cc, "-o", bin, src).CombinedOutput(); err != nil { //nolint:gosec // G204: the test binary or a tool the test names, run as the test's own child.
-		t.Skipf("cannot build the client: %v\n%s", err, out)
-	}
-	beacon := make(chan struct{}, 1)
-	ln, err := listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close()
-	go func() {
-		for {
-			c, err := ln.Accept()
-			if err != nil {
-				return
+	for _, s := range allServices {
+		t.Run("lookups "+string(s), func(t *testing.T) {
+			t.Parallel()
+			escRun(t, Spec{Services: []Service{s}}, "lookup-allowed", serviceNames[s]...)
+			var others []string
+			for o, names := range serviceNames {
+				if o != s {
+					others = append(others, names...)
+				}
 			}
-			beacon <- struct{}{}
-			_ = c.Close()
+			escRun(t, Spec{Services: []Service{s}}, "lookup-denied", others...)
+			escRun(t, Spec{}, "lookup-denied", serviceNames[s]...)
+		})
+	}
+	t.Run("launchservicesd", func(t *testing.T) {
+		t.Parallel()
+		// loginwindow runs in every login session. A search for it, which
+		// lsappinfo answers from launchservicesd, is quick where a list of
+		// every app is not.
+		const count = `/usr/bin/lsappinfo find bundleid=com.apple.loginwindow 2>/dev/null | grep -c 'ASN:'`
+		out, err := exec.CommandContext(t.Context(), "/bin/sh", "-c", count).Output()
+		if n, _ := strconv.Atoi(strings.TrimSpace(string(out))); n == 0 {
+			t.Fatalf("lsappinfo finds no loginwindow outside a sandbox (%q, %v), so it can't show the lookup working", out, err)
 		}
-	}()
-	url := "http://" + ln.Addr().String() + "/raw-xpc-beacon"
-	before := calculators(t)
-	without := sh(t, Spec{Home: dir, Read: []string{dir}}, bin+" "+url+" 2>&1")
-	with := sh(t, Spec{Home: dir, Read: []string{dir}, Services: []Service{ServiceFirefox}, BroadLoopback: true}, bin+" "+url+" 2>&1")
-	if !strings.Contains(without.stdout, "Connection invalid") {
-		t.Errorf("without the group the lookup of launchservicesd was not refused:\n%s", without.stdout)
-	}
-	if !strings.Contains(with.stdout, "reply:") || strings.Contains(with.stdout, "Connection invalid") {
-		t.Errorf("with the Firefox group the connection was not made:\n%s", with.stdout)
-	}
-	time.Sleep(500 * time.Millisecond)
-	select {
-	case <-beacon:
-		t.Error("a raw message to launchservicesd made the default browser fetch a URL")
-	default:
-	}
-	for pid, comm := range calculators(t) {
-		if _, old := before[pid]; !old {
-			t.Errorf("an app was launched outside the profile, or one was opened meanwhile: pid %d, %s, left running", pid, comm)
+		if r := sh(t, Spec{Services: []Service{ServiceLaunchServices}}, count); strings.TrimSpace(r.stdout) == "0" {
+			t.Errorf("lsappinfo found no loginwindow with ServiceLaunchServices: %s", r)
 		}
-	}
+		if r := sh(t, Spec{}, count); strings.TrimSpace(r.stdout) != "0" {
+			t.Errorf("lsappinfo found loginwindow with no Services: %s", strings.TrimSpace(r.stdout))
+		}
+	})
+	t.Run("configd", func(t *testing.T) {
+		t.Parallel()
+		const show = `echo "show State:/Network/Global/IPv4" | /usr/sbin/scutil 2>&1 | grep -c 'Permission denied'`
+		if r := sh(t, Spec{Services: []Service{ServiceSystemConfiguration}}, show); strings.TrimSpace(r.stdout) != "0" {
+			t.Errorf("scutil was refused configd with ServiceSystemConfiguration: %s", r)
+		}
+		if r := sh(t, Spec{}, show); strings.TrimSpace(r.stdout) == "0" {
+			t.Errorf("scutil reached configd with no Services: %s", r)
+		}
+	})
 }
 
 // Row: "Own process group, foreground of a terminal on Stdin": a command that

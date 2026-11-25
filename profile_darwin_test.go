@@ -180,13 +180,11 @@ func TestProfileNetwork(t *testing.T) {
 
 func TestProfileServices(t *testing.T) {
 	t.Parallel()
-	p, err := profile(profileInput{Home: "/h", Services: []Service{ServiceFirefox, ServiceFirefox, ServiceDirectory}})
+	p, err := profile(profileInput{Home: "/h", Services: []Service{ServiceLaunchServices, ServiceLaunchServices, ServiceSystemConfiguration, ServiceDirectory}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
-		`(allow mach-register (global-name-regex #"^org\.mozilla\.machname\."))`,
-		`(allow mach-lookup (global-name-regex #"^org\.mozilla\.machname\."))`,
 		`(allow mach-lookup (global-name "com.apple.coreservices.launchservicesd"))`,
 		`(allow mach-lookup (global-name "com.apple.SystemConfiguration.configd"))`,
 		`(allow mach-lookup (global-name "com.apple.system.opendirectoryd.libinfo"))`,

@@ -755,8 +755,8 @@ func runAs(ctx context.Context, spec Spec, euid, ruid int) (int, error) {
 // commandEnv returns env with the sandbox's home and its own temporary
 // directory in the variables programs read them from. CFFIXED_USER_HOME is
 // what Cocoa resolves ~/Library from, which $HOME alone does not move: without
-// it Firefox 152 to 157 hangs on the TCC-protected real ~/Library, and later
-// versions write into it (docs/macos.md, M2).
+// it a Cocoa program reaches for the real ~/Library, which the profile covers
+// and TCC guards.
 func commandEnv(env []string, spec Spec) []string {
 	tmp := filepath.Join(spec.Home, tmpName)
 	set := [][2]string{

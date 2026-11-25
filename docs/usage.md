@@ -249,34 +249,23 @@ No method lists the survivors, so treat the host as dirty:
 - **Set `WaitDelay`** if `Wait` itself must not block on a survivor that holds the output open.
 - **Limit how long a sandbox can run.** A fork bomb only outruns the scan until it stops on its own, so a `Footprint` or wall-clock limit that cancels the context shortens it.
 
-## Firefox
+## Programs under the sandbox
 
-Headless Firefox runs under both backends and renders a page byte-identical to an unsandboxed render. What each needs:
+The library guarantees the isolation, not that a given program runs inside it. What a program meets there, by mechanism:
 
 ### Linux
 
-- **`Kernel: strict`** is enough. It rendered the same under `strict` and `nested`, so `nested` gains a page-rendering caller nothing.
-- Headless `--screenshot` takes about 2 seconds. The PNG is byte-identical to the unsandboxed render, including inside a loopback-only network namespace.
-- Firefox's own sandbox stays on. Its seccomp filters and file broker run as they do unsandboxed. Only its user-namespace layer drops out, as Mozilla bug 1756236 describes. Set `MOZ_ASSUME_USER_NS=0` to silence the probe, and `MOZ_CRASHREPORTER_DISABLE=1` is harmless.
-- What `strict` refuses is harmless: the `clone(CLONE_NEWUSER)` probe, `clone3` (glibc falls back to `clone`), `quotactl`, and netlink sockets. Firefox still reports `navigator.onLine` true.
-- `Start` sets `XDG_RUNTIME_DIR` to a directory of the sandbox's own. The host's `/run/user/<uid>` reached Firefox before, and dconf failed to create its directory under the read-only cover.
-- A snap-packaged Firefox can't run: `snap-confine` is setuid, and `/run` and `/var` are covered. Use the distribution's own package or Mozilla's.
-- Not run: geckodriver and Marionette inside the sandbox. That's TCP on loopback, which `strict` allows (inferred).
+- `Start` sets `XDG_RUNTIME_DIR` to a directory of the sandbox's own, since the host's `/run/user/<uid>` is under a cover, and a program that makes its own directories there, as dconf does, fails on the read-only view.
+- A setuid program gains nothing: the command runs with `no_new_privs`. So a snap-packaged program can't start, since `snap-confine` is setuid, and `/run` and `/var` are covered as well.
+- Under `strict`, a program's own sandbox loses the layers that need what the filter refuses: a user namespace (`clone(CLONE_NEWUSER)`), and netlink sockets. `clone3` is refused with `ENOSYS`, and glibc falls back to `clone`. A program's own seccomp filter still loads.
 
 ### macOS
 
-- Use `Services: []sandbox.Service{sandbox.ServiceFirefox}` and no network. A render takes 2 to 3 seconds, and `TestFirefoxScreenshot` compares it byte for byte with an unsandboxed one.
-- Set `MOZ_DISABLE_CONTENT_SANDBOX=1`, `MOZ_DISABLE_SOCKET_PROCESS_SANDBOX=1` and `MOZ_DISABLE_RDD_SANDBOX=1`. Firefox's own processes can't apply a profile of their own inside ours. Without the content switch the content process crash-loops with no output. The other two only stop crashing children.
-- `Start` sets `CFFIXED_USER_HOME` to the sandbox's home. Without it, Firefox 152 to 157 hangs on the TCC-protected real `~/Library`, and later versions write into it.
-- **Check that the PNG exists, not only the exit status.** A denial, such as a missing `mach-register` rule, can leave Firefox exiting 0 with no output.
-- An image from the `Listen` port loads, and one from a port the sandbox wasn't given doesn't (`TestFirefoxNetwork`).
-- There's no inner sandbox layer, so the Seatbelt profile is the only one. Seatbelt filters operations, not system calls.
-- Firefox makes `Library/Application Support` in the home with an ACL that denies deletion. A caller that removes the home runs `chmod -RN` on it first.
-- The group's `org.mozilla.machname.*` names are shared with the user's own Firefox and with other sandboxes given the group. Run untrusting Firefox sandboxes one at a time.
-- Media in a page may start the GPU, utility or GMP processes, which didn't start for a plain page. Their `MOZ_DISABLE_*` switches exist and weren't needed.
-- Not run: geckodriver and Marionette under the profile, web fonts and media, and windowed-mode parity.
-
-[macos.md](macos.md#m2-headless-firefox-under-sandbox-exec) lists what the experiment measured.
+- `Start` sets `CFFIXED_USER_HOME` to the home, since Cocoa finds `~/Library` by it and not by `$HOME` ([macos.md](macos.md#the-environment-the-home-and-temporary-files)).
+- A program that puts its child processes in Seatbelt profiles of its own can't: a process under a profile can't apply another, and `sandbox_init` fails. Such a program needs its own sandbox turned off, which leaves this profile as the only layer.
+- A program whose processes find each other by registered Mach names can't run, since no `Service` allows `mach-register` ([macos.md](macos.md#services)). One that looks up a system service needs the `Service` for it, and `Command` refuses a name it doesn't know.
+- A denial can be silent: a program can exit 0 having done nothing, when a child it needed was refused. Check the output exists, not only the exit status.
+- A program can make a directory in the home with an ACL that denies deletion. A caller that removes the home runs `chmod -RN` on it first.
 
 ## Files a caller handles for a run
 

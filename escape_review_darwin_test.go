@@ -520,7 +520,7 @@ func TestCanonicalName(t *testing.T) {
 	for in, want := range map[string]string{
 		"/System/Volumes/Data/Users/a/b":                "/Users/a/b",
 		"/System/Volumes/Data/private/var/folders/x":    "/private/var/folders/x",
-		"/System/Volumes/Data/Applications/Firefox.app": "/Applications/Firefox.app",
+		"/System/Volumes/Data/Applications/Example.app": "/Applications/Example.app",
 		"/System/Volumes/Data/usr/local/bin":            "/usr/local/bin",
 		"/System/Volumes/Data/opt":                      "/opt",
 		// Not firmlinked: the data volume's own name is the only one.
@@ -1244,8 +1244,8 @@ func TestEscapeNestedProfileRefused(t *testing.T) {
 		spec Spec
 	}{
 		{"none", Spec{}},
-		{"network host, broad loopback, both services", Spec{Network: NetworkHost, BroadLoopback: true, Services: []Service{ServiceFirefox, ServiceDirectory}}},
-		{"services, loopback and listen", Spec{Services: []Service{ServiceFirefox, ServiceDirectory}, Loopback: 1, Listen: 1}},
+		{"network host, broad loopback, both services", Spec{Network: NetworkHost, BroadLoopback: true, Services: allServices}},
+		{"services, loopback and listen", Spec{Services: allServices, Loopback: 1, Listen: 1}},
 		{"read, write and cover", Spec{Read: []string{read}, Write: []string{write}, Cover: []string{cover}}},
 		{"rlimits and kernel open", Spec{Kernel: KernelOpen, Rlimits: []Rlimit{{ResourceCPU, 600, 600}}}},
 	} {
