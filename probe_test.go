@@ -1,8 +1,6 @@
 package sandbox
 
 import (
-	"os"
-	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
@@ -81,6 +79,11 @@ func TestDiagnose(t *testing.T) {
 		{"old", mod(func(f *probeFacts) { f.Version = "bubblewrap 0.4.1" }), "probe.bubblewrap", "older than 0.8"},
 		{"no version", mod(func(f *probeFacts) { f.Version = "" }), "probe.bubblewrap", "no version"},
 		{"no filter", mod(func(f *probeFacts) { f.Kernels = nil }), "probe.seccomp", "architecture"},
+		// A trial that couldn't be built is not blamed on AppArmor.
+		{"trial not built", mod(func(f *probeFacts) {
+			f.TrialErr = "make its home: no space left on device"
+			f.Sysctl["kernel.apparmor_restrict_unprivileged_userns"] = "1"
+		}), "probe.trial", "no space left"},
 		{"apparmor", mod(func(f *probeFacts) { f.Sysctl["kernel.apparmor_restrict_unprivileged_userns"] = "1" }), "probe.apparmor-userns", "  userns,"},
 		{"apparmor names this binary", mod(func(f *probeFacts) { f.Sysctl["kernel.apparmor_restrict_unprivileged_userns"] = "1" }), "probe.apparmor-userns", "profile sandbox-opt-app-server /opt/app/server flags=(unconfined)"},
 		{"sysctl clone", mod(func(f *probeFacts) { f.Sysctl["kernel.unprivileged_userns_clone"] = "0" }), "probe.userns-sysctl", "unprivileged_userns_clone=1"},
@@ -147,30 +150,87 @@ func TestMasked(t *testing.T) {
 
 func TestApparmorProfile(t *testing.T) {
 	t.Parallel()
-	p, name, err := apparmorProfile("/opt/app/server")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if name != "sandbox-opt-app-server" {
-		t.Errorf("name = %q", name)
-	}
-	for _, s := range []string{
-		"abi <abi/4.0>,",
-		"profile sandbox-opt-app-server /opt/app/server flags=(unconfined) {\n  userns,\n}",
+	for _, tc := range []struct {
+		enforce bool
+		want    string
+		grant   string // the one rule that grants user namespaces
+	}{
+		{false, "profile sandbox-opt-app-server /opt/app/server flags=(unconfined) {\n  userns,\n}", "userns,"},
+		{true, "profile sandbox-opt-app-server /opt/app/server flags=(attach_disconnected) {\n  allow all,\n}", "allow all,"},
 	} {
-		if !strings.Contains(p, s) {
-			t.Errorf("profile lacks %q:\n%s", s, p)
+		p, name, err := apparmorProfile("/opt/app/server", tc.enforce)
+		if err != nil {
+			t.Fatal(err)
 		}
-	}
-	// The one grant is in the one profile, which is for this binary and not
-	// for bubblewrap.
-	if strings.Count(p, "userns,") != 1 || strings.Count(p, "\nprofile ") != 1 || strings.Contains(p, "bwrap") {
-		t.Errorf("want one profile, for this binary, with one userns rule:\n%s", p)
+		if name != "sandbox-opt-app-server" {
+			t.Errorf("name = %q", name)
+		}
+		for _, s := range []string{"abi <abi/4.0>,", tc.want} {
+			if !strings.Contains(p, s) {
+				t.Errorf("enforce=%v: profile lacks %q:\n%s", tc.enforce, s, p)
+			}
+		}
+		// The one grant is in the one profile, which is for this binary and
+		// not for bubblewrap.
+		if strings.Count(p, tc.grant) != 1 || strings.Count(p, "\nprofile ") != 1 || strings.Contains(p, "bwrap") {
+			t.Errorf("enforce=%v: want one profile, for this binary, with one %q rule:\n%s", tc.enforce, tc.grant, p)
+		}
 	}
 	for _, bad := range []string{"", "relative", "/opt/my app/x", "/bad\"path", "/bad\nname"} {
-		if _, _, err := apparmorProfile(bad); err == nil {
+		if _, _, err := apparmorProfile(bad, false); err == nil {
 			t.Errorf("accepted %q", bad)
 		}
+	}
+}
+
+// TestDiagnoseApparmor checks which profile the AppArmor finding prints, by
+// the label bubblewrap gets, and that a binary already under its own profile
+// is not told to load it again.
+func TestDiagnoseApparmor(t *testing.T) {
+	t.Parallel()
+	const (
+		ours     = "sandbox-opt-app-server"
+		unconf   = "flags=(unconfined) {\n  userns,"
+		enforce  = "flags=(attach_disconnected) {\n  allow all,"
+		restrict = "kernel.apparmor_restrict_unprivileged_userns"
+	)
+	for _, tc := range []struct {
+		name        string
+		self, bwrap string // this process's label and bubblewrap's
+		want        string // "probe.apparmor-userns" with the profile, or the next finding
+		profile     string
+	}{
+		{"no profile attaches to bwrap (Ubuntu 24.04)", "unconfined", "unconfined", "probe.apparmor-userns", unconf},
+		{"bwrap-userns-restrict loaded (Ubuntu 26.04)", "unconfined", "bwrap (enforce)", "probe.apparmor-userns", enforce},
+		{"bwrap's label unknown", "unconfined", "", "probe.apparmor-userns", unconf},
+		{"the unconfined-mode profile is loaded but bwrap leaves it", ours + " (unconfined)", "bwrap (enforce)", "probe.apparmor-userns", enforce},
+		{"the unconfined-mode profile is loaded and keeps bwrap", ours + " (unconfined)", ours + " (unconfined)", "probe.userns", ""},
+		{"the enforce-mode profile is loaded and keeps bwrap", ours + " (enforce)", ours + " (enforce)", "probe.userns", ""},
+		// Under another program's profile, a profile for this binary would not
+		// attach, so the finding is a later one.
+		{"another enforce-mode profile keeps bwrap", "other (enforce)", "other (enforce)", "probe.userns", ""},
+		{"docker-default keeps bwrap", "docker-default (enforce)", "docker-default (enforce)", "probe.docker-apparmor", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			f := goodFacts()
+			if strings.HasPrefix(tc.self, "docker-default") {
+				f.Container = "docker"
+			}
+			f.TryErr = "sandbox: copy the view into a mount namespace of its own: operation not permitted"
+			f.Sysctl = map[string]string{restrict: "1"}
+			f.AppArmor, f.BwrapLabel = tc.self, tc.bwrap
+			r := lastCheck(t, f)
+			if r.Name != tc.want || r.Status != Fail {
+				t.Fatalf("last finding = %s %v, want a failed %s: %s", r.Name, r.Status, tc.want, r.Detail)
+			}
+			if tc.profile != "" && !strings.Contains(r.Detail, tc.profile) {
+				t.Errorf("detail lacks %q:\n%s", tc.profile, r.Detail)
+			}
+			if tc.profile == enforce && !strings.Contains(r.Detail, tc.bwrap) {
+				t.Errorf("detail does not name bubblewrap's label %q:\n%s", tc.bwrap, r.Detail)
+			}
+		})
 	}
 }
 
@@ -197,31 +257,5 @@ func TestDetectContainer(t *testing.T) {
 		if got := detectContainer(tc.f); got != tc.want {
 			t.Errorf("%s: detectContainer = %q, want %q", tc.name, got, tc.want)
 		}
-	}
-}
-
-// TestWriteApparmorProfile writes this test binary's AppArmor profile into
-// the directory named by SBX_APPARMOR_OUT, under the name to load it by.
-// scripts/apparmor.sh uses it, so the profile the suite runs under is the
-// one the library prints.
-func TestWriteApparmorProfile(t *testing.T) {
-	t.Parallel()
-	dir := os.Getenv("SBX_APPARMOR_OUT")
-	if dir == "" {
-		t.Skip("SBX_APPARMOR_OUT is not set")
-	}
-	exe, err := os.Executable()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if exe, err = filepath.EvalSymlinks(exe); err != nil {
-		t.Fatal(err)
-	}
-	p, name, err := apparmorProfile(exe)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, name), []byte(p), 0o600); err != nil { //nolint:gosec // G703: the test touches only paths it made, or was passed, to see whether a sandbox allows it.
-		t.Fatal(err)
 	}
 }

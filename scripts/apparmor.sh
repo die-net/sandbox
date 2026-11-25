@@ -1,6 +1,8 @@
 #!/bin/sh
 # Load or remove the AppArmor profile the library prints for a test binary,
-# which Ubuntu 24.04 needs before bubblewrap can make a user namespace.
+# which Ubuntu 24.04 and later need before bubblewrap can make a user
+# namespace. The profile depends on the host's policy (docs/linux.md), so it
+# is written on the host that loads it.
 #   scripts/apparmor.sh load   /path/to/sandbox.test
 #   scripts/apparmor.sh remove /path/to/sandbox.test
 # It runs where the binary runs, as the test account, and uses sudo. The
@@ -16,6 +18,7 @@ for f in "$dir"/*; do
 	name=$(basename "$f")
 	case $op in
 	load)
+		cat "$f" >&2
 		sudo install -m 644 "$f" "/etc/apparmor.d/$name"
 		sudo apparmor_parser -r "/etc/apparmor.d/$name"
 		;;

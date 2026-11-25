@@ -12,7 +12,7 @@ Read the sections a change touches before making it. A change to behavior a doc 
 ## Checks
 
 - macOS: `go test ./...` and `go test -race ./...`.
-- Linux: `scripts/linux-test.sh`, which runs the suite on a Linux machine as `docs/testing.md` describes. CI runs it on Ubuntu 24.04 with and without cgo, and on macOS.
+- Linux: `scripts/linux-test.sh`, which runs the suite on a Linux machine as `docs/testing.md` describes. CI runs it on Ubuntu 24.04 and 26.04 with and without cgo, and on macOS.
 - Vet every platform the code builds for: `GOOS=linux` with `GOARCH` amd64, arm64 and arm, `GOOS=darwin` with arm64 and amd64, and `GOOS=windows GOARCH=amd64`, each with `CGO_ENABLED=0`.
 - Lint: `golangci-lint run` with each `GOOS` above (linux, darwin and windows). It is clean before work is done, including issues you did not cause.
 

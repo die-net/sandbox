@@ -326,7 +326,7 @@ A Fable review of the proof-based teardown, reading the code against XNU's sourc
 
 ## Found in the code and plans of the projects that adopt it
 
-These came from the code and plans of the project the library was extracted from, which changed to meet them. Most are for the adopting program to get right, not the sandbox, and are listed in [usage.md](usage.md#files-a-caller-handles-for-a-run). Two are about the library itself.
+These came from the code, plans and CI of the projects that adopt the library, which changed to meet them. Most are for the adopting program to get right, not the sandbox, and are listed in [usage.md](usage.md#files-a-caller-handles-for-a-run). Three are about the library itself.
 
 ### bubblewrap as root maps the sandbox to host uid 0
 
@@ -339,3 +339,9 @@ These came from the code and plans of the project the library was extracted from
 - **How it worked.** An early plan for the macOS `open` kernel level allowed any Mach service but the keychain. LaunchServices starts processes outside the profile, and no list of services to refuse could be complete.
 - **What stops it.** On macOS `open` is the same as `strict`: every level gets the one profile.
 - **Test.** `TestEscapeKernelLevels`.
+
+### Ubuntu 26.04's bubblewrap profile took the first stage's capabilities, and `Probe` passed
+
+- **How it worked.** Not a way out: every sandbox failed to start, closed. An adopting program's CI ran on GitHub's Ubuntu 26.04 runner (kernel 7.0, bubblewrap 0.11.1), which loads Ubuntu's `bwrap-userns-restrict`, under the unconfined-mode profile `Probe` printed. Ubuntu's `bwrap` profile still attached to `/usr/bin/bwrap`, since the kernel ignores an unconfined-mode profile's exec rules, and it stacks `unpriv_bwrap`, which denies every capability, onto what bubblewrap execs. The first stage was refused `CAP_SYS_ADMIN` (`apparmor="DENIED" operation="capable" profile="unpriv_bwrap" comm="sandbox-stage" capability=21`), and `Start` failed with `read the sandbox's setup: connection reset by peer`. `Probe`'s trial ran only `true` in bubblewrap, which needs no capability, so it passed. The docs had said bubblewrap stays in its parent's label, which held only where no profile attaches to it.
+- **What stops it.** `Probe`'s trial is a real sandbox that `Command` builds, so it fails where the first stage does. `Probe` reads the label bubblewrap gets, and where it isn't the binary's own, prints an enforce-mode profile with `allow all` and `attach_disconnected`, whose exec rule keeps bubblewrap and the stage in the binary's label ([linux.md](linux.md#probe-and-check)). It still grants user namespaces only to the one binary and what it runs. Nothing is loaded for `/usr/bin/bwrap`, which would give them to every program that runs it.
+- **Test.** `TestProbeTrialStartsTheFirstStage` puts a bubblewrap on `PATH` that drops every capability before the stage, as `unpriv_bwrap` does, and fails if `Probe` passes. `TestDiagnoseApparmor` checks which profile is printed for each label. CI's `ubuntu-26.04` legs require Ubuntu's `bwrap` profile to be loaded and run the suite under the profile `Probe` prints there, and the `ubuntu-24.04` legs under the other.

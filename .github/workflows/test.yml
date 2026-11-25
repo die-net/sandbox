@@ -26,13 +26,27 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: "0"
 
+  # Each Ubuntu release a runner offers is named, rather than ubuntu-latest,
+  # since their AppArmor policies differ. Both keep
+  # kernel.apparmor_restrict_unprivileged_userns at 1, so bubblewrap can make a
+  # user namespace only for a program with a profile that allows it.
+  # scripts/apparmor.sh loads the profile the library prints for the test
+  # binary, and removes it after. 26.04 also loads Ubuntu's
+  # bwrap-userns-restrict, whose bwrap profile attaches to /usr/bin/bwrap and
+  # takes the capabilities away from what bubblewrap starts, so the profile
+  # printed there is the enforce-mode one (docs/linux.md). Its leg fails if
+  # that profile isn't loaded, so CI keeps testing both profiles.
   test:
-    name: test linux/amd64 cgo=${{ matrix.cgo }}
-    runs-on: ubuntu-24.04
+    name: test ${{ matrix.os }} cgo=${{ matrix.cgo }}
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-24.04, ubuntu-26.04]
         cgo: ["0", "1"]
+        include:
+          - os: ubuntu-26.04
+            bwrap-profile: true
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
@@ -43,12 +57,23 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y bubblewrap
           bwrap --version
-      # Ubuntu 24.04 sets kernel.apparmor_restrict_unprivileged_userns=1, so
-      # bubblewrap can make a user namespace only for a program with an
-      # AppArmor profile that allows it. scripts/apparmor.sh loads the profile
-      # the library prints for the test binary, and removes it after.
+      # TestIsolation's open level tries to replace an iptables table, and
+      # wants the kernel's EPERM. Without the ip_tables module, which 26.04's
+      # runner doesn't load, the kernel answers ENOPROTOOPT before it checks
+      # anything, and the test would prove nothing.
+      - name: Load ip_tables
+        run: sudo modprobe ip_tables
       - name: Show the restriction
-        run: sysctl kernel.apparmor_restrict_unprivileged_userns kernel.unprivileged_userns_clone
+        run: |
+          sysctl kernel.apparmor_restrict_unprivileged_userns kernel.unprivileged_userns_clone
+          ls /sys/kernel/security/apparmor/policy/profiles | grep -E 'bwrap|userns' || true
+      - name: Require Ubuntu's bwrap profile
+        if: matrix.bwrap-profile
+        run: |
+          if ! ls -d /sys/kernel/security/apparmor/policy/profiles/bwrap.* >/dev/null 2>&1; then
+            echo "Ubuntu's bwrap profile is not loaded, so this leg would not test the enforce-mode profile" >&2
+            exit 1
+          fi
       # SBX_LOCAL runs the tests on this machine, as the runner's own user, in
       # a directory of their own under /tmp, as the script explains.
       - name: Test

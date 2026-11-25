@@ -92,7 +92,7 @@ A program that sandboxes should tell its operator what the sandbox gives and wha
 
 ### Probe
 
-`Probe` tries the backend for real and returns a `Report`:
+`Probe` tries the backend for real and returns a `Report`. On Linux its trial is a real sandbox whose command is the program itself, so the program must call `Stage` first, as it must for `Command` and `Check`. A trial that can't be built at all, such as for want of a temporary directory, fails as `probe.trial`.
 
 - `Backend` is `bubblewrap` or `seatbelt`.
 - `Kernel` maps each level asked for to the level given, never a lower one. A level the host can't meet is absent.
@@ -137,7 +137,7 @@ A pass means one attempt failed, not that every path is closed. The checks have 
 | Finding | How it's detected | Fix |
 |---|---|---|
 | bubblewrap missing, setuid, or older than 0.8 | `PATH`, mode bits, `--version` | The distribution's package. |
-| Ubuntu's AppArmor restriction on user namespaces | `kernel.apparmor_restrict_unprivileged_userns=1`, and the trial sandbox fails | An AppArmor profile for this binary's path with a `userns` rule, which `Probe` prints, plus the commands to load it. A child profile for bubblewrap doesn't work ([linux.md](linux.md#probe-and-check)). |
+| Ubuntu's AppArmor restriction on user namespaces | `kernel.apparmor_restrict_unprivileged_userns=1`, the trial sandbox fails, and the binary doesn't already run under its own profile with bubblewrap in the same label | An AppArmor profile for this binary's path, which `Probe` prints, plus the commands to load it. Where no profile attaches to bubblewrap, as on Ubuntu 24.04, it is an unconfined-mode profile with a `userns` rule. Where one does, as Ubuntu 26.04's `bwrap-userns-restrict` does, it is an enforce-mode profile with `allow all`, which keeps bubblewrap and everything else the binary runs in its own label ([linux.md](linux.md#probe-and-check)). Neither is a profile for bubblewrap itself. |
 | User namespaces turned off | `kernel.unprivileged_userns_clone=0` (older Debian) or `user.max_user_namespaces=0` | The sysctl. |
 | Docker's or Podman's default seccomp profile | `Seccomp: 2`, a container detected, and `unshare(CLONE_NEWUSER)` returns `EPERM`. The default profile grants those calls only with `CAP_SYS_ADMIN`. | A seccomp profile that is the runtime's default plus `clone` with the namespace flags, `unshare`, `mount`, `umount2`, `pivot_root` and the new mount API. Never `seccomp=unconfined`. |
 | Docker's AppArmor profile | `/proc/self/attr/current` reads `docker-default` | A profile that allows `mount`, or `--security-opt apparmor=unconfined` for this container only. |
@@ -145,7 +145,7 @@ A pass means one attempt failed, not that every path is closed. The checks have 
 | A hardened systemd unit | `$INVOCATION_ID` set, the cgroup ends in `.service`, and namespaces or mounts are refused | Relax `RestrictNamespaces=`, and a `SystemCallFilter=` that lacks `@mount`, for this unit only. |
 | macOS: already inside a Seatbelt profile | `sandbox-exec` with a trivial profile fails | Run outside that profile: another tool's sandbox or an App Sandbox. |
 
-In a container, the fix relaxes the outer layer just enough for the inner one, which then applies the stricter filter and the covers to the untrusted code. This is why the sandbox can't start inside default Docker, rootless Podman or a hardened unit: all three refuse the namespace and mount calls that bubblewrap makes. The AppArmor row was verified on Ubuntu 24.04. The masked-`/proc` row and the Docker and Podman options were inferred, not run.
+In a container, the fix relaxes the outer layer just enough for the inner one, which then applies the stricter filter and the covers to the untrusted code. This is why the sandbox can't start inside default Docker, rootless Podman or a hardened unit: all three refuse the namespace and mount calls that bubblewrap makes. The AppArmor row was verified on Ubuntu 24.04 and 26.04. The masked-`/proc` row and the Docker and Podman options were inferred, not run.
 
 Container detection is best effort: `/.dockerenv`, `/run/.containerenv`, `KUBERNETES_SERVICE_HOST`, cgroup path patterns, and `systemd-detect-virt -c` when it exists.
 

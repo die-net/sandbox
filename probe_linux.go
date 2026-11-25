@@ -9,15 +9,19 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 )
 
-// Probe tries the Linux backend for real: bubblewrap, its version, a user
-// namespace it can mount in, and the seccomp filters this architecture has.
-// An error means no sandbox can start, and Report.Checks says why and how to
-// fix it. The Report is filled in either way.
+// Probe tries the Linux backend for real: bubblewrap, its version, the
+// seccomp filters this architecture has, and a trial sandbox that Command
+// builds, whose first stage must get its capabilities and whose command must
+// run. The trial's command is this binary, so the program must call Stage
+// first in main, as it must for Command and Check. An error means no sandbox
+// can start, and Report.Checks says why and how to fix it. The Report is
+// filled in either way.
 func Probe() (Report, error) {
 	rep := Report{
 		Backend:         "bubblewrap",
@@ -47,7 +51,7 @@ func Probe() (Report, error) {
 	// The trial needs a working bubblewrap, and is skipped when diagnose
 	// would stop earlier anyway.
 	if f.Bwrap != "" && !f.Setuid && len(f.Kernels) > 0 {
-		f.TryErr = tryBubblewrap(f.Bwrap)
+		f.TryErr, f.TrialErr = trySandbox()
 	}
 	if f.TryErr != "" {
 		gatherFailureFacts(&f)
@@ -87,27 +91,88 @@ func trueBinary() string {
 	return ""
 }
 
-// tryBubblewrap starts a sandbox that makes the mounts a real one does, and
-// returns bubblewrap's complaint, or "" if it ran.
-func tryBubblewrap(bwrap string) string {
-	tr := trueBinary()
-	if tr == "" {
-		return "" // nothing to run in it; the trial proves nothing
+// trySandbox starts a sandbox through Command, as a caller does, and returns
+// why it failed, or "" if its command ran and exited 0. The command is this
+// binary's check child in its no-op mode, which needs nothing from the host,
+// so the trial fails only where the backend does, such as a first stage
+// that AppArmor denies its capabilities. The home is a directory of its own,
+// removed after. built is set instead when the trial could not be made at
+// all, so its failure is not blamed on the host's sandboxing.
+func trySandbox() (failed, built string) {
+	home, err := os.MkdirTemp("", "sandbox-probe-")
+	if err != nil {
+		return "", fmt.Sprintf("make its home: %v", err)
+	}
+	// Nothing can be done about a home that won't go, and it holds nothing.
+	defer func() { _ = os.RemoveAll(home) }()
+	// Start refuses a home path with a link in it, which a temporary
+	// directory may have, such as a TMPDIR under a link. Probe made this
+	// directory just now, so the real path names the same one.
+	if resolved, err := filepath.EvalSymlinks(home); err == nil {
+		home = resolved
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, bwrap, "--unshare-user", "--unshare-pid", "--die-with-parent", //nolint:gosec // G204: bwrap is the bubblewrap Probe found, run with a fixed trial.
-		"--ro-bind", "/", "/", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--", tr)
+	cmd, err := Command(ctx, Spec{Command: []string{SelfPath, checkArg, modeNoop}, Home: home})
+	if err != nil {
+		return "", err.Error()
+	}
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		msg := strings.TrimSpace(stderr.String())
-		if msg == "" {
-			msg = err.Error()
-		}
-		return msg
+	err = cmd.Start()
+	if err == nil {
+		err = cmd.Wait()
 	}
-	return ""
+	if err == nil {
+		return "", ""
+	}
+	// The stages write why they failed to stderr, which says more than the
+	// error Start sees once the stage has exited.
+	if msg := strings.TrimSpace(stderr.String()); msg != "" {
+		return fmt.Sprintf("%s (%v)", msg, err), ""
+	}
+	return err.Error(), ""
+}
+
+// bwrapLabel returns the AppArmor label bubblewrap gets when this process
+// runs it, or "" when it can't be read. bubblewrap reads its --args
+// descriptor to the end while it parses its arguments (parse_args_recurse in
+// bubblewrap.c), which main does before it makes any namespace, so it waits
+// there while the pipe's write end is open. The label is read then, and closing
+// the pipe ends bubblewrap, which finds no command.
+func bwrapLabel(bwrap string) string {
+	r, w, err := os.Pipe()
+	if err != nil {
+		return ""
+	}
+	defer func() { _ = w.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bwrap, "--args", "3")
+	cmd.ExtraFiles = []*os.File{r}
+	err = cmd.Start()
+	_ = r.Close() // bubblewrap holds its own copy.
+	if err != nil {
+		return ""
+	}
+	b, err := os.ReadFile("/proc/" + strconv.Itoa(cmd.Process.Pid) + "/attr/current")
+	_ = w.Close()  // Ends bubblewrap's read. The deferred close is then a no-op.
+	_ = cmd.Wait() // bubblewrap exits 1 for want of a command, which is expected.
+	if err != nil {
+		return ""
+	}
+	return strings.TrimRight(string(b), "\x00\n")
+}
+
+// gatherAppArmor reads this process's AppArmor label, and the one bubblewrap
+// gets when this process runs it, which choose the profile Probe prints.
+func gatherAppArmor(f *probeFacts) {
+	if b, err := os.ReadFile("/proc/self/attr/current"); err == nil {
+		f.AppArmor = strings.TrimRight(string(b), "\x00\n")
+	}
+	if f.Bwrap != "" {
+		f.BwrapLabel = bwrapLabel(f.Bwrap)
+	}
 }
 
 // gatherContainer reads the markers detectContainer looks at.
@@ -140,7 +205,9 @@ func gatherFailureFacts(f *probeFacts) {
 		st.Close() //nolint:gosec // G104: a read-only descriptor, and nothing can be done about a failed close.
 		f.Seccomp = s.Seccomp
 	}
-	if b, err := os.ReadFile("/proc/self/attr/current"); err == nil {
+	if f.Sysctl["kernel.apparmor_restrict_unprivileged_userns"] == "1" {
+		gatherAppArmor(f)
+	} else if b, err := os.ReadFile("/proc/self/attr/current"); err == nil {
 		f.AppArmor = strings.TrimRight(string(b), "\x00\n")
 	}
 	if mi, err := os.Open("/proc/self/mountinfo"); err == nil {
