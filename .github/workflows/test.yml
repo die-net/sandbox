@@ -58,7 +58,18 @@ jobs:
       # AppArmor profile that allows it. scripts/apparmor.sh loads the profile
       # the library prints for the test binary, and removes it after.
       - name: Show the restriction
-        run: sysctl kernel.apparmor_restrict_unprivileged_userns kernel.unprivileged_userns_clone
+        run: |
+          sysctl kernel.apparmor_restrict_unprivileged_userns kernel.unprivileged_userns_clone
+          ls /sys/kernel/security/apparmor/policy/profiles | grep -E 'bwrap|userns' || true
+      # The 26.04 legs exist to test the profile against Ubuntu's bwrap
+      # profile, so they fail if the runner stops loading it.
+      - name: Require Ubuntu's bwrap profile
+        if: matrix.os == 'ubuntu-26.04'
+        run: |
+          if ! ls -d /sys/kernel/security/apparmor/policy/profiles/bwrap.* >/dev/null 2>&1; then
+            echo "Ubuntu's bwrap profile is not loaded, so this leg would not test the profile against it" >&2
+            exit 1
+          fi
       # SBX_LOCAL runs the tests on this machine, as the runner's own user, in
       # a directory of their own under /tmp, as the script explains.
       - name: Test
