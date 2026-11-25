@@ -317,7 +317,7 @@ func checkNested(e *checkEnv) []Result {
 		}
 		return verdict(name, mode+" of "+what+" in a new user and mount namespace", worked)
 	}
-	covers := slices.Concat(defaultCover, e.spec.Cover)
+	covers := checkedCovers(e.spec)
 	return []Result{
 		attempt(names[0], modeUmount, covers, "cover"),
 		attempt(names[1], modeRemount, e.spec.Read, "read-only Read path"),
