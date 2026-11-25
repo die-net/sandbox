@@ -316,6 +316,53 @@ func TestCheckedCoversListsEachOnce(t *testing.T) {
 	}
 }
 
+// TestExtraGroups checks that the process's own gid and egid, which Docker and
+// initgroups put in getgroups' list, aren't counted as supplementary groups,
+// and that any other group is.
+func TestExtraGroups(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		gs        []int
+		gid, egid int
+		want      []int
+	}{
+		{nil, 1000, 1000, nil},
+		{[]int{1000}, 1000, 1000, nil},
+		{[]int{1000, 999}, 1000, 1000, []int{999}},
+		{[]int{5}, 1000, 5, nil},
+		{[]int{65534}, 1000, 1000, []int{65534}},
+	} {
+		if got := extraGroups(tc.gs, tc.gid, tc.egid); !slices.Equal(got, tc.want) {
+			t.Errorf("extraGroups(%v, %d, %d) = %v, want %v", tc.gs, tc.gid, tc.egid, got, tc.want)
+		}
+	}
+}
+
+// TestCoverLeakWalksScratch checks that a scratch directory under a cover is
+// explained without hiding what is in it, so a host file that showed through
+// the sandbox's own tmpfs still fails the cover.
+func TestCoverLeakWalksScratch(t *testing.T) {
+	t.Parallel()
+	cover := t.TempDir()
+	scratch := filepath.Join(cover, "tmp")
+	home := filepath.Join(cover, "home")
+	for _, d := range []string{scratch, home} {
+		if err := os.Mkdir(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := coverLeak(cover, []string{home}, []string{scratch}); got != "" {
+		t.Errorf("an empty scratch directory and a shown home leak %q", got)
+	}
+	leaked := filepath.Join(scratch, "host-file")
+	if err := os.WriteFile(leaked, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := coverLeak(cover, []string{home}, []string{scratch}); got != leaked {
+		t.Errorf("coverLeak = %q, want %q, the file in the scratch directory", got, leaked)
+	}
+}
+
 // noDeadlineConn is a connection that refuses a deadline, and records a write.
 type noDeadlineConn struct {
 	net.Conn
