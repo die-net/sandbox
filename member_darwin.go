@@ -189,13 +189,6 @@ func (m marker) processes() ([]int, error) {
 	return out, nil
 }
 
-// testProberHook changes the prober of every teardown in this process, to
-// make one that cannot prove the sandbox empty without a process that keeps
-// ahead of it. A test binary's TestMain sets it, once, in a stage process
-// before anything runs, since the stage has no Cmd to carry a hook (see
-// run.proberHook). It is nil in a program.
-var testProberHook func(*prober)
-
 // prober returns the scan's view of the system for m: the account's pids
 // from proc_listpids in one atomic list (procinfo_darwin.go), sandbox_check, and
 // the process's bsdinfo.
@@ -213,9 +206,6 @@ func (m marker) prober(execPid int) prober {
 		kill:  func(pid int) { _ = syscall.Kill(pid, syscall.SIGKILL) },
 		now:   time.Now,
 		sleep: time.Sleep,
-	}
-	if testProberHook != nil {
-		testProberHook(&p)
 	}
 	return p
 }
