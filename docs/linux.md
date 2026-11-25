@@ -6,7 +6,7 @@ How the sandbox is built on Linux, and what was tried and dropped. [security-mod
 
 bubblewrap builds the sandbox. It's the setup Flatpak runs every app through, so a reviewer can rely on its record and read only what this package hands it, where a builder of our own would have to be reviewed whole.
 
-- The package needs bubblewrap 0.8.0 or later, from the distribution. The suite passes on 0.12.0 and on 0.9.0.
+- The package needs bubblewrap 0.8.0 or later, from the distribution. The suite passes on 0.12.0, 0.9.0 and 0.8.0.
 - It refuses a setuid copy, since bubblewrap's serious past flaws were in its setuid mode.
 - `Command` works out the view. `Start` hands bubblewrap every option on a descriptor with `--args`, so pid 1's command line, which any process inside can read, doesn't list them.
 - Each bind source is opened by the caller's process and passed as a descriptor with `--bind-fd` or `--ro-bind-fd`. The account's `passwd` and `group` entries go in with `--ro-bind-data`.
