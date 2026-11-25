@@ -53,3 +53,7 @@ func platformSockets() []string {
 // platformScratch is empty here, where the view's only exceptions are the paths
 // of the Spec.
 func platformScratch() []string { return nil }
+
+// overflowGID returns -1: without user namespaces, no gid stands for groups
+// that aren't mapped.
+func overflowGID() int { return -1 }

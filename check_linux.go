@@ -700,3 +700,19 @@ func parseGateway(r io.Reader) (string, error) {
 	}
 	return "", errors.New("no default route")
 }
+
+// overflowGID returns the gid that getgroups shows for a group not mapped
+// into the caller's user namespace. It is 65534 unless the host changed
+// kernel.overflowgid, and 65534 is also what it returns when the sysctl
+// can't be read, as DEFAULT_OVERFLOWGID in Linux include/linux/highuid.h.
+func overflowGID() int {
+	b, err := os.ReadFile("/proc/sys/kernel/overflowgid")
+	if err != nil {
+		return 65534
+	}
+	g, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil {
+		return 65534
+	}
+	return g
+}

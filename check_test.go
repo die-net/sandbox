@@ -322,18 +322,22 @@ func TestCheckedCoversListsEachOnce(t *testing.T) {
 func TestExtraGroups(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
-		gs        []int
-		gid, egid int
-		want      []int
+		gs                  []int
+		gid, egid, overflow int
+		want                []int
 	}{
-		{nil, 1000, 1000, nil},
-		{[]int{1000}, 1000, 1000, nil},
-		{[]int{1000, 999}, 1000, 1000, []int{999}},
-		{[]int{5}, 1000, 5, nil},
-		{[]int{65534}, 1000, 1000, []int{65534}},
+		{nil, 1000, 1000, 65534, nil},
+		{[]int{1000}, 1000, 1000, 65534, nil},
+		{[]int{1000, 999}, 1000, 1000, 65534, []int{999}},
+		{[]int{5}, 1000, 5, 65534, nil},
+		{[]int{65534}, 1000, 1000, 65534, []int{65534}},
+		// An account whose own group is nogroup, with a group not mapped
+		// into the namespace: both show as the overflow gid.
+		{[]int{65534}, 65534, 65534, 65534, []int{65534}},
+		{[]int{65534}, 65534, 65534, -1, nil},
 	} {
-		if got := extraGroups(tc.gs, tc.gid, tc.egid); !slices.Equal(got, tc.want) {
-			t.Errorf("extraGroups(%v, %d, %d) = %v, want %v", tc.gs, tc.gid, tc.egid, got, tc.want)
+		if got := extraGroups(tc.gs, tc.gid, tc.egid, tc.overflow); !slices.Equal(got, tc.want) {
+			t.Errorf("extraGroups(%v, %d, %d, %d) = %v, want %v", tc.gs, tc.gid, tc.egid, tc.overflow, got, tc.want)
 		}
 	}
 }

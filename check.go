@@ -339,16 +339,25 @@ func checkGroups(*checkEnv) []Result {
 	if err != nil {
 		return []Result{fail("groups.supplementary", "getgroups: %v", err)}
 	}
-	gid, egid := os.Getgid(), os.Getegid()
-	if extra := extraGroups(gs, gid, egid); len(extra) > 0 {
-		return []Result{fail("groups.supplementary", "getgroups returned %v, beyond the process's own gid %d and egid %d", extra, gid, egid)}
+	gid, egid, overflow := os.Getgid(), os.Getegid(), overflowGID()
+	if extra := extraGroups(gs, gid, egid, overflow); len(extra) > 0 {
+		why := ""
+		if slices.Contains(extra, overflow) {
+			why = fmt.Sprintf(". %d is the overflow gid, which stands for every group not mapped into this user namespace, so it is never taken for the process's own", overflow)
+		}
+		return []Result{fail("groups.supplementary", "getgroups returned %v, beyond the process's own gid %d and egid %d%s", extra, gid, egid, why)}
 	}
 	return []Result{pass("groups.supplementary", "getgroups returned no group beyond the process's own gid %d and egid %d", gid, egid)}
 }
 
-// extraGroups returns the groups in gs other than gid and egid.
-func extraGroups(gs []int, gid, egid int) []int {
-	return slices.DeleteFunc(slices.Clone(gs), func(g int) bool { return g == gid || g == egid })
+// extraGroups returns the groups in gs other than gid and egid. It keeps
+// the overflow gid even when it is gid or egid: inside a user namespace,
+// getgroups shows every unmapped group as that gid (groups_to_user in Linux
+// kernel/groups.c), so a process whose own gid is the overflow gid can't
+// tell its own group from groups the kernel still grants it. overflow is -1
+// where there is none.
+func extraGroups(gs []int, gid, egid, overflow int) []int {
+	return slices.DeleteFunc(slices.Clone(gs), func(g int) bool { return g != overflow && (g == gid || g == egid) })
 }
 
 func checkIdentity(*checkEnv) []Result {
