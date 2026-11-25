@@ -1705,7 +1705,9 @@ func TestEscapeDefaultCovers(t *testing.T) {
 		t.Fatal(err)
 	}
 	// A file of the host in /dev/shm and /var/tmp is out of the sandbox's own.
-	shm := fmt.Sprintf("/dev/shm/sandbox-test-%d", os.Getpid())
+	// Its name is not escScratch's, whose file TestEscapeScratch checks never
+	// shows on the host while this test may run beside it.
+	shm := fmt.Sprintf("/dev/shm/sandbox-cover-%d", os.Getpid())
 	if err := os.WriteFile(shm, []byte("secret"), 0o600); err != nil {
 		t.Skip("cannot write /dev/shm on this host: " + err.Error())
 	}

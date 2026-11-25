@@ -55,7 +55,7 @@ esac
 # The binary goes in its own directory: the tests make that directory
 # readable inside the sandbox, and it must not be /tmp itself, which the
 # sandbox covers.
-rdir=/tmp/sandbox-test-$$
+rdir=/tmp/sandbox-run-$$
 remote=$rdir/sandbox.test
 rsh "mkdir $rdir"
 cleanup() { rsh "rm -rf $rdir" || true; rm -rf "$out"; }
