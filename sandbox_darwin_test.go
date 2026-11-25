@@ -59,6 +59,11 @@ const stageKillBeforeReplyEnv = "SANDBOX_TEST_STAGE_KILL_BEFORE_REPLY"
 // keeps forking against the teardown is.
 const stageNoKillEnv = "SANDBOX_TEST_STAGE_NO_KILL"
 
+// stageFdDirEnv, in the same place, holds the directory the stage lists its
+// descriptors from in place of /dev/fd, so that a test can make the listing
+// fail.
+const stageFdDirEnv = "SANDBOX_TEST_STAGE_FD_DIR"
+
 // TestMain lets the test binary be each part of a sandbox: the process that
 // starts it, its stage, and the command inside it.
 func TestMain(m *testing.M) {
@@ -116,6 +121,7 @@ func TestMain(m *testing.M) {
 			_ = syscall.Kill(os.Getpid(), syscall.SIGKILL)
 		}
 	}
+	opts.fdDir = os.Getenv(stageFdDirEnv)
 	if len(hooks) > 0 {
 		opts.proberHook = func(p *prober) {
 			for _, h := range hooks {

@@ -1108,3 +1108,28 @@ func TestStageKilledAfterItsForkLeavesNoCommandRunning(t *testing.T) {
 		t.Error("the command ran, though the stage that started it was killed before it replied")
 	}
 }
+
+// Row: "Descriptors handed in". A stage that can't list its descriptors can't
+// mark them close-on-exec, and the command would inherit the stage's own, the
+// status pipe among them. So the stage starts nothing, and Start fails.
+func TestStageThatCannotListDescriptorsStartsNothing(t *testing.T) {
+	t.Parallel()
+	home := realTemp(t)
+	ran := filepath.Join(home, "ran")
+	c, err := Command(t.Context(), Spec{Home: home, Command: []string{"/usr/bin/touch", ran}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Env = []string{shellPath, stageFdDirEnv + "=" + filepath.Join(home, "missing")}
+	err = c.Start()
+	if err == nil {
+		_ = c.Wait()
+		t.Fatal("Start succeeded though the stage could not list its descriptors")
+	}
+	if !strings.Contains(err.Error(), "close-on-exec") {
+		t.Errorf("Start = %v, want the stage's error", err)
+	}
+	if _, err := os.Stat(ran); err == nil {
+		t.Error("the command ran, though the stage could not mark its descriptors close-on-exec")
+	}
+}

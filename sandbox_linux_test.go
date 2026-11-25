@@ -66,8 +66,16 @@ const (
 // table, which needs CAP_NET_ADMIN.
 const iptSoSetReplace = 64
 
-// TestMain lets the test binary be each part of a sandbox: the process that
-// starts it, its first stage, and the command inside it.
+// stageNoCloseRangeEnv, in the environment of a sandbox's stage, which is this
+// test binary again, makes the stage skip close_range, as on a kernel before
+// 5.11, and list its descriptors instead.
+const stageNoCloseRangeEnv = "SANDBOX_TEST_STAGE_NO_CLOSE_RANGE"
+
+// stageFdDirEnv, in the same place, holds the directory the stage lists its
+// descriptors from in place of /proc/self/fd, so that a test can make the
+// listing fail.
+const stageFdDirEnv = "SANDBOX_TEST_STAGE_FD_DIR"
+
 // listenTCP listens on a TCP address, with a context that is never canceled,
 // for the processes the tests run inside a sandbox, which have none of their
 // own to give.
@@ -76,13 +84,19 @@ func listenTCP(addr string) (net.Listener, error) {
 	return lc.Listen(context.Background(), "tcp", addr)
 }
 
+// TestMain lets the test binary be each part of a sandbox: the process that
+// starts it, its stages, and the command inside it.
 func TestMain(m *testing.M) {
 	registerAPIModes()
 	registerAPIAllocCheck()
 	registerEscapeModes()
 	registerEscRoot()
 	registerHardeningChecks()
-	if code, ok := Stage(); ok {
+	opts := stageOptions{
+		noCloseRange: os.Getenv(stageNoCloseRangeEnv) != "",
+		fdDir:        os.Getenv(stageFdDirEnv),
+	}
+	if code, ok := runStage(opts); ok {
 		os.Exit(code)
 	}
 	if body, ok := os.LookupEnv(testSpecVar); ok {
