@@ -31,7 +31,7 @@ func churnBackoff(t *testing.T) {
 
 // TestChurnCleanScanRate measures how often a scan of an empty sandbox is clean,
 // and how long a teardown takes, while other processes of the account fork and
-// exit as fast as they can: n perl loops, each with one child at a time that
+// exit as fast as they can: n shell loops, each with one child at a time that
 // exits at once. It needs a machine with nothing else to do, and takes half a
 // minute, so it runs only with SANDBOX_CHURN=1. The figures are in
 // docs/macos.md, "Process churn".
@@ -42,7 +42,9 @@ func TestChurnCleanScanRate(t *testing.T) {
 		t.Skip("set SANDBOX_CHURN=1 to measure")
 	}
 	churnBackoff(t)
-	const loop = `use POSIX; my $e = time + $ARGV[0]; my $n = 0; while (time < $e) { my $p = fork(); if (!$p) { POSIX::_exit(0) } waitpid($p, 0); $n++ } print "$n\n";`
+	// (:) forks a subshell, with no exec, that exits at once, and the loop
+	// waits for it. $SECONDS is bash's, the shell's age in seconds.
+	const loop = `n=0; while [ "$SECONDS" -lt "$1" ]; do (:); n=$((n+1)); done; echo "$n"`
 	budget := 200 * time.Millisecond
 	if v, err := strconv.Atoi(os.Getenv("SANDBOX_CHURN_BUDGET_MS")); err == nil {
 		budget = time.Duration(v) * time.Millisecond
@@ -66,7 +68,7 @@ func TestChurnCleanScanRate(t *testing.T) {
 		var cmds []*exec.Cmd
 		outs := make([]*syncBuffer, loops)
 		for i := range loops {
-			cmd := exec.CommandContext(t.Context(), "/usr/bin/perl", "-e", loop, strconv.Itoa(secs)) //nolint:gosec // G204: the test binary or a tool the test names, run as the test's own child.
+			cmd := exec.CommandContext(t.Context(), "/bin/bash", "-c", loop, "churn", strconv.Itoa(secs)) //nolint:gosec // G204: the test binary or a tool the test names, run as the test's own child.
 			outs[i] = &syncBuffer{}
 			cmd.Stdout = outs[i]
 			if err := cmd.Start(); err != nil {
@@ -136,11 +138,11 @@ func TestChurnNormalTeardownLatency(t *testing.T) {
 		t.Skip("set SANDBOX_CHURN=1 to measure")
 	}
 	churnBackoff(t)
-	const loop = `use POSIX; my $e = time + $ARGV[0]; while (time < $e) { my $p = fork(); if (!$p) { POSIX::_exit(0) } waitpid($p, 0); }`
+	const loop = `while [ "$SECONDS" -lt "$1" ]; do (:); done`
 	for _, loops := range []int{0, 4, 16} {
 		var cmds []*exec.Cmd
 		for range loops {
-			cmd := exec.CommandContext(t.Context(), "/usr/bin/perl", "-e", loop, "9")
+			cmd := exec.CommandContext(t.Context(), "/bin/bash", "-c", loop, "churn", "9")
 			if err := cmd.Start(); err != nil {
 				t.Fatal(err)
 			}

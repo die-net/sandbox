@@ -289,10 +289,7 @@ func TestTeardownGivesUpOnMembersItCannotEnd(t *testing.T) {
 	// The member leaves the command's group, so the stage's signal to the group
 	// misses it, and the stage's scan signals nothing, so it finds it again each
 	// time, as it would a process that forks faster than it is signaled.
-	const leaver = `use POSIX qw(setsid _exit); pipe(my $r, my $w); my $pid = fork();
-if (!$pid) { setsid(); syswrite($w, "x"); sleep 30; _exit(0) }
-close $w; sysread($r, my $b, 1); _exit(0);`
-	c, err := Command(t.Context(), Spec{Home: realTemp(t), Command: []string{"/usr/bin/perl", "-e", leaver}})
+	c, err := Command(t.Context(), Spec{Home: realTemp(t), Command: []string{self(t), "leaver", "keep"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -358,13 +355,10 @@ func TestWaitGivesUpOnMembersItCannotEnd(t *testing.T) {
 func TestTeardownDoesNotGiveUpOnShortChains(t *testing.T) {
 	t.Parallel()
 	const chains = 8
-	script := `use POSIX qw(setsid _exit); use Time::HiRes qw(time);
-my $end = time + 3;
-while (time < $end) { my $pid = fork(); defined $pid or _exit(1); _exit(0) if $pid; setsid(); }
-_exit(0);`
-	sh := fmt.Sprintf(`i=0; while [ $i -lt %d ]; do /usr/bin/perl -e "$0" & i=$((i+1)); done; wait`, chains)
+	// Each chain forks as fast as it can, and stops by itself within 3 seconds.
+	script := fmt.Sprintf(`i=0; while [ $i -lt %d ]; do chain 3 0 & i=$((i+1)); done; wait`, chains)
 	for range 3 {
-		c, err := Command(t.Context(), Spec{Home: realTemp(t), Command: []string{"/bin/sh", "-c", sh, script}})
+		c, err := Command(t.Context(), Spec{Home: realTemp(t), Command: reforkCommand(script)})
 		if err != nil {
 			t.Fatal(err)
 		}

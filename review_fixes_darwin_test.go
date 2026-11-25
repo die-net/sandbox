@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -191,7 +192,7 @@ func TestMemberNeverMatchesAProcessApplyingAProfile(t *testing.T) {
 // chain lives on.
 func TestRealScanIsNeverCleanWhileAChainLives(t *testing.T) {
 	t.Parallel()
-	c, err := Command(t.Context(), Spec{Home: realTemp(t), Command: []string{"/bin/sh", "-c", `/usr/bin/perl -e "$0" 6 & /bin/sleep 3`, reforkScript}})
+	c, err := Command(t.Context(), Spec{Home: realTemp(t), Command: reforkCommand("chain 6 200 & /bin/sleep 3")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -514,6 +515,53 @@ func TestProcStatOfReadsTheFlagsAndTheName(t *testing.T) {
 
 func registerSleepForever() {
 	childModes["sleep-forever"] = func([]string) int { time.Sleep(time.Minute); return 0 }
+}
+
+// registerLeaver adds "leaver", a command that starts a member which leaves the
+// command's group and session with setsid, and exits once the member has. The
+// member is this binary again, as "leaver-member", which sleeps 30 seconds and
+// ends by itself. With "keep" it holds the command's output open. With "close"
+// it never has it, and the command writes "x" to its output before it exits. A
+// fork and exec does here: what matters is where the member ends up, not how
+// fast it gets there.
+func registerLeaver() {
+	childModes["leaver"] = func(args []string) int {
+		if len(args) != 1 || (args[0] != "keep" && args[0] != "close") {
+			fmt.Fprintln(os.Stderr, "leaver keep|close")
+			return 2
+		}
+		r, w, err := os.Pipe()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		// The member outlives this process, so no context ends it.
+		member := exec.CommandContext(context.Background(), self1(), "leaver-member") //nolint:gosec // G204: the test binary or a tool the test names, run as the test's own child.
+		member.ExtraFiles = []*os.File{w}
+		member.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+		if args[0] == "keep" {
+			member.Stdout, member.Stderr = os.Stdout, os.Stderr
+		}
+		if err := member.Start(); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		_ = w.Close()
+		// The member writes once it runs, after its setsid.
+		if _, err := r.Read(make([]byte, 1)); err != nil {
+			fmt.Fprintln(os.Stderr, "the member never started:", err)
+			return 1
+		}
+		if args[0] == "close" {
+			_, _ = os.Stdout.WriteString("x")
+		}
+		return 0
+	}
+	childModes["leaver-member"] = func([]string) int {
+		_, _ = os.NewFile(3, "ready").WriteString("x")
+		time.Sleep(30 * time.Second)
+		return 0
+	}
 }
 
 // A process that runs under another sandbox's profile and is named sandbox-exec
@@ -962,9 +1010,6 @@ func TestWatchStageDoesNotScanAfterTheStageReported(t *testing.T) {
 	t.Parallel()
 	// The member leaves the command's group, so the stage's signal to the group
 	// misses it, and it closes its output, which would otherwise hold Wait.
-	const leaver = `use POSIX qw(setsid _exit); pipe(my $r, my $w); my $pid = fork();
-if (!$pid) { setsid(); close STDOUT; close STDERR; syswrite($w, "x"); sleep 30; _exit(0) }
-close $w; sysread($r, my $b, 1); syswrite(STDOUT, "x"); _exit(0);`
 	for _, tc := range []struct {
 		name    string
 		command []string
@@ -973,7 +1018,7 @@ close $w; sysread($r, my $b, 1); syswrite(STDOUT, "x"); _exit(0);`
 		timeout time.Duration
 	}{
 		{"empty", []string{"/bin/sh", "-c", "echo x"}, []string{shellPath}, false, 10 * time.Second},
-		{"members", []string{"/usr/bin/perl", "-e", leaver}, []string{shellPath, stageNoKillEnv + "=1"}, true, 30 * time.Second},
+		{"members", []string{self(t), "leaver", "close"}, []string{shellPath, stageNoKillEnv + "=1"}, true, 30 * time.Second},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -1045,10 +1090,7 @@ func TestWaitReturnsAfterAGiveUpWhileAMemberHoldsTheOutput(t *testing.T) {
 	t.Parallel()
 	// The member leaves the command's group, so the stage's signal to the group
 	// misses it, and it keeps the command's output open.
-	const leaver = `use POSIX qw(setsid _exit); pipe(my $r, my $w); my $pid = fork();
-if (!$pid) { setsid(); syswrite($w, "x"); sleep 30; _exit(0) }
-close $w; sysread($r, my $b, 1); _exit(0);`
-	c, err := Command(t.Context(), Spec{Home: realTemp(t), Command: []string{"/usr/bin/perl", "-e", leaver}})
+	c, err := Command(t.Context(), Spec{Home: realTemp(t), Command: []string{self(t), "leaver", "keep"}})
 	if err != nil {
 		t.Fatal(err)
 	}
