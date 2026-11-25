@@ -42,6 +42,15 @@ func TestCheckSandbox(t *testing.T) {
 		"expect.unreadable:" + secret: Pass,
 		// Not vacuous: a path under Home is writable, so the check says so.
 		"expect.unwritable:" + inHome: Fail,
+		// The sandbox's own pid 1, the check child's parent, is not outside
+		// it. It is still tried for tracing and its environment, and is
+		// undumpable.
+		"proc.visible": Pass,
+		"proc.signal":  Pass,
+		"proc.trace":   Pass,
+		"proc.environ": Pass,
+		// Only the caller's own context can make a cgroup to delegate.
+		"cgroup.delegate": Skipped,
 	} {
 		if r, ok := m[name]; !ok || r.Status != st {
 			t.Errorf("%s = %+v, want %v", name, r, st)

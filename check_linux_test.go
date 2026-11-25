@@ -199,6 +199,31 @@ func osNeutralNames() []string {
 	}
 }
 
+// TestOutsidePIDs checks that only the sandbox's own pid 1, the parent of a
+// check child that Check started in a sandbox, is left out of the processes
+// outside the check's tree. Every other pid counts, and pid 1 counts too when
+// it isn't the child's parent or the check runs with no Spec.
+func TestOutsidePIDs(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name      string
+		pids      []int
+		inSandbox bool
+		ppid      int
+		want      []int
+	}{
+		{"the sandbox's pid 1", []int{1}, true, 1, []int{}},
+		{"pid 1 and another", []int{1, 40}, true, 1, []int{40}},
+		{"a parent that isn't pid 1", []int{1, 40}, true, 7, []int{1, 40}},
+		{"no Spec", []int{1, 40}, false, 1, []int{1, 40}},
+		{"no pid 1", []int{2, 40}, true, 1, []int{2, 40}},
+	} {
+		if got := outsidePIDs(tc.pids, tc.inSandbox, tc.ppid); !slices.Equal(got, tc.want) {
+			t.Errorf("%s: outsidePIDs = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
 // TestProbeVM checks that Probe's verdict agrees with whether a sandbox
 // starts, on a host set up for the suite or not. On Ubuntu 26.04 without the
 // AppArmor profile, bubblewrap starts and AppArmor denies the first stage its

@@ -265,7 +265,8 @@ type checkEnv struct {
 	spec  *Spec
 	hints checkHints
 	// scratch are the paths inside the covers that the sandbox mounts a
-	// tmpfs of its own on, which the covers check doesn't walk.
+	// tmpfs of its own on. The covers check explains them and still walks
+	// into them, so anything there the sandbox didn't write shows.
 	scratch []string
 }
 
@@ -330,15 +331,24 @@ func verdict(name, tried string, worked []string) Result {
 	return pass(name, "%s: refused or absent", tried)
 }
 
+// checkGroups fails when the process holds a group beyond its own gid and
+// egid. getgroups may list the primary gid too, as Docker and initgroups do,
+// which grants nothing the process doesn't already have.
 func checkGroups(*checkEnv) []Result {
 	gs, err := os.Getgroups()
 	if err != nil {
 		return []Result{fail("groups.supplementary", "getgroups: %v", err)}
 	}
-	if len(gs) > 0 {
-		return []Result{fail("groups.supplementary", "getgroups returned %v", gs)}
+	gid, egid := os.Getgid(), os.Getegid()
+	if extra := extraGroups(gs, gid, egid); len(extra) > 0 {
+		return []Result{fail("groups.supplementary", "getgroups returned %v, beyond the process's own gid %d and egid %d", extra, gid, egid)}
 	}
-	return []Result{pass("groups.supplementary", "getgroups returned none")}
+	return []Result{pass("groups.supplementary", "getgroups returned no group beyond the process's own gid %d and egid %d", gid, egid)}
+}
+
+// extraGroups returns the groups in gs other than gid and egid.
+func extraGroups(gs []int, gid, egid int) []int {
+	return slices.DeleteFunc(slices.Clone(gs), func(g int) bool { return g == gid || g == egid })
 }
 
 func checkIdentity(*checkEnv) []Result {
@@ -713,7 +723,7 @@ func checkCovers(e *checkEnv) []Result {
 	// Paths the sandbox shows on purpose, and the directories that lead to them.
 	// The Spec is the prepared one, which has the files that links in /etc
 	// lead to under a cover.
-	shown := slices.Concat([]string{e.spec.Home, e.spec.Dir}, e.spec.Write, e.spec.Read, e.scratch)
+	shown := slices.Concat([]string{e.spec.Home, e.spec.Dir}, e.spec.Write, e.spec.Read)
 	shown = slices.DeleteFunc(shown, func(s string) bool { return s == "" })
 	covers := checkedCovers(e.spec)
 	res := make([]Result, 0, len(covers))
@@ -723,25 +733,7 @@ func checkCovers(e *checkEnv) []Result {
 			res = append(res, pass(name, "%s: %v", c, err))
 			continue
 		}
-		var leak string
-		n := 0
-		_ = filepath.WalkDir(c, func(p string, _ fs.DirEntry, err error) error {
-			if p == c || err != nil {
-				return nil
-			}
-			n++
-			if n > coverLimit {
-				return fs.SkipAll
-			}
-			if slices.ContainsFunc(shown, func(s string) bool { return under(p, s) }) {
-				return fs.SkipDir
-			}
-			if slices.ContainsFunc(shown, func(s string) bool { return under(s, p) }) {
-				return nil // on the way to a shown path
-			}
-			leak = p
-			return fs.SkipAll
-		})
+		leak := coverLeak(c, shown, e.scratch)
 		if leak != "" {
 			res = append(res, fail(name, "%s shows %s, which no Home, Write or Read path explains", c, leak))
 		} else {
@@ -749,6 +741,33 @@ func checkCovers(e *checkEnv) []Result {
 		}
 	}
 	return res
+}
+
+// coverLeak walks the cover c and returns the first path in it that neither
+// a shown path nor a scratch directory explains, or "". A shown path is
+// skipped whole. A scratch directory is a tmpfs the sandbox made, so it is
+// walked into, and anything in it shows.
+func coverLeak(c string, shown, scratch []string) string {
+	var leak string
+	n := 0
+	_ = filepath.WalkDir(c, func(p string, _ fs.DirEntry, err error) error {
+		if p == c || err != nil {
+			return nil
+		}
+		n++
+		if n > coverLimit {
+			return fs.SkipAll
+		}
+		if slices.ContainsFunc(shown, func(s string) bool { return under(p, s) }) {
+			return fs.SkipDir
+		}
+		if slices.ContainsFunc(shown, func(s string) bool { return under(s, p) }) || slices.Contains(scratch, p) {
+			return nil // on the way to a shown path, or the sandbox's scratch
+		}
+		leak = p
+		return fs.SkipAll
+	})
+	return leak
 }
 
 func checkExpect(e *checkEnv) []Result {

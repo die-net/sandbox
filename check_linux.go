@@ -406,7 +406,20 @@ func parseStatPPID(s string) (int, bool) {
 // probeLimit bounds how many outside processes each attempt tries.
 const probeLimit = 16
 
-func checkProcesses(*checkEnv) []Result {
+// outsidePIDs returns the pids that count as outside the check's tree. In a
+// sandbox Check built, the check child's parent is pid 1, the sandbox's own
+// stage, which started it. It is part of the sandbox, so it isn't outside,
+// and signal 0 to it works by design. In its own pid namespace nothing else
+// can hold pid 1. A sandbox without a pid namespace of its own gives the
+// child a parent with another pid, and then pid 1 counts.
+func outsidePIDs(pids []int, inSandbox bool, ppid int) []int {
+	if !inSandbox || ppid != 1 {
+		return pids
+	}
+	return slices.DeleteFunc(slices.Clone(pids), func(p int) bool { return p == 1 })
+}
+
+func checkProcesses(e *checkEnv) []Result {
 	pids, err := foreignPIDs()
 	if err != nil {
 		return []Result{
@@ -414,29 +427,29 @@ func checkProcesses(*checkEnv) []Result {
 			skipped("proc.trace", "%v", err), skipped("proc.environ", "%v", err),
 		}
 	}
-	if len(pids) == 0 {
-		return []Result{
-			pass("proc.visible", "no process outside this tree is listed in /proc"),
-			pass("proc.signal", "no outside process to signal"),
-			pass("proc.trace", "no outside process to trace"),
-			pass("proc.environ", "no outside process whose environment to read"),
-		}
+	outside := outsidePIDs(pids, e.spec != nil, os.Getppid())
+	var res []Result
+	if len(outside) == 0 {
+		res = append(res, pass("proc.visible", "no process outside this tree is listed in /proc"))
+	} else {
+		res = append(res, fail("proc.visible", "%d processes outside this tree are listed in /proc, such as pid %d", len(outside), outside[0]))
 	}
-	res := []Result{fail("proc.visible", "%d processes outside this tree are listed in /proc, such as pid %d", len(pids), pids[0])}
-	try := pids[:min(len(pids), probeLimit)]
+	// pid 1 is still tried for tracing and its environment, since it holds
+	// the sandbox's setup and must stay undumpable.
 	attempts := []struct {
 		name string
+		pids []int
 		fn   func(pid int) bool
 	}{
-		{"proc.signal", func(pid int) bool { return syscall.Kill(pid, 0) == nil }},
-		{"proc.trace", func(pid int) bool {
+		{"proc.signal", outside, func(pid int) bool { return syscall.Kill(pid, 0) == nil }},
+		{"proc.trace", pids, func(pid int) bool {
 			f, err := os.Open("/proc/" + strconv.Itoa(pid) + "/mem")
 			if err == nil {
 				f.Close() //nolint:gosec // G104: the open worked, which is the result.
 			}
 			return err == nil
 		}},
-		{"proc.environ", func(pid int) bool {
+		{"proc.environ", pids, func(pid int) bool {
 			f, err := os.Open("/proc/" + strconv.Itoa(pid) + "/environ")
 			if err != nil {
 				return false
@@ -447,13 +460,18 @@ func checkProcesses(*checkEnv) []Result {
 		}},
 	}
 	for _, a := range attempts {
+		if len(a.pids) == 0 {
+			res = append(res, pass(a.name, "no other process to try"))
+			continue
+		}
+		try := a.pids[:min(len(a.pids), probeLimit)]
 		var worked []string
 		for _, pid := range try {
 			if a.fn(pid) {
 				worked = append(worked, strconv.Itoa(pid))
 			}
 		}
-		res = append(res, verdict(a.name, fmt.Sprintf("%d outside processes tried", len(try)), worked))
+		res = append(res, verdict(a.name, fmt.Sprintf("%d other processes tried", len(try)), worked))
 	}
 	return res
 }
@@ -614,8 +632,15 @@ func checkLimits(*checkEnv) []Result {
 
 // checkDelegate makes a child of the process's own cgroup, as a unit with
 // Delegate=yes allows, and removes it again.
-func checkDelegate(*checkEnv) []Result {
+//
+// It asks whether the caller can make a cgroup to pass as Cmd.CgroupFD, which
+// only the caller's own context answers. Inside a sandbox the cgroup tree is
+// read-only, so there it is Skipped.
+func checkDelegate(e *checkEnv) []Result {
 	const name = "cgroup.delegate"
+	if e.spec != nil {
+		return []Result{skipped(name, "the check runs inside the sandbox Check started, whose cgroup tree is read-only. Check with no Spec tries it in the caller's own context")}
+	}
 	dir, err := cgroupDir()
 	if err != nil {
 		return []Result{fail(name, "%v", err)}
