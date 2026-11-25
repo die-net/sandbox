@@ -1184,9 +1184,7 @@ func TestEscapeParentKilled(t *testing.T) {
 	if err := parent.Start(); err != nil {
 		t.Fatal(err)
 	}
-	eventually(t, 10*time.Second, "the sandbox did not start", func() bool { _, err := os.Stat(marker); return err == nil })
-	b, _ := readFile(marker)
-	inner, _ := strconv.Atoi(string(b))
+	inner := readPid(t, marker)
 	if !alive(inner) {
 		t.Fatal("the command is not running")
 	}
@@ -1228,9 +1226,7 @@ func TestEscapeStageKilled(t *testing.T) {
 	if err := c.Start(); err != nil {
 		t.Fatal(err)
 	}
-	eventually(t, 10*time.Second, "no start", func() bool { _, err := os.Stat(marker); return err == nil })
-	b, _ := readFile(marker)
-	inner, _ := strconv.Atoi(string(b))
+	inner := readPid(t, marker)
 	_ = syscall.Kill(c.Pid(), syscall.SIGKILL)
 	err := c.Wait()
 	if err == nil {

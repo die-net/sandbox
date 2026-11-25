@@ -747,9 +747,7 @@ func TestAPIRun(t *testing.T) {
 		if err := cmd.Start(); err != nil {
 			t.Fatal(err)
 		}
-		eventually(t, 10*time.Second, "the command did not start", func() bool { _, err := os.Stat(marker); return err == nil })
-		b, _ := readFile(marker)
-		inner, _ := strconv.Atoi(string(b))
+		inner := readPid(t, marker)
 		_ = cmd.Process.Signal(syscall.SIGTERM)
 		done := make(chan error, 1)
 		go func() { done <- cmd.Wait() }()
@@ -919,9 +917,7 @@ func TestAPIContextAndWaitDelay(t *testing.T) {
 		if err := c.Start(); err != nil {
 			t.Fatal(err)
 		}
-		eventually(t, 10*time.Second, "no start", func() bool { _, err := os.Stat(marker); return err == nil })
-		b, _ := readFile(marker)
-		inner, _ := strconv.Atoi(string(b))
+		inner := readPid(t, marker)
 		cancel()
 		done := make(chan error, 1)
 		go func() { done <- c.Wait() }()
@@ -1052,9 +1048,7 @@ func TestAPIStartThreadExits(t *testing.T) {
 	if err := <-started; err != nil {
 		t.Fatal(err)
 	}
-	eventually(t, 10*time.Second, "no start", func() bool { _, err := os.Stat(marker); return err == nil })
-	b, _ := readFile(marker)
-	inner, _ := strconv.Atoi(string(b))
+	inner := readPid(t, marker)
 	for range 20 {
 		runtime.GC()
 		time.Sleep(20 * time.Millisecond)
