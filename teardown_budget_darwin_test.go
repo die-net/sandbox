@@ -303,8 +303,8 @@ func TestTeardownGivesUpOnMembersItCannotEnd(t *testing.T) {
 	if !errors.Is(err, ErrSurvivors) {
 		t.Errorf("Wait: %v, want ErrSurvivors", err)
 	}
-	if d := time.Since(start); d < giveUpAfter || d > giveUpAfter+3*time.Second {
-		t.Errorf("Wait took %v: the teardown should give up on members in about %v, and Wait not scan again", d, giveUpAfter)
+	if d := time.Since(start); d < stageNoKillGiveUp || d > stageNoKillGiveUp+3*time.Second {
+		t.Errorf("Wait took %v: the teardown should give up on members in about %v, and Wait not scan again", d, stageNoKillGiveUp)
 	}
 	if c.run.stageScans < 10 {
 		t.Errorf("the stage made %d scans, want many, each finding the member", c.run.stageScans)

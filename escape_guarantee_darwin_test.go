@@ -464,11 +464,12 @@ func escDialDenied(e *escT, args []string) {
 
 // escDialAllowed fails for each address in args whose connection the profile
 // refuses. Any other end, a connection, a timeout or no route, is one the
-// profile let out. A UDP address is sent a datagram too.
+// profile let out. The profile refuses in the connect call itself, so a short
+// timeout tells the two apart. A UDP address is sent a datagram too.
 func escDialAllowed(e *escT, args []string) {
 	for _, a := range args {
 		network, addr, _ := strings.Cut(a, ":")
-		c, err := dialTimeout(network, addr, time.Second)
+		c, err := dialTimeout(network, addr, 100*time.Millisecond)
 		if err == nil {
 			if network == "udp" {
 				_, err = c.Write([]byte("x"))
