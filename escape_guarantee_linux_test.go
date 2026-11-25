@@ -1042,7 +1042,7 @@ func escPasswd(e *escT, args []string) {
 	}(), unix.EROFS, unix.EACCES)
 }
 
-func escNoNewPrivs(e *escT, args []string) {
+func escNoNewPrivs(e *escT, _ []string) {
 	status, _ := os.ReadFile("/proc/self/status")
 	if v := lineWith(string(status), "NoNewPrivs:"); v != "1" {
 		e.failf("NoNewPrivs = %q, want 1", v)
@@ -1055,21 +1055,14 @@ func escNoNewPrivs(e *escT, args []string) {
 			e.failf("%s = %s, want none", n, v)
 		}
 	}
-	// A real setuid-root binary stays an ordinary program: sudo says so
-	// itself.
-	if len(args) > 0 && args[0] != "" {
-		out, err := exec.CommandContext(context.Background(), args[0], "-n", "id", "-u").CombinedOutput() //nolint:gosec // G204: the test binary or a tool the test names, run as the test's own child.
-		if err == nil {
-			e.failf("%s -n id succeeded: %s", args[0], out)
-		}
-		if !strings.Contains(string(out), "no new privileges") {
-			e.failf("%s did not say no_new_privs stopped it: %s", args[0], out)
-		}
-	}
-	// Setuid and setgid on an exec do not apply: a file this account owns
-	// with the bit set runs with the account's own uid anyway, so the
-	// check is that euid never changes after an exec of a setuid file.
-	for _, p := range []string{"/usr/bin/passwd", "/usr/bin/su", "/usr/bin/mount", "/usr/bin/sudo"} {
+	// A real setuid-root program stays an ordinary one: its effective uid
+	// after the exec is the account's own. passwd, su and mount are setuid
+	// root on every Debian and Ubuntu install, the minimal ones too, since
+	// their packages are required. The status is read before Wait, so a
+	// program that has already exited is a zombie, whose status still shows
+	// its uids.
+	checked := 0
+	for _, p := range []string{"/usr/bin/passwd", "/usr/bin/su", "/usr/bin/mount"} {
 		fi, err := os.Stat(p)
 		if err != nil || fi.Mode()&os.ModeSetuid == 0 {
 			continue
@@ -1078,16 +1071,22 @@ func escNoNewPrivs(e *escT, args []string) {
 		cmd.Stdin = nil
 		cmd.Stdout, cmd.Stderr = io.Discard, io.Discard
 		if err := cmd.Start(); err != nil {
+			e.failf("start %s: %v", p, err)
 			continue
 		}
-		st, _ := os.ReadFile("/proc/" + strconv.Itoa(cmd.Process.Pid) + "/status")
-		if v := lineWith(string(st), "Uid:"); v != "" {
-			f := strings.Fields(v)
-			if len(f) >= 2 && (f[1] != strconv.Itoa(os.Getuid())) {
-				e.failf("%s runs with euid %s", p, f[1])
-			}
+		st, err := os.ReadFile("/proc/" + strconv.Itoa(cmd.Process.Pid) + "/status")
+		f := strings.Fields(lineWith(string(st), "Uid:"))
+		switch {
+		case err != nil || len(f) < 2:
+			e.failf("the uids of %s: %q, %v", p, st, err)
+		case f[1] != strconv.Itoa(os.Getuid()):
+			e.failf("%s runs with euid %s", p, f[1])
 		}
+		checked++
 		_ = cmd.Wait()
+	}
+	if checked == 0 {
+		e.failf("no setuid passwd, su or mount in the sandbox, so no real setuid program was tried")
 	}
 }
 
@@ -1655,21 +1654,14 @@ func TestEscapeSeccomp(t *testing.T) {
 // program does not gain privilege.
 func TestEscapeNoNewPrivs(t *testing.T) {
 	t.Parallel()
-	sudo := ""
-	if fi, err := os.Stat("/usr/bin/sudo"); err == nil && fi.Mode()&os.ModeSetuid != 0 {
-		sudo = "/usr/bin/sudo"
-	}
 	for _, level := range []Kernel{KernelStrict, KernelNested, KernelOpen} {
 		t.Run(string(level), func(t *testing.T) {
 			t.Parallel()
 			if !kernelFilterBuilds && level != KernelOpen {
 				t.Skip("no system call list on " + runtime.GOARCH)
 			}
-			escRun(t, Spec{Home: t.TempDir(), Kernel: level}, "nnp", sudo)
+			escRun(t, Spec{Home: t.TempDir(), Kernel: level}, "nnp")
 		})
-	}
-	if sudo == "" {
-		t.Log("no setuid sudo on this host: only NoNewPrivs and the capability sets were checked, not a real setuid program")
 	}
 }
 
