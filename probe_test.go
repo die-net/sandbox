@@ -89,15 +89,42 @@ func TestDiagnose(t *testing.T) {
 		{"apparmor names this binary", mod(func(f *probeFacts) { f.Sysctl["kernel.apparmor_restrict_unprivileged_userns"] = "1" }), "probe.apparmor-userns", "profile sandbox-opt-app-server /opt/app/server flags=(attach_disconnected,mediate_deleted)"},
 		// Ubuntu 26.04: bubblewrap's profile, whatever the sysctl.
 		{"bwrap profile", mod(func(f *probeFacts) {
-			f.AppArmor, f.BwrapLabel = "unconfined", "bwrap//&unpriv_bwrap (enforce)"
+			f.AppArmor, f.BwrapLabel = "unconfined", "bwrap (enforce)"
 		}), "probe.apparmor-bwrap", "profile sandbox-opt-app-server /opt/app/server flags=(attach_disconnected,mediate_deleted)"},
 		{"bwrap profile names the label", mod(func(f *probeFacts) {
-			f.AppArmor, f.BwrapLabel = "sandbox-opt-app-server (unconfined)", "bwrap//&unpriv_bwrap (enforce)"
-		}), "probe.apparmor-bwrap", `under "bwrap//&unpriv_bwrap (enforce)"`},
+			f.AppArmor, f.BwrapLabel = "sandbox-opt-app-server (unconfined)", "bwrap (enforce)"
+		}), "probe.apparmor-bwrap", `label "bwrap (enforce)"`},
 		{"bwrap profile before sysctl", mod(func(f *probeFacts) {
-			f.AppArmor, f.BwrapLabel = "unconfined", "bwrap//&unpriv_bwrap (enforce)"
+			f.AppArmor, f.BwrapLabel = "unconfined", "bwrap (enforce)"
 			f.Sysctl["kernel.apparmor_restrict_unprivileged_userns"] = "1"
 		}), "probe.apparmor-bwrap", ""},
+		// A trial that couldn't be built is not blamed on AppArmor.
+		{"trial not built", mod(func(f *probeFacts) {
+			f.TrialErr = "make its home: no space left on device"
+			f.Sysctl["kernel.apparmor_restrict_unprivileged_userns"] = "1"
+			f.AppArmor, f.BwrapLabel = "unconfined", "bwrap (enforce)"
+		}), "probe.trial", "no space left"},
+		// Under its own profile, loaded in enforce mode, loading it again
+		// would change nothing, so the failure is someone else's.
+		{"own profile in force", mod(func(f *probeFacts) {
+			f.Sysctl["kernel.apparmor_restrict_unprivileged_userns"] = "1"
+			f.AppArmor, f.BwrapLabel = "sandbox-opt-app-server (enforce)", "bwrap (enforce)"
+		}), "probe.userns", "no known cause"},
+		// v0.1.0's profile, in unconfined mode, is replaced.
+		{"old own profile", mod(func(f *probeFacts) {
+			f.Sysctl["kernel.apparmor_restrict_unprivileged_userns"] = "1"
+			f.AppArmor, f.BwrapLabel = "sandbox-opt-app-server (unconfined)", "sandbox-opt-app-server (unconfined)"
+		}), "probe.apparmor-userns", "  allow all,"},
+		// Under another program's profile, a profile for this binary would
+		// not attach, so a later finding explains it.
+		{"another profile", mod(func(f *probeFacts) {
+			f.Sysctl["kernel.apparmor_restrict_unprivileged_userns"] = "1"
+			f.AppArmor, f.BwrapLabel = "other (enforce)", "bwrap (enforce)"
+		}), "probe.userns", "no known cause"},
+		{"docker-default", mod(func(f *probeFacts) {
+			f.Sysctl["kernel.apparmor_restrict_unprivileged_userns"] = "1"
+			f.Container, f.AppArmor, f.BwrapLabel = "docker", "docker-default (enforce)", "bwrap (enforce)"
+		}), "probe.docker-apparmor", "apparmor=unconfined"},
 		{"same label is no cause", mod(func(f *probeFacts) {
 			f.AppArmor, f.BwrapLabel = "sandbox-opt-app-server (enforce)", "sandbox-opt-app-server (enforce)"
 		}), "probe.userns", "no known cause"},

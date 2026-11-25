@@ -49,13 +49,17 @@ type probeFacts struct {
 	Root    bool              // this process runs as root, which Command refuses
 	Staged  bool              // this process called Stage, so Start can run
 	TryErr  string            // why the trial sandbox failed, "" when it started
+	// TrialErr is why the trial sandbox could not be built at all, before
+	// bubblewrap ran, such as a home that can't be made or a descriptor
+	// limit.
+	TrialErr string
 
 	Sysctl     map[string]string // by dotted name, absent when unreadable
 	Seccomp    int               // Seccomp: in /proc/self/status
 	Container  string            // detectContainer's answer
 	UnshareErr error             // clone(CLONE_NEWUSER) as an ordinary process
-	AppArmor   string            // /proc/self/attr/apparmor/current, or attr/current before Linux 5.8
-	BwrapLabel string            // attr/apparmor/current of a process bubblewrap starts, "" when unknown
+	AppArmor   string            // this process's AppArmor label, from attr/apparmor/current or attr/current
+	BwrapLabel string            // the label bubblewrap gets when this process runs it, "" when unknown
 	Mounts     []mount           // this process's mount table
 	Self       string            // this binary's path
 }
@@ -102,6 +106,9 @@ func diagnose(f probeFacts) []Result {
 			"Fix: call sandbox.Stage first in main, and exit with its code when it reports true"))
 	}
 	res = append(res, pass("probe.stage", "this program called Stage"))
+	if f.TrialErr != "" {
+		return append(res, fail("probe.trial", "the trial sandbox could not be built, so nothing was tried: %s", f.TrialErr))
+	}
 	if f.TryErr == "" {
 		return append(res, pass("probe.userns", "a trial sandbox started, set itself up and ran its command"))
 	}
@@ -113,18 +120,18 @@ func diagnose(f probeFacts) []Result {
 func firstBlock(f probeFacts) Result {
 	container := f.Container != "" && f.Container != "systemd-unit"
 	switch {
-	case f.BwrapLabel != "" && f.BwrapLabel != f.AppArmor:
+	case apparmorApplies(f) && !apparmorInForce(f) && f.BwrapLabel != "" && f.BwrapLabel != f.AppArmor:
 		profile, name, err := apparmorProfile(f.Self)
 		if err != nil {
-			return fail("probe.apparmor-bwrap", "AppArmor runs what bubblewrap starts under %q, not this program's own %q, and the sandbox failed: %s\n"+
+			return fail("probe.apparmor-bwrap", "bubblewrap gets the AppArmor label %q when this program runs it, not this program's own %q, and the sandbox failed: %s\n"+
 				"No profile can be generated: %v", f.BwrapLabel, f.AppArmor, f.TryErr, err)
 		}
-		return fail("probe.apparmor-bwrap", "AppArmor runs what bubblewrap starts under %q, not this program's own %q, and the sandbox failed: %s\n"+
-			"Ubuntu 26.04's bwrap profile does this, and its unpriv_bwrap profile denies the capabilities the sandbox's first stage needs, whatever kernel.apparmor_restrict_unprivileged_userns says.\n"+
+		return fail("probe.apparmor-bwrap", "bubblewrap gets the AppArmor label %q when this program runs it, not this program's own %q, and the sandbox failed: %s\n"+
+			"Ubuntu 26.04's bwrap profile does this, and runs what bubblewrap starts stacked with its unpriv_bwrap profile, which denies the capabilities the sandbox's first stage needs, whatever kernel.apparmor_restrict_unprivileged_userns says.\n"+
 			"Fix: save this as /etc/apparmor.d/%s, then run: sudo apparmor_parser -r /etc/apparmor.d/%s\n"+
 			"%s\n\n%s",
 			f.BwrapLabel, f.AppArmor, f.TryErr, name, name, profileGrant(f.Self), profile)
-	case f.Sysctl["kernel.apparmor_restrict_unprivileged_userns"] == "1":
+	case apparmorApplies(f) && !apparmorInForce(f) && f.Sysctl["kernel.apparmor_restrict_unprivileged_userns"] == "1":
 		profile, name, err := apparmorProfile(f.Self)
 		if err != nil {
 			return fail("probe.apparmor-userns", "AppArmor restricts unprivileged user namespaces (kernel.apparmor_restrict_unprivileged_userns=1), and bubblewrap failed: %s\n"+
@@ -159,6 +166,32 @@ func masked(mounts []mount) bool {
 		}
 	}
 	return false
+}
+
+// apparmorOwn reports whether this process runs under the profile
+// apparmorProfile names for it, in whatever mode.
+func apparmorOwn(f probeFacts) bool {
+	_, name, err := apparmorProfile(f.Self)
+	return err == nil && strings.HasPrefix(f.AppArmor, name+" (")
+}
+
+// apparmorApplies reports whether a profile for this binary can be what the
+// trial needs: the process runs unconfined, under its own profile, or under
+// a label Probe couldn't read. Under another profile, such as
+// docker-default, the exec rule of whatever started it decides its label,
+// and a profile for its path would not attach, so a later finding explains
+// the failure.
+func apparmorApplies(f probeFacts) bool {
+	return f.AppArmor == "" || f.AppArmor == "unconfined" || apparmorOwn(f)
+}
+
+// apparmorInForce reports whether this process already runs under the
+// profile apparmorProfile writes, which is in enforce mode, so loading it
+// again would change nothing and the trial failed for another reason. Under
+// the unconfined-mode profile of v0.1.0 it is not, and the fix is to replace
+// it.
+func apparmorInForce(f probeFacts) bool {
+	return apparmorOwn(f) && strings.HasSuffix(f.AppArmor, " (enforce)")
 }
 
 // apparmorProfile writes an AppArmor profile for the binary at self, and

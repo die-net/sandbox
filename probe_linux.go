@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -52,7 +53,7 @@ func Probe() (Report, error) {
 	// would stop earlier anyway. Without Stage, the trial's first stage
 	// would run this program's own main, so it never starts then.
 	if f.Bwrap != "" && !f.Setuid && len(f.Kernels) > 0 && !f.Root && f.Staged {
-		f.TryErr = trySandbox(f.Kernels)
+		f.TryErr, f.TrialErr = trySandbox(f.Kernels)
 	}
 	if f.TryErr != "" {
 		gatherFailureFacts(&f)
@@ -92,16 +93,15 @@ func trueBinary() string {
 	return ""
 }
 
-// trySandbox starts a sandbox the way Start does, at the strictest kernel level
-// the host can give, running a program that does nothing, and returns why it
-// failed, or "" if it ran. A trial of bubblewrap alone isn't enough: on
-// Ubuntu 26.04 bubblewrap starts, and AppArmor denies the first stage the
-// capabilities it needs.
-func trySandbox(kernels map[Kernel]Kernel) string {
-	tr := trueBinary()
-	if tr == "" {
-		return "" // nothing to run in it; the trial proves nothing
-	}
+// trySandbox starts a sandbox the way Start does, at the strictest kernel
+// level the host can give. It returns why the sandbox failed, or "" if its
+// command ran and exited 0, and sets built instead when the trial could not
+// be made at all, before bubblewrap ran, so that failure isn't blamed on the
+// host's sandboxing. The command is this binary's check child in its no-op
+// mode, which needs nothing from the host. A trial of bubblewrap alone isn't
+// enough: on Ubuntu 26.04 bubblewrap starts, and AppArmor denies the first
+// stage the capabilities it needs.
+func trySandbox(kernels map[Kernel]Kernel) (failed, built string) {
 	var level Kernel
 	for _, k := range []Kernel{KernelStrict, KernelNested, KernelOpen} {
 		if _, ok := kernels[k]; ok {
@@ -111,22 +111,31 @@ func trySandbox(kernels map[Kernel]Kernel) string {
 	}
 	home, err := os.MkdirTemp("", "sandbox-probe-")
 	if err != nil {
-		return fmt.Sprintf("make the trial sandbox's home: %v", err)
+		return "", fmt.Sprintf("make its home: %v", err)
 	}
-	msg := runTrial(Spec{Command: []string{tr}, Home: home, Kernel: level})
-	if err := os.Remove(home); err != nil && msg == "" {
-		return fmt.Sprintf("remove the trial sandbox's home: %v", err)
+	// Start refuses a home path with a link in it, which a temporary
+	// directory may have, such as a TMPDIR under a link. Probe made this
+	// directory just now, so its real path names the same one.
+	resolved, err := filepath.EvalSymlinks(home)
+	if err == nil {
+		failed, built = runTrial(Spec{Command: []string{SelfPath, checkArg, modeNoop}, Home: resolved, Kernel: level})
+	} else {
+		built = fmt.Sprintf("resolve its home: %v", err)
 	}
-	return msg
+	if err := os.Remove(home); err != nil && failed == "" && built == "" {
+		built = fmt.Sprintf("remove its home: %v", err)
+	}
+	return failed, built
 }
 
-// runTrial runs the trial sandbox and returns why it failed, or "".
-func runTrial(spec Spec) string {
+// runTrial runs the trial sandbox, and returns why it failed or why it
+// could not be built, as trySandbox does.
+func runTrial(spec Spec) (failed, built string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	cmd, err := Command(ctx, spec)
 	if err != nil {
-		return err.Error()
+		return "", err.Error()
 	}
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -135,28 +144,65 @@ func runTrial(spec Spec) string {
 		err = cmd.Wait()
 	}
 	if err == nil {
-		return ""
+		return "", ""
 	}
+	// Once bubblewrap has run, Start and Wait carry its exit status. An
+	// error without one came before bubblewrap ran, such as a descriptor
+	// limit or a mount table Start couldn't read.
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) {
+		return "", err.Error()
+	}
+	// The stages write why they failed to stderr, which says more than the
+	// error Start sees once the stage has exited.
 	if msg := strings.TrimSpace(stderr.String()); msg != "" {
-		return msg
+		return fmt.Sprintf("%s (%v)", msg, err), ""
 	}
-	return err.Error()
+	return err.Error(), ""
 }
 
-// bwrapLabel returns the AppArmor label of a program bubblewrap starts, or ""
-// when there is none or bubblewrap fails.
+// bwrapLabel returns the AppArmor label bubblewrap gets when this process
+// runs it, or "" when it can't be read. bubblewrap reads its --args
+// descriptor to the end while it parses its arguments (parse_args_recurse in
+// bubblewrap.c), which main does before it makes any namespace, so it waits
+// there while the pipe's write end is open. The label is read then, and
+// closing the pipe ends bubblewrap, which finds no command. Under an
+// unconfined-mode profile, as on Ubuntu 26.04 with its bwrap profile, the
+// label is bubblewrap's own, and what it starts gets more stacked on it.
 func bwrapLabel(bwrap string) string {
-	cat, err := exec.LookPath("cat")
+	r, w, err := os.Pipe()
 	if err != nil {
 		return ""
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer w.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, bwrap, "--unshare-user", "--ro-bind", "/", "/", "--", cat, "/proc/self/attr/apparmor/current").Output() //nolint:gosec // G204: bwrap is the bubblewrap Probe found, run with a fixed command.
+	cmd := exec.CommandContext(ctx, bwrap, "--args", "3")
+	cmd.ExtraFiles = []*os.File{r}
+	err = cmd.Start()
+	r.Close() //nolint:gosec // G104: bubblewrap holds its own copy, and nothing can be done about a failed close.
 	if err != nil {
 		return ""
 	}
-	return strings.TrimRight(string(out), "\x00\n")
+	label := readLabel(cmd.Process.Pid)
+	w.Close()      //nolint:gosec // G104: this ends bubblewrap's read, and the deferred close is then a no-op.
+	_ = cmd.Wait() // bubblewrap exits 1 for want of a command, which is expected.
+	return label
+}
+
+// readLabel returns the AppArmor label of the process pid, from AppArmor's
+// own attr/apparmor/current, which Linux has had since 5.8, or before that
+// from attr/current, which is whichever major LSM the kernel runs.
+func readLabel(pid int) string {
+	dir := "/proc/" + strconv.Itoa(pid) + "/attr/"
+	b, err := os.ReadFile(dir + "apparmor/current") //nolint:gosec // G304: a fixed file of a process's proc directory.
+	if err != nil {
+		b, err = os.ReadFile(dir + "current") //nolint:gosec // G304: a fixed file of a process's proc directory.
+	}
+	if err != nil {
+		return ""
+	}
+	return strings.TrimRight(string(b), "\x00\n")
 }
 
 // gatherContainer reads the markers detectContainer looks at.
@@ -189,15 +235,7 @@ func gatherFailureFacts(f *probeFacts) {
 		st.Close() //nolint:gosec // G104: a read-only descriptor, and nothing can be done about a failed close.
 		f.Seccomp = s.Seccomp
 	}
-	// attr/apparmor/current is AppArmor's own, since Linux 5.8, where
-	// attr/current is whichever major LSM the kernel runs.
-	b, err := os.ReadFile("/proc/self/attr/apparmor/current")
-	if err != nil {
-		b, err = os.ReadFile("/proc/self/attr/current")
-	}
-	if err == nil {
-		f.AppArmor = strings.TrimRight(string(b), "\x00\n")
-	}
+	f.AppArmor = readLabel(os.Getpid())
 	f.BwrapLabel = bwrapLabel(f.Bwrap)
 	if mi, err := os.Open("/proc/self/mountinfo"); err == nil {
 		f.Mounts, _ = parseMountinfo(mi)

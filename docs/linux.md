@@ -149,20 +149,23 @@ A descriptor is more than the access it was opened with. It grants whatever the 
 
 ## Probe and Check
 
-`Probe` tries the backend and returns a `Report`: which backend, which kernel levels it can give, whether killing the sandbox kills every process in it, whether loopback is private, and what the host's container is. Its trial is a real sandbox, started as `Start` starts one, that runs `true`. A trial of bubblewrap alone passed on Ubuntu 26.04, where bubblewrap starts and the first stage is denied its capabilities. So like `Command`, `Probe` refuses root, and it starts no trial in a program that never called `Stage`, since the trial's first stage would run that program's own `main`. `Stage` records that it ran.
+`Probe` tries the backend and returns a `Report`: which backend, which kernel levels it can give, whether killing the sandbox kills every process in it, whether loopback is private, and what the host's container is. Its trial is a real sandbox, started as `Start` starts one at the strictest kernel level the host can give, whose command is this binary's check child in a mode that does nothing, so it needs nothing from the host. A trial of bubblewrap alone passed on Ubuntu 26.04, where bubblewrap starts and the first stage is denied its capabilities. So like `Command`, `Probe` refuses root, and it starts no trial in a program that never called `Stage`, since the trial's first stage would run that program's own `main`. `Stage` records that it ran. A trial that can't be built at all, before bubblewrap runs, such as for want of a temporary directory or a descriptor, is `probe.trial`, and isn't blamed on the host's sandboxing.
 
 When no sandbox can start, `Report.Checks` ends at the first prerequisite that blocks it, with the fix. They are checked in this order:
 
 1. bubblewrap missing, setuid or older than 0.8.
 2. Running as root.
 3. No call of `Stage`.
-4. AppArmor running what bubblewrap starts under another profile than this program's own, as Ubuntu 26.04's `bwrap` profile does.
-5. Ubuntu's AppArmor restriction on user namespaces.
-6. A sysctl that turns user namespaces off.
-7. Docker's or Podman's default seccomp profile.
-8. Docker's AppArmor profile.
-9. A masked `/proc`.
-10. A systemd unit's restrictions.
+4. A trial that couldn't be built.
+5. bubblewrap getting another AppArmor label than this program's own, as Ubuntu 26.04's `bwrap` profile gives it. `Probe` reads the label while bubblewrap waits to read its `--args`, before it makes any namespace.
+6. Ubuntu's AppArmor restriction on user namespaces.
+7. A sysctl that turns user namespaces off.
+8. Docker's or Podman's default seccomp profile.
+9. Docker's AppArmor profile.
+10. A masked `/proc`.
+11. A systemd unit's restrictions.
+
+The two AppArmor findings apply only when this program runs unconfined, under its own profile, or under a label `Probe` can't read. Under another program's profile, such as `docker-default`, a profile for this path wouldn't attach, so a later finding explains the failure. They don't apply either when this program already runs under its own profile in enforce mode, since loading it again would change nothing. Under v0.1.0's profile, in unconfined mode, they print the new one to replace it.
 
 [usage.md](usage.md#probe-and-check) says how a program uses them.
 
