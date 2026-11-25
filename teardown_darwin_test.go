@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"errors"
+	"strconv"
 	"syscall"
 	"testing"
 	"time"
@@ -82,7 +83,7 @@ func TestTeardownLingeringZombie(t *testing.T) {
 	// The zombie is a child of this process, which is no member, so a scan would
 	// excuse it at once (TestRealScanExcusesAZombieOfANonMember). Its parent is
 	// hidden from the stage's scan, to leave what the scan remembers.
-	c.Env = []string{shellPath, stageOrphanZombiesEnv + "=1"}
+	c.Env = []string{shellPath, stageOrphanZombieEnv + "=" + strconv.Itoa(z)}
 	start := time.Now()
 	if err := c.Start(); err != nil {
 		t.Fatal(err)
