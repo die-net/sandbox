@@ -149,6 +149,7 @@ func escTTYMode(args []string) int {
 	}
 	fg, _ := unix.IoctlGetInt(0, unix.TIOCGPGRP)
 	fmt.Println("sandbox-foreground", fg == c.run.cmd.Process.Pid && fg != unix.Getpgrp())
+	fmt.Println("caller-foreground", fg == unix.Getpgrp())
 	if err := c.Wait(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
@@ -164,6 +165,22 @@ func escTTYMode(args []string) int {
 // SIGTTIN.
 func TestEscapeTerminalForeground(t *testing.T) {
 	t.Parallel()
+	// A shell, which stops on SIGTTIN where a Go program, which handles the
+	// signal, does not.
+	out := onTerminal(t, Spec{Home: t.TempDir(), Command: []string{"/bin/sh", "-c", `read line; printf 'got %s\n' "$line"`}})
+	for _, want := range []string{"got ping", "sandbox-foreground true", "caller-foreground-again true"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output lacks %q: %s", want, out)
+		}
+	}
+}
+
+// onTerminal runs spec through escTTYMode in a session of its own, whose
+// controlling terminal is a new pty with "ping" typed on it, as a shell's job
+// is, and returns what it printed. It fails the test if the run fails, as it
+// does when the sandbox is stopped reading in the background.
+func onTerminal(t *testing.T, spec Spec) string {
+	t.Helper()
 	mfd, err := unix.Open("/dev/ptmx", unix.O_RDWR|unix.O_NOCTTY|unix.O_CLOEXEC, 0)
 	if err != nil {
 		t.Skip("no /dev/ptmx: " + err.Error())
@@ -182,10 +199,6 @@ func TestEscapeTerminalForeground(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer slave.Close()
-
-	// A shell, which stops on SIGTTIN where a Go program, which handles the
-	// signal, does not.
-	spec := Spec{Home: t.TempDir(), Command: []string{"/bin/sh", "-c", `read line; printf 'got %s\n' "$line"`}}
 	body, err := json.Marshal(spec)
 	if err != nil {
 		t.Fatal(err)
@@ -208,11 +221,7 @@ func TestEscapeTerminalForeground(t *testing.T) {
 	if err := cmd.Wait(); err != nil {
 		t.Fatalf("%v (a sandbox in the background group stops on its read)\nstdout: %s\nstderr: %s", err, &stdout, &stderr)
 	}
-	for _, want := range []string{"got ping", "sandbox-foreground true", "caller-foreground-again true"} {
-		if !strings.Contains(stdout.String(), want) {
-			t.Errorf("output lacks %q: %s", want, &stdout)
-		}
-	}
+	return stdout.String()
 }
 
 // ------------------------------------------------------- 2. /dev read-only

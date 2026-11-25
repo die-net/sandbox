@@ -1486,65 +1486,74 @@ func TestEscapePidNamespacePeer(t *testing.T) {
 
 // Row: "User/pid/ipc/uts namespaces ... --die-with-parent": a SIGKILLed
 // parent takes everything with it, including a process that setsid'd and
-// double-forked.
+// double-forked, with OwnSession as without.
 func TestEscapeParentKilled(t *testing.T) {
 	t.Parallel()
-	home := t.TempDir()
-	ready := filepath.Join(home, "ready")
-	exe, dir := escBinary(t)
-	spec := Spec{Home: home, Command: []string{exe, "esc", "daemon", ready, "hang"}, Read: []string{dir}}
-	parent := exec.CommandContext(t.Context(), "/proc/self/exe", "esc-parent", jsonArg(t, spec)) //nolint:gosec // G204: the test binary or a tool the test names, run as the test's own child.
-	out, err := parent.StdoutPipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	var stderr bytes.Buffer
-	parent.Stderr = &stderr
-	if err := parent.Start(); err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = parent.Wait() }()
-	rd := bufio.NewReader(out)
-	var ns string
-	var pid1 int
-	for {
-		line, err := rd.ReadString('\n')
-		if err != nil {
-			t.Fatalf("before ready: %v: %s", err, &stderr)
+	for _, own := range []bool{false, true} {
+		name := "caller's session"
+		if own {
+			name = "own session"
 		}
-		line = strings.TrimSpace(line)
-		if v, ok := strings.CutPrefix(line, "pid "); ok {
-			pid1, _ = strconv.Atoi(v)
-		}
-		if v, ok := strings.CutPrefix(line, "ns "); ok {
-			ns = v
-		}
-		if line == "ready" {
-			break
-		}
-	}
-	members := nsMembers(ns)
-	if len(members) < 2 {
-		t.Fatalf("expected the command, the daemon and pid 1 in %s, found %v", ns, members)
-	}
-	// The daemon is in a session of its own, away from pid 1's.
-	var daemons int
-	for _, m := range members {
-		if st, err := os.ReadFile("/proc/" + strconv.Itoa(m) + "/stat"); err == nil {
-			f := strings.Fields(string(st[bytes.LastIndexByte(st, ')')+2:]))
-			if len(f) > 4 && f[3] != strconv.Itoa(mySid()) {
-				daemons++
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			home := t.TempDir()
+			ready := filepath.Join(home, "ready")
+			exe, dir := escBinary(t)
+			spec := Spec{Home: home, Command: []string{exe, "esc", "daemon", ready, "hang"}, Read: []string{dir}, OwnSession: own}
+			parent := exec.CommandContext(t.Context(), "/proc/self/exe", "esc-parent", jsonArg(t, spec)) //nolint:gosec // G204: the test binary or a tool the test names, run as the test's own child.
+			out, err := parent.StdoutPipe()
+			if err != nil {
+				t.Fatal(err)
 			}
-		}
-	}
-	if err := parent.Process.Kill(); err != nil {
-		t.Fatal(err)
-	}
-	if left := waitNoMembers(ns); len(left) > 0 {
-		t.Errorf("processes %v of the sandbox outlived the parent (%d were in a session of their own)", left, daemons)
-	}
-	if !gone(pid1) {
-		t.Errorf("pid 1 (%d) outlived the parent", pid1)
+			var stderr bytes.Buffer
+			parent.Stderr = &stderr
+			if err := parent.Start(); err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = parent.Wait() }()
+			rd := bufio.NewReader(out)
+			var ns string
+			var pid1 int
+			for {
+				line, err := rd.ReadString('\n')
+				if err != nil {
+					t.Fatalf("before ready: %v: %s", err, &stderr)
+				}
+				line = strings.TrimSpace(line)
+				if v, ok := strings.CutPrefix(line, "pid "); ok {
+					pid1, _ = strconv.Atoi(v)
+				}
+				if v, ok := strings.CutPrefix(line, "ns "); ok {
+					ns = v
+				}
+				if line == "ready" {
+					break
+				}
+			}
+			members := nsMembers(ns)
+			if len(members) < 2 {
+				t.Fatalf("expected the command, the daemon and pid 1 in %s, found %v", ns, members)
+			}
+			// The daemon is in a session of its own, away from pid 1's.
+			var daemons int
+			for _, m := range members {
+				if st, err := os.ReadFile("/proc/" + strconv.Itoa(m) + "/stat"); err == nil {
+					f := strings.Fields(string(st[bytes.LastIndexByte(st, ')')+2:]))
+					if len(f) > 4 && f[3] != strconv.Itoa(mySid()) {
+						daemons++
+					}
+				}
+			}
+			if err := parent.Process.Kill(); err != nil {
+				t.Fatal(err)
+			}
+			if left := waitNoMembers(ns); len(left) > 0 {
+				t.Errorf("processes %v of the sandbox outlived the parent (%d were in a session of their own)", left, daemons)
+			}
+			if !gone(pid1) {
+				t.Errorf("pid 1 (%d) outlived the parent", pid1)
+			}
+		})
 	}
 }
 

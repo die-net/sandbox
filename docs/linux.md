@@ -15,9 +15,9 @@ bubblewrap builds the sandbox. It's the setup Flatpak runs every app through, so
 
 `Command` refuses to run as root. It opens paths and writes the sandbox's `passwd` in the calling process, so a caller that runs as root must switch to the sandbox's uid first.
 
-Three options are left out on purpose:
+Two options are left out on purpose, and one is off by default:
 
-- **`--new-session`.** The command stays in its caller's session, which a caller may check a bridge by. The filter refuses `TIOCSTI` instead.
+- **`--new-session`**, unless `Spec.OwnSession` is set. By default the command stays in its caller's session, which a caller may check a bridge by, and the filter refuses `TIOCSTI` instead. With it, bubblewrap calls `setsid` in pid 1, which `--as-pid-1` makes the first stage, so `Pid` leads the session and every process the command starts is in it (`TestEscapeOwnSession`, on bubblewrap 0.8.0, 0.9.0 and 0.12.0). pid 1 isn't a process group leader, since bubblewrap has a group of its own, so `setsid` can't fail there.
 - **`--die-with-parent`.** See [the lifeline](#the-lifeline).
 - **`--seccomp`.** The filter refuses calls the first stage makes, so the stage installs it after them.
 
@@ -104,9 +104,11 @@ The first stage sets `PR_SET_PDEATHSIG` on itself instead, whose parent is bubbl
 
 ## The process group and the terminal
 
-`Start` always starts bubblewrap in a process group of its own, and keeps the caller's session. The filter allows `kill`, `tgkill`, `pidfd_send_signal` and `setpriority`, and the kernel lets a process signal or renice a group in another pid namespace when the uid matches. A sandbox that shared its caller's group could end the caller and its siblings with `kill(0, sig)`, or slow them with `setpriority(PRIO_PGRP, 0, n)`. In a group of its own, `kill(0)` and `kill(-1)` reach only the sandbox.
+`Start` always starts bubblewrap in a process group of its own, and keeps the caller's session unless `OwnSession` moves pid 1 to one of its own. The filter allows `kill`, `tgkill`, `pidfd_send_signal` and `setpriority`, and the kernel lets a process signal or renice a group in another pid namespace when the uid matches. A sandbox that shared its caller's group could end the caller and its siblings with `kill(0, sig)`, or slow them with `setpriority(PRIO_PGRP, 0, n)`. In a group of its own, `kill(0)` and `kill(-1)` reach only the sandbox.
 
 A background group is stopped when it reads the terminal. So when `Stdin` is a terminal whose foreground group is the caller's, which is what `Run` passes, the sandbox's group takes the foreground. `Wait` gives it back to the caller's group, if the sandbox still holds it, with `SIGTTOU` blocked on the calling thread, since setting the foreground from the background would otherwise stop the caller. A Ctrl-C then goes to the sandbox's group and not the caller's. For `Run` that is enough: bubblewrap ends, and pid 1 follows it.
+
+With `OwnSession`, `Start` doesn't hand the foreground over. The sandbox's session has no controlling terminal, so job control doesn't stop its reads (`tty_check_change` in `drivers/tty/tty_jobctrl.c` checks only a process's own controlling terminal), and no group in it could hold the terminal's foreground. bubblewrap's group would hold only bubblewrap's outer process, and a Ctrl-C there would end the sandbox while the caller kept running. The caller keeps the foreground, and a Ctrl-C goes to it (`TestOwnSessionTerminal`).
 
 ## The network
 
@@ -176,7 +178,7 @@ It also reports capabilities, `no_new_privs`, the seccomp mode and supplementary
 - **Landlock inside the namespaces.** Its file rules come from the same paths as the mounts, so they shared the mounts' mistakes: both planted-link findings got through it. Its ptrace and signal scopes repeat the pid namespace, and its abstract-socket scope and port rule repeat the network namespace. Under `nested` it refused what the mount locks already refuse, and stopped Chromium's and bubblewrap's sandboxes from starting, since it refuses mounts and writes to `/proc/<pid>/uid_map`. Its one real job, keeping a sandbox off the host's abstract sockets, ended when the network namespace came. Taking it out also took out a walk of the host's root on every start (a workaround so renames between directories work), refused terminal ioctls on device files, and a dependency from outside the standard library and `golang.org/x`. The filter still allows the Landlock calls, so a program inside can use Landlock on itself, as Cursor's sandbox does.
 - **A namespace builder of our own.** The spike built the namespaces and the view itself with Go's `SysProcAttr`, a staging root and `pivot_root`. It worked, but its whole setup would have to be reviewed, where bubblewrap's has a long record. It had already needed a fix that bubblewrap doesn't: Go's ambient setup leaves capabilities in the inheritable set, which a file's inheritable capabilities combine with outside the bounding set.
 - **bubblewrap's `--seccomp`.** The filter refuses the calls the first stage makes, so the stage installs it after them.
-- **bubblewrap's `--new-session`.** It would guard against `TIOCSTI`, but a new session fails a caller's check that a bridge is in the session of the command's starter. A process group of its own does the job a session would for signals. The filter refuses `TIOCSTI` instead.
+- **bubblewrap's `--new-session` by default.** It would guard against `TIOCSTI`, but a new session fails a caller's check that a bridge is in the session of the command's starter. A process group of its own does the job a session would for signals. The filter refuses `TIOCSTI` instead. `Spec.OwnSession` turns it on for a caller that checks by the sandbox's own session instead.
 - **bubblewrap's `--die-with-parent` and `Pdeathsig`.** Both fire on the exit of the thread that started the process. The lifeline replaces them ([the lifeline](#the-lifeline)).
 - **bubblewrap's `--cap-add` to change the view or the network.** Unprivileged bubblewrap runs the command in a user namespace nested inside the one that owns the view's mounts and the network namespace. So the capabilities are real but don't reach either. That's why the first stage makes a mount namespace of its own, and why adding routes would need a network namespace of its own too.
 - **The first stage making only itself private.** `unshare` moves one thread, and bubblewrap's own reaper stays behind, so other processes inside still see the host's later mounts through `/proc/<pid>/root`. The stage execs itself and is pid 1.

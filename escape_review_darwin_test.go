@@ -138,7 +138,7 @@ func waitWithin(t *testing.T, c *Cmd, d time.Duration) error {
 // command's process group: a shell's job control, setpgid in a child, setsid in
 // a child. Each holds the command's standard output, which is a pipe to a
 // writer that is not a file, so a survivor would keep Wait from returning. They
-// are all ended, and Wait comes back at once.
+// are all ended, and Wait comes back at once, with OwnSession as without.
 func TestEscapeSetpgidAndJobControl(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
@@ -155,28 +155,34 @@ func TestEscapeSetpgidAndJobControl(t *testing.T) {
 			return []string{self(t), "esc", "leave", "setsid", filepath.Join(home, "pid"), "1", "exit"}
 		}},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			home := realTemp(t)
-			c, err := Command(t.Context(), Spec{Home: home, Command: tc.cmd(home)})
-			if err != nil {
-				t.Fatal(err)
+		for _, own := range []bool{false, true} {
+			name := tc.name
+			if own {
+				name += ", own session"
 			}
-			c.Env = []string{shellPath}
-			c.Stdout = &syncBuffer{} // not an *os.File: exec waits for it to close
-			if err := c.Start(); err != nil {
-				t.Fatal(err)
-			}
-			endAtCleanup(t, c)
-			pid := readPid(t, filepath.Join(home, "pid"))
-			if g, err := unix.Getpgid(pid); err == nil && g == c.run.group {
-				t.Fatalf("the process is still in the command's group %d, so it did not leave it", g)
-			}
-			if err := waitWithin(t, c, 20*time.Second); err != nil {
-				t.Fatalf("Wait: %v", err)
-			}
-			eventually(t, 5*time.Second, "a process that left the group outlived the sandbox", func() bool { return !alive(pid) })
-		})
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
+				home := realTemp(t)
+				c, err := Command(t.Context(), Spec{Home: home, Command: tc.cmd(home), OwnSession: own})
+				if err != nil {
+					t.Fatal(err)
+				}
+				c.Env = []string{shellPath}
+				c.Stdout = &syncBuffer{} // not an *os.File: exec waits for it to close
+				if err := c.Start(); err != nil {
+					t.Fatal(err)
+				}
+				endAtCleanup(t, c)
+				pid := readPid(t, filepath.Join(home, "pid"))
+				if g, err := unix.Getpgid(pid); err == nil && g == c.run.group {
+					t.Fatalf("the process is still in the command's group %d, so it did not leave it", g)
+				}
+				if err := waitWithin(t, c, 20*time.Second); err != nil {
+					t.Fatalf("Wait: %v", err)
+				}
+				eventually(t, 5*time.Second, "a process that left the group outlived the sandbox", func() bool { return !alive(pid) })
+			})
+		}
 	}
 }
 

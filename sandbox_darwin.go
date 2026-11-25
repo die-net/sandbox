@@ -429,6 +429,14 @@ func (c *Cmd) Start() error {
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = c.Stdin, c.Stdout, c.Stderr
 	cmd.WaitDelay = c.WaitDelay
 	cmd.ExtraFiles = extra
+	// With OwnSession the stage leads a session of its own, which the command
+	// and everything it starts are in, unless they call setsid. The stage
+	// starts sandbox-exec in a process group of its own, inside it. The
+	// session has no controlling terminal, so the stage gives the command no
+	// foreground (foregroundOf) and job control doesn't stop its reads.
+	if spec.OwnSession {
+		cmd.SysProcAttr = &unix.SysProcAttr{Setsid: true}
+	}
 	// Canceling ctx closes the lifeline, so that the stage ends the command's
 	// whole group. A stage that has not gone a little later is killed.
 	cmd.Cancel = func() error {

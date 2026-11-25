@@ -100,6 +100,16 @@ type Spec struct {
 	// anonymous shared memory are not files on those tmpfs, and only a
 	// delegated cgroup's memory.max (Cmd.CgroupFD) bounds them.
 	ScratchSize int64 `json:"scratch_size,omitempty"`
+	// OwnSession puts the sandbox in a session of its own, whose leader is the
+	// process Pid names: pid 1 on Linux, and the stage on macOS. Every process
+	// the command starts is in it unless it calls setsid, so a caller can tell
+	// one sandbox's processes from another's, and from its own, by getsid,
+	// also on macOS, which has no pid namespace. The session has no
+	// controlling terminal. A terminal on Stdin still reads and writes, but
+	// the command can't open /dev/tty, job control doesn't stop it, and a
+	// Ctrl-C at the terminal reaches the caller, not the command. The zero
+	// value keeps the caller's session.
+	OwnSession bool `json:"own_session,omitempty"`
 }
 
 // Network is what a sandbox's command can reach of the network.
