@@ -2,10 +2,13 @@ package sandbox
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -148,16 +151,11 @@ func TestCheckSandboxDarwin(t *testing.T) {
 }
 
 // TestCheckCatchesEscapesDarwin runs the checks against sandboxes that have a
-// hole, to see that they fail: host network, BroadLoopback, a Read path that
-// shows a secret, a Write path that is writable.
+// hole, to see that they fail: a reach outside, BroadLoopback, a Read path
+// that shows a secret, a Write path that is writable.
 //
 //nolint:paralleltest // uses t.Setenv through checkWorld, which t.Parallel forbids.
 func TestCheckCatchesEscapesDarwin(t *testing.T) {
-	conn, err := dialTimeout("tcp", "1.1.1.1:443", 3*time.Second)
-	haveNet := err == nil
-	if haveNet {
-		conn.Close() //nolint:gosec // G104: nothing can be done about a failed close here, and the test is over or has what it needs.
-	}
 	listener, err := listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -286,16 +284,33 @@ func TestCheckCatchesEscapesDarwin(t *testing.T) {
 	if r := byName(t, res)["expect.unreachable:tcp:"+listener.Addr().String()]; r.Status != Fail {
 		t.Errorf("a local listener under BroadLoopback: %+v", r)
 	}
-	if !haveNet {
-		return
-	}
-	// The host's network reaches the internet.
-	res, err = Check(ctx, &Spec{Home: home, Network: NetworkHost}, Expect{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if r := byName(t, res)["egress.direct-tcp"]; r.Status != Fail {
-		t.Errorf("direct TCP under NetworkHost: %+v", r)
+	// The egress rows, which Check points at public addresses, fail when the
+	// sandbox reaches the address they try, and pass when it can't. Here they try
+	// a TCP listener and a UDP server on the host's LAN address, which need no
+	// internet, and which BroadLoopback reaches and the default refuses.
+	tcpAddr := net.JoinHostPort(lanAddr(t), strconv.Itoa(listenAny(t)))
+	udpAddr := udpResponder(t)
+	for _, tc := range []struct {
+		name string
+		spec Spec
+		want Status
+	}{
+		{"default", Spec{}, Pass},
+		{"BroadLoopback", Spec{BroadLoopback: true}, Fail},
+	} {
+		out := escRun(t, tc.spec, "egress-rows", tcpAddr, udpAddr)
+		var rows []Result
+		if err := json.Unmarshal([]byte(out), &rows); err != nil {
+			t.Fatalf("%s: %v: %q", tc.name, err, out)
+		}
+		if len(rows) != 2 {
+			t.Fatalf("%s: rows %+v", tc.name, rows)
+		}
+		for _, r := range rows {
+			if r.Status != tc.want {
+				t.Errorf("%s: %+v, want %v", tc.name, r, tc.want)
+			}
+		}
 	}
 }
 
