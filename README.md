@@ -101,14 +101,14 @@ On both: a file descriptor you hand in grants whatever its object allows, whatev
 ## Requirements
 
 - **Go** 1.26 or later.
-- **Linux:** bubblewrap 0.8 or later from your distribution, not setuid. The suite passes on 0.12.0, 0.9.0 and 0.8.0.
-- **Ubuntu 24.04 and later** restrict unprivileged user namespaces, so the binary needs an AppArmor profile. `Probe` prints one for the binary's own path, and the commands to load it. [scripts/apparmor.sh](scripts/apparmor.sh) does the same for this package's test binary.
+- **Linux:** bubblewrap 0.8 or later from your distribution, not setuid. The suite passes on 0.12.0, 0.11.1, 0.9.0 and 0.8.0.
+- **Ubuntu 24.04 and later** restrict unprivileged user namespaces, and 26.04 also confines bubblewrap whatever that setting says, so the binary needs an AppArmor profile. `Probe` prints one for the binary's own path, and the commands to load it. Every program the binary starts stays in that profile, which allows everything ([docs/linux.md](docs/linux.md#probe-and-check)). [scripts/apparmor.sh](scripts/apparmor.sh) does the same for this package's test binary.
 - **macOS:** `/usr/bin/sandbox-exec`, which ships with the system. It must not already be inside a Seatbelt profile.
 - **Elsewhere:** `Command` and `Run` return `errors.ErrUnsupported`.
 
 ## Status
 
-Both backends are built and tested, on Linux (amd64 and arm64, Debian 12 and 13 and Ubuntu 24.04) and on macOS 15, 26 and 27 (arm64, and amd64 under Rosetta 2 on 27). Each has had a security review by a model, and [docs/findings.md](docs/findings.md) lists what they found. The first release is v0.1.0, and the API may still change before v1. The Seatbelt rules come from running macOS 27.0.1 and 27.2.0. CI runs the suite on macOS 15 and 26, which needed one more rule. Rerun the tests on each new release.
+Both backends are built and tested, on Linux (amd64 and arm64, Debian 12 and 13, Ubuntu 24.04 and Ubuntu 26.04) and on macOS 15, 26 and 27 (arm64, and amd64 under Rosetta 2 on 27). Each has had a security review by a model, and [docs/findings.md](docs/findings.md) lists what they found. The first release is v0.1.0, and the API may still change before v1. The Seatbelt rules come from running macOS 27.0.1 and 27.2.0. CI runs the suite on macOS 15 and 26, which needed one more rule. Rerun the tests on each new release.
 
 ## Documentation
 

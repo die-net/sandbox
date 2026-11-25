@@ -149,19 +149,35 @@ A descriptor is more than the access it was opened with. It grants whatever the 
 
 ## Probe and Check
 
-`Probe` tries the backend and returns a `Report`: which backend, which kernel levels it can give, whether killing the sandbox kills every process in it, whether loopback is private, and what the host's container is. When no sandbox can start, `Report.Checks` ends at the first prerequisite that blocks it, with the fix. They are checked in this order:
+`Probe` tries the backend and returns a `Report`: which backend, which kernel levels it can give, whether killing the sandbox kills every process in it, whether loopback is private, and what the host's container is. Its trial is a real sandbox, started as `Start` starts one, that runs `true`. A trial of bubblewrap alone passed on Ubuntu 26.04, where bubblewrap starts and the first stage is denied its capabilities. So like `Command`, `Probe` refuses root, and it starts no trial in a program that never called `Stage`, since the trial's first stage would run that program's own `main`. `Stage` records that it ran.
+
+When no sandbox can start, `Report.Checks` ends at the first prerequisite that blocks it, with the fix. They are checked in this order:
 
 1. bubblewrap missing, setuid or older than 0.8.
-2. Ubuntu's AppArmor restriction on user namespaces.
-3. A sysctl that turns user namespaces off.
-4. Docker's or Podman's default seccomp profile.
-5. Docker's AppArmor profile.
-6. A masked `/proc`.
-7. A systemd unit's restrictions.
+2. Running as root.
+3. No call of `Stage`.
+4. AppArmor running what bubblewrap starts under another profile than this program's own, as Ubuntu 26.04's `bwrap` profile does.
+5. Ubuntu's AppArmor restriction on user namespaces.
+6. A sysctl that turns user namespaces off.
+7. Docker's or Podman's default seccomp profile.
+8. Docker's AppArmor profile.
+9. A masked `/proc`.
+10. A systemd unit's restrictions.
 
 [usage.md](usage.md#probe-and-check) says how a program uses them.
 
-The AppArmor fix is a profile for this one binary's path, which the package generates. It grants user namespaces to that binary and what it starts, and to no other program. It doesn't use a child profile for bubblewrap: the kernel ignores exec rules in an unconfined-mode profile, so bubblewrap would stay in the parent's label and be refused. Without the profile on Ubuntu 24.04, `Probe` names it, but `Start` fails with bubblewrap's own message, such as `loopback: Failed RTM_NEWADDR: Operation not permitted`, because the kernel lets bubblewrap make a user namespace and takes its capabilities away.
+The AppArmor fix is a profile for this one binary's path, which the package generates and `Probe` prints. Ubuntu 24.04 and 26.04 need it, and Debian doesn't.
+
+- **Ubuntu 24.04** sets `kernel.apparmor_restrict_unprivileged_userns=1`. The kernel then lets an unconfined program make a user namespace and takes its capabilities away, so `Start` fails with bubblewrap's own message, such as `loopback: Failed RTM_NEWADDR: Operation not permitted`.
+- **Ubuntu 26.04** also attaches a profile to `/usr/bin/bwrap`, from `bwrap-userns-restrict` in the `apparmor` package. It lets bubblewrap make namespaces, and runs whatever bubblewrap starts as `bwrap//&unpriv_bwrap`, a stack whose `unpriv_bwrap` denies every capability. The first stage then can't make its mount namespace, and `Start` fails with `copy the view into a mount namespace of its own: operation not permitted`, whatever the sysctl says. The audit log shows `apparmor="DENIED" operation="capable" profile="unpriv_bwrap" comm="sandbox-stage" capname="sys_admin"`.
+
+The profile allows everything, user namespaces and capabilities in them included, to this binary and every process it starts, and to no other program. It is in enforce mode with an `all` rule, because under `all` an exec keeps the profile, so bubblewrap and the stage never move into `bwrap`. The profile before it was in unconfined mode with only a `userns` rule. That worked on 24.04, but in unconfined mode an exec looks up the profile attached to the new program, and the kernel ignores the profile's own exec rules, so on 26.04 bubblewrap moved into `bwrap` with that profile loaded too.
+
+The cost is that no program this binary starts moves into a profile of its own. That holds outside the sandbox too: a caller's other children, such as a browser or a tool with a stricter profile of its own, run under this one, which allows everything. AppArmor confines nothing the sandbox relies on, so this changes nothing inside it.
+
+The profile has `attach_disconnected`, since bubblewrap writes `/proc/<pid>/uid_map` by a path AppArmor can't name from inside the new namespaces. It also lists `mount`, `umount`, `pivot_root`, `network` and `unix`, which `all` covers on AppArmor 5. Ubuntu 24.04's 4.0 parser leaves out of `all` a mount with `MS_SILENT`, which bubblewrap's first mount sets, and the creation of sockets. Both were found from the audit log, and the full suite passes on 24.04 and 26.04 under the profile, with nothing denied.
+
+A profile on bubblewrap's own path would give the same to every program on the host that runs it.
 
 `Check` runs the escape attempts of the generic suite in a child of this binary, inside a sandbox built from a `Spec` or, with none, in the caller's own context, which is what an operator's container or unit gives. The child is started with a marker that `Stage` handles, and gets its settings on a descriptor, not in argv. Each attempt returns a pass when it failed. The suite tries to:
 
@@ -179,6 +195,8 @@ It also reports capabilities, `no_new_privs`, the seccomp mode and supplementary
 - **Landlock alone.** Before ABI 9 it doesn't check socket files, so it doesn't keep a sandbox off the account's own services, and it leaves ptys, SysV IPC and other processes' command lines open too.
 - **Landlock inside the namespaces.** Its file rules come from the same paths as the mounts, so they shared the mounts' mistakes: both planted-link findings got through it. Its ptrace and signal scopes repeat the pid namespace, and its abstract-socket scope and port rule repeat the network namespace. Under `nested` it refused what the mount locks already refuse, and stopped Chromium's and bubblewrap's sandboxes from starting, since it refuses mounts and writes to `/proc/<pid>/uid_map`. Its one real job, keeping a sandbox off the host's abstract sockets, ended when the network namespace came. Taking it out also took out a walk of the host's root on every start (a workaround so renames between directories work), refused terminal ioctls on device files, and a dependency from outside the standard library and `golang.org/x`. The filter still allows the Landlock calls, so a program inside can use Landlock on itself, as Cursor's sandbox does.
 - **A namespace builder of our own.** The spike built the namespaces and the view itself with Go's `SysProcAttr`, a staging root and `pivot_root`. It worked, but its whole setup would have to be reviewed, where bubblewrap's has a long record. It had already needed a fix that bubblewrap doesn't: Go's ambient setup leaves capabilities in the inheritable set, which a file's inheritable capabilities combine with outside the bounding set.
+- **An unconfined-mode AppArmor profile with a `userns` rule.** It was the fix for Ubuntu 24.04, and on 26.04 it left bubblewrap to move into its own `bwrap` profile. Adding `/usr/bin/bwrap ix` to it changed nothing, since the kernel ignores exec rules in unconfined mode ([the AppArmor fix](#probe-and-check)).
+- **A `Probe` trial of bubblewrap alone.** It ran `true` under bubblewrap, which needs no capability, so it passed on Ubuntu 26.04 while no sandbox could start. The trial is a real sandbox now.
 - **bubblewrap's `--seccomp`.** The filter refuses the calls the first stage makes, so the stage installs it after them.
 - **bubblewrap's `--new-session` by default.** It would guard against `TIOCSTI`, but a new session fails a caller's check that a bridge is in the session of the command's starter. A process group of its own does the job a session would for signals. The filter refuses `TIOCSTI` instead. `Spec.OwnSession` turns it on for a caller that checks by the sandbox's own session instead.
 - **bubblewrap's `--die-with-parent` and `Pdeathsig`.** Both fire on the exit of the thread that started the process. The lifeline replaces them ([the lifeline](#the-lifeline)).

@@ -14,10 +14,14 @@ import (
 	"time"
 )
 
-// Probe tries the Linux backend for real: bubblewrap, its version, a user
-// namespace it can mount in, and the seccomp filters this architecture has.
-// An error means no sandbox can start, and Report.Checks says why and how to
-// fix it. The Report is filled in either way.
+// Probe tries the Linux backend for real: bubblewrap, its version, the
+// seccomp filters this architecture has, and a trial sandbox that it starts
+// as Start does. So, like Command, it refuses root, and it needs Stage first
+// in main: in a program that never called Stage it starts no sandbox, since
+// the sandbox's first stage would run the program's own main, and its
+// probe.stage check fails. An error means no sandbox can start, and
+// Report.Checks says why and how to fix it. The Report is filled in either
+// way.
 func Probe() (Report, error) {
 	rep := Report{
 		Backend:         "bubblewrap",
@@ -26,7 +30,7 @@ func Probe() (Report, error) {
 		PrivateLoopback: true,
 		Ignored:         []string{"Services", "BroadLoopback"},
 	}
-	f := probeFacts{Kernels: rep.Kernel}
+	f := probeFacts{Kernels: rep.Kernel, Root: os.Geteuid() == 0, Staged: staged.Load()}
 	for _, k := range []Kernel{KernelStrict, KernelNested, KernelOpen} {
 		if _, err := filterProgram(k); err == nil {
 			rep.Kernel[k] = k
@@ -45,9 +49,10 @@ func Probe() (Report, error) {
 	rep.Container = gatherContainer()
 	f.Container = rep.Container
 	// The trial needs a working bubblewrap, and is skipped when diagnose
-	// would stop earlier anyway.
-	if f.Bwrap != "" && !f.Setuid && len(f.Kernels) > 0 {
-		f.TryErr = tryBubblewrap(f.Bwrap)
+	// would stop earlier anyway. Without Stage, the trial's first stage
+	// would run this program's own main, so it never starts then.
+	if f.Bwrap != "" && !f.Setuid && len(f.Kernels) > 0 && !f.Root && f.Staged {
+		f.TryErr = trySandbox(f.Kernels)
 	}
 	if f.TryErr != "" {
 		gatherFailureFacts(&f)
@@ -87,27 +92,71 @@ func trueBinary() string {
 	return ""
 }
 
-// tryBubblewrap starts a sandbox that makes the mounts a real one does, and
-// returns bubblewrap's complaint, or "" if it ran.
-func tryBubblewrap(bwrap string) string {
+// trySandbox starts a sandbox the way Start does, at the strictest kernel level
+// the host can give, running a program that does nothing, and returns why it
+// failed, or "" if it ran. A trial of bubblewrap alone isn't enough: on
+// Ubuntu 26.04 bubblewrap starts, and AppArmor denies the first stage the
+// capabilities it needs.
+func trySandbox(kernels map[Kernel]Kernel) string {
 	tr := trueBinary()
 	if tr == "" {
 		return "" // nothing to run in it; the trial proves nothing
 	}
+	var level Kernel
+	for _, k := range []Kernel{KernelStrict, KernelNested, KernelOpen} {
+		if _, ok := kernels[k]; ok {
+			level = k
+			break
+		}
+	}
+	home, err := os.MkdirTemp("", "sandbox-probe-")
+	if err != nil {
+		return fmt.Sprintf("make the trial sandbox's home: %v", err)
+	}
+	msg := runTrial(Spec{Command: []string{tr}, Home: home, Kernel: level})
+	if err := os.Remove(home); err != nil && msg == "" {
+		return fmt.Sprintf("remove the trial sandbox's home: %v", err)
+	}
+	return msg
+}
+
+// runTrial runs the trial sandbox and returns why it failed, or "".
+func runTrial(spec Spec) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, bwrap, "--unshare-user", "--unshare-pid", "--die-with-parent", //nolint:gosec // G204: bwrap is the bubblewrap Probe found, run with a fixed trial.
-		"--ro-bind", "/", "/", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--", tr)
+	cmd, err := Command(ctx, spec)
+	if err != nil {
+		return err.Error()
+	}
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		msg := strings.TrimSpace(stderr.String())
-		if msg == "" {
-			msg = err.Error()
-		}
+	err = cmd.Start()
+	if err == nil {
+		err = cmd.Wait()
+	}
+	if err == nil {
+		return ""
+	}
+	if msg := strings.TrimSpace(stderr.String()); msg != "" {
 		return msg
 	}
-	return ""
+	return err.Error()
+}
+
+// bwrapLabel returns the AppArmor label of a program bubblewrap starts, or ""
+// when there is none or bubblewrap fails.
+func bwrapLabel(bwrap string) string {
+	cat, err := exec.LookPath("cat")
+	if err != nil {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, bwrap, "--unshare-user", "--ro-bind", "/", "/", "--", cat, "/proc/self/attr/apparmor/current").Output() //nolint:gosec // G204: bwrap is the bubblewrap Probe found, run with a fixed command.
+	if err != nil {
+		return ""
+	}
+	return strings.TrimRight(string(out), "\x00\n")
 }
 
 // gatherContainer reads the markers detectContainer looks at.
@@ -140,9 +189,16 @@ func gatherFailureFacts(f *probeFacts) {
 		st.Close() //nolint:gosec // G104: a read-only descriptor, and nothing can be done about a failed close.
 		f.Seccomp = s.Seccomp
 	}
-	if b, err := os.ReadFile("/proc/self/attr/current"); err == nil {
+	// attr/apparmor/current is AppArmor's own, since Linux 5.8, where
+	// attr/current is whichever major LSM the kernel runs.
+	b, err := os.ReadFile("/proc/self/attr/apparmor/current")
+	if err != nil {
+		b, err = os.ReadFile("/proc/self/attr/current")
+	}
+	if err == nil {
 		f.AppArmor = strings.TrimRight(string(b), "\x00\n")
 	}
+	f.BwrapLabel = bwrapLabel(f.Bwrap)
 	if mi, err := os.Open("/proc/self/mountinfo"); err == nil {
 		f.Mounts, _ = parseMountinfo(mi)
 		mi.Close() //nolint:gosec // G104: a read-only descriptor, and nothing can be done about a failed close.

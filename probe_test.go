@@ -35,6 +35,7 @@ func goodFacts() probeFacts {
 		Bwrap:   "/usr/bin/bwrap",
 		Version: "bubblewrap 0.12.0\n",
 		Kernels: map[Kernel]Kernel{KernelStrict: KernelStrict},
+		Staged:  true,
 		Self:    "/opt/app/server",
 	}
 }
@@ -81,8 +82,25 @@ func TestDiagnose(t *testing.T) {
 		{"old", mod(func(f *probeFacts) { f.Version = "bubblewrap 0.4.1" }), "probe.bubblewrap", "older than 0.8"},
 		{"no version", mod(func(f *probeFacts) { f.Version = "" }), "probe.bubblewrap", "no version"},
 		{"no filter", mod(func(f *probeFacts) { f.Kernels = nil }), "probe.seccomp", "architecture"},
-		{"apparmor", mod(func(f *probeFacts) { f.Sysctl["kernel.apparmor_restrict_unprivileged_userns"] = "1" }), "probe.apparmor-userns", "  userns,"},
-		{"apparmor names this binary", mod(func(f *probeFacts) { f.Sysctl["kernel.apparmor_restrict_unprivileged_userns"] = "1" }), "probe.apparmor-userns", "profile sandbox-opt-app-server /opt/app/server flags=(unconfined)"},
+		{"root", mod(func(f *probeFacts) { f.Root = true }), "probe.root", "switch to the sandbox's own uid"},
+		{"no stage", mod(func(f *probeFacts) { f.Staged = false }), "probe.stage", "call sandbox.Stage first in main"},
+		{"root before stage", mod(func(f *probeFacts) { f.Root, f.Staged = true, false }), "probe.root", ""},
+		{"apparmor", mod(func(f *probeFacts) { f.Sysctl["kernel.apparmor_restrict_unprivileged_userns"] = "1" }), "probe.apparmor-userns", "  allow all,"},
+		{"apparmor names this binary", mod(func(f *probeFacts) { f.Sysctl["kernel.apparmor_restrict_unprivileged_userns"] = "1" }), "probe.apparmor-userns", "profile sandbox-opt-app-server /opt/app/server flags=(attach_disconnected,mediate_deleted)"},
+		// Ubuntu 26.04: bubblewrap's profile, whatever the sysctl.
+		{"bwrap profile", mod(func(f *probeFacts) {
+			f.AppArmor, f.BwrapLabel = "unconfined", "bwrap//&unpriv_bwrap (enforce)"
+		}), "probe.apparmor-bwrap", "profile sandbox-opt-app-server /opt/app/server flags=(attach_disconnected,mediate_deleted)"},
+		{"bwrap profile names the label", mod(func(f *probeFacts) {
+			f.AppArmor, f.BwrapLabel = "sandbox-opt-app-server (unconfined)", "bwrap//&unpriv_bwrap (enforce)"
+		}), "probe.apparmor-bwrap", `under "bwrap//&unpriv_bwrap (enforce)"`},
+		{"bwrap profile before sysctl", mod(func(f *probeFacts) {
+			f.AppArmor, f.BwrapLabel = "unconfined", "bwrap//&unpriv_bwrap (enforce)"
+			f.Sysctl["kernel.apparmor_restrict_unprivileged_userns"] = "1"
+		}), "probe.apparmor-bwrap", ""},
+		{"same label is no cause", mod(func(f *probeFacts) {
+			f.AppArmor, f.BwrapLabel = "sandbox-opt-app-server (enforce)", "sandbox-opt-app-server (enforce)"
+		}), "probe.userns", "no known cause"},
 		{"sysctl clone", mod(func(f *probeFacts) { f.Sysctl["kernel.unprivileged_userns_clone"] = "0" }), "probe.userns-sysctl", "unprivileged_userns_clone=1"},
 		{"sysctl max", mod(func(f *probeFacts) { f.Sysctl["user.max_user_namespaces"] = "0" }), "probe.userns-sysctl", "max_user_namespaces="},
 		{"docker seccomp", mod(func(f *probeFacts) {
@@ -156,16 +174,17 @@ func TestApparmorProfile(t *testing.T) {
 	}
 	for _, s := range []string{
 		"abi <abi/4.0>,",
-		"profile sandbox-opt-app-server /opt/app/server flags=(unconfined) {\n  userns,\n}",
+		"profile sandbox-opt-app-server /opt/app/server flags=(attach_disconnected,mediate_deleted) {\n  allow all,\n  allow mount,\n  allow umount,\n  allow pivot_root,\n  allow network,\n  allow unix,\n}",
 	} {
 		if !strings.Contains(p, s) {
 			t.Errorf("profile lacks %q:\n%s", s, p)
 		}
 	}
-	// The one grant is in the one profile, which is for this binary and not
-	// for bubblewrap.
-	if strings.Count(p, "userns,") != 1 || strings.Count(p, "\nprofile ") != 1 || strings.Contains(p, "bwrap") {
-		t.Errorf("want one profile, for this binary, with one userns rule:\n%s", p)
+	// The one profile is for this binary and not for bubblewrap, and it is
+	// in enforce mode, since an unconfined-mode profile lets Ubuntu 26.04's
+	// bwrap profile attach to bubblewrap.
+	if strings.Count(p, "\nprofile ") != 1 || strings.Contains(p, "bwrap") || strings.Contains(p, "unconfined") {
+		t.Errorf("want one profile, for this binary, in enforce mode:\n%s", p)
 	}
 	for _, bad := range []string{"", "relative", "/opt/my app/x", "/bad\"path", "/bad\nname"} {
 		if _, _, err := apparmorProfile(bad); err == nil {

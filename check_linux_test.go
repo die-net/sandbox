@@ -2,7 +2,9 @@ package sandbox
 
 import (
 	"context"
+	"fmt"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -197,14 +199,28 @@ func osNeutralNames() []string {
 	}
 }
 
+// TestProbeVM checks that Probe's verdict agrees with whether a sandbox
+// starts, on a host set up for the suite or not. On Ubuntu 26.04 without the
+// AppArmor profile, bubblewrap starts and AppArmor denies the first stage its
+// capabilities, and a trial of bubblewrap alone passed there while no
+// sandbox could start. CI runs this test there without the profile too.
 func TestProbeVM(t *testing.T) {
 	t.Parallel()
 	rep, err := Probe()
-	if err != nil {
+	startErr := startTrueSandbox(t)
+	if (err == nil) != (startErr == nil) {
 		for _, c := range rep.Checks {
 			t.Logf("%s %v: %s", c.Name, c.Status, c.Detail)
 		}
-		t.Fatal(err)
+		t.Fatalf("Probe = %v, but a sandbox's start = %v", err, startErr)
+	}
+	if err != nil {
+		last := rep.Checks[len(rep.Checks)-1]
+		if last.Status != Fail {
+			t.Errorf("Probe failed, and its last check passed: %+v", rep.Checks)
+		}
+		t.Logf("no sandbox starts here, and Probe says why: %s: %s", last.Name, last.Detail)
+		return
 	}
 	if rep.Backend != "bubblewrap" || !rep.TreeKill || !rep.PrivateLoopback {
 		t.Errorf("report = %+v", rep)
@@ -224,6 +240,59 @@ func TestProbeVM(t *testing.T) {
 		t.Errorf("Ignored = %v", rep.Ignored)
 	}
 	t.Logf("container %q, checks %+v", rep.Container, rep.Checks)
+}
+
+// startTrueSandbox runs true in a sandbox, apart from Probe, and returns why it
+// failed.
+func startTrueSandbox(t *testing.T) error {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	cmd, err := Command(ctx, Spec{Command: []string{trueBinary()}, Home: t.TempDir()})
+	if err != nil {
+		return err
+	}
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("%w: %s", err, stderr.String())
+	}
+	if err := cmd.Wait(); err != nil {
+		return fmt.Errorf("%w: %s", err, stderr.String())
+	}
+	return nil
+}
+
+// TestProbeWithoutStage plays a program that never called Stage. Probe must
+// say so, and start no sandbox, since the sandbox's first stage would run
+// the program's own main. A bubblewrap of the test's own on PATH logs how
+// it was run, so a trial that started shows.
+func TestProbeWithoutStage(t *testing.T) {
+	dir := t.TempDir()
+	log := filepath.Join(dir, "log")
+	script := "#!/bin/sh\necho \"$1\" >>" + log + "\n[ \"$1\" = --version ] && echo 'bubblewrap 0.11.1'\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(dir, "bwrap"), []byte(script), 0o700); err != nil { //nolint:gosec // G306: the file is a program the test runs, which needs its owner to execute it.
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	staged.Store(false)
+	t.Cleanup(func() { staged.Store(true) })
+
+	rep, err := Probe()
+	if err == nil || len(rep.Checks) == 0 {
+		t.Fatalf("Probe = %+v, %v", rep, err)
+	}
+	last := rep.Checks[len(rep.Checks)-1]
+	if last.Name != "probe.stage" || last.Status != Fail || !strings.Contains(last.Detail, "sandbox.Stage") {
+		t.Errorf("last check = %+v", last)
+	}
+	b, err := os.ReadFile(log) //nolint:gosec // G304: the test reads a path it made, or one a sandbox must not let it read.
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runs := strings.Fields(string(b)); !slices.Equal(runs, []string{"--version"}) {
+		t.Errorf("bubblewrap ran with %q, want only --version", runs)
+	}
 }
 
 func TestProbeNoBubblewrap(t *testing.T) {
