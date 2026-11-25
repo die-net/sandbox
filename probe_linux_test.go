@@ -14,11 +14,19 @@ import (
 // there, while every real sandbox's first stage fails. The trial must run the
 // first stage, and fail with the stage's own error, not as a trial that was
 // never built.
+//
+// Where AppArmor's user-namespace restriction applies to bubblewrap itself,
+// as on Ubuntu 24.04 without this binary's profile, bubblewrap is refused
+// before it starts anything, so no stage runs, with or without the wrapper.
+// The trial must then fail with bubblewrap's own refusal.
 func TestProbeTrialStartsTheFirstStage(t *testing.T) {
 	bwrap, err := exec.LookPath("bwrap")
 	if err != nil {
 		t.Fatal(err)
 	}
+	f := hostLabels(t, bwrap)
+	restricted, _ := os.ReadFile("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
+	refused := strings.TrimSpace(string(restricted)) == "1" && apparmorApplies(f) && !apparmorInForce(f) && f.BwrapLabel == f.AppArmor
 	// --cap-drop ALL goes right before the first "--", after the options
 	// that --args reads, so it undoes their --cap-add.
 	script := `#!/bin/sh
@@ -39,9 +47,32 @@ exec ` + bwrap + ` "$@"
 	if built != "" {
 		t.Fatalf("the trial was not built: %s", built)
 	}
-	if want := "copy the view into a mount namespace of its own: operation not permitted"; !strings.Contains(failed, want) {
-		t.Errorf("the trial failed with %q, want the first stage's %q", failed, want)
+	stage := "copy the view into a mount namespace of its own: operation not permitted"
+	switch {
+	case refused:
+		t.Logf("AppArmor restricts bubblewrap's user namespace here, as %q", f.AppArmor)
+		if !strings.HasPrefix(failed, "bwrap: ") || !strings.Contains(failed, "Operation not permitted") || strings.Contains(failed, stage) {
+			t.Errorf("the trial failed with %q, want bubblewrap's own EPERM", failed)
+		}
+	case !strings.Contains(failed, stage):
+		t.Errorf("the trial failed with %q, want the first stage's %q", failed, stage)
 	}
+}
+
+// hostLabels returns the AppArmor labels of this process and of the
+// bubblewrap it runs, and this binary's path, which decide whether a profile
+// for this binary is in force.
+func hostLabels(t *testing.T, bwrap string) probeFacts {
+	t.Helper()
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	self, err := filepath.EvalSymlinks(exe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return probeFacts{Self: self, AppArmor: readLabel(os.Getpid()), BwrapLabel: bwrapLabel(bwrap)}
 }
 
 // TestProbeTrialNotBuilt checks that a trial that can't be made is
@@ -78,18 +109,11 @@ func TestBwrapLabel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	f := probeFacts{AppArmor: readLabel(os.Getpid()), BwrapLabel: bwrapLabel(bwrap)}
+	f := hostLabels(t, bwrap)
 	if f.AppArmor == "" || f.BwrapLabel == "" {
 		t.Fatalf("labels not read: this process %q, bubblewrap %q", f.AppArmor, f.BwrapLabel)
 	}
 	t.Logf("this process is %q, and bubblewrap gets %q", f.AppArmor, f.BwrapLabel)
-	exe, err := os.Executable()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if f.Self, err = filepath.EvalSymlinks(exe); err != nil {
-		t.Fatal(err)
-	}
 	if apparmorOwn(f) && f.BwrapLabel != f.AppArmor {
 		t.Errorf("under its own profile %q, this binary runs bubblewrap as %q", f.AppArmor, f.BwrapLabel)
 	}
