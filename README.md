@@ -108,7 +108,7 @@ On both: a file descriptor you hand in grants whatever its object allows, whatev
 
 ## Status
 
-Both backends are built and tested, on Linux (amd64 and arm64, Debian 13 and Ubuntu 24.04) and on macOS 15, 26 and 27 (arm64, and amd64 under Rosetta 2 on 27). Each has had a security review by a model, and [docs/findings.md](docs/findings.md) lists what they found. No release has been tagged. The Seatbelt rules come from running macOS 27.0.1 and 27.2.0. CI runs the suite on macOS 15 and 26, which needed one more rule. Rerun the tests on each new release.
+Both backends are built and tested, on Linux (amd64 and arm64, Debian 13 and Ubuntu 24.04) and on macOS 15, 26 and 27 (arm64, and amd64 under Rosetta 2 on 27). Each has had a security review by a model, and [docs/findings.md](docs/findings.md) lists what they found. The first release is v0.1.0, and the API may still change before v1. The Seatbelt rules come from running macOS 27.0.1 and 27.2.0. CI runs the suite on macOS 15 and 26, which needed one more rule. Rerun the tests on each new release.
 
 ## Documentation
 
