@@ -47,6 +47,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y bubblewrap
           bwrap --version
+      # TestIsolation's open level tries to replace an iptables table and
+      # wants the kernel's EPERM. Without the ip_tables module, which the
+      # 26.04 runner doesn't load, the kernel answers ENOPROTOOPT before it
+      # checks a capability, and the test fails saying so.
+      - name: Load ip_tables
+        run: sudo modprobe ip_tables
       # Ubuntu sets kernel.apparmor_restrict_unprivileged_userns=1, so
       # bubblewrap can make a user namespace only for a program with an
       # AppArmor profile that allows it. scripts/apparmor.sh loads the profile
