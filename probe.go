@@ -152,6 +152,8 @@ func firstBlock(f probeFacts) Result {
 		return fail("probe.docker-apparmor", "the container runs under Docker's docker-default AppArmor profile, which denies mount. Fix: a profile that allows mount, or --security-opt apparmor=unconfined for this container only")
 	case container && masked(f.Mounts):
 		return fail("probe.masked-proc", "paths under /proc are overmounted, and the kernel refuses a new procfs while the existing one is partly hidden. Fix: Docker --security-opt systempaths=unconfined, or Podman --security-opt unmask=ALL")
+	case f.Container == "systemd-unit" && masked(f.Mounts):
+		return fail("probe.masked-proc", "paths under /proc are overmounted in this systemd service, and the kernel refuses a new procfs while the existing one is partly hidden. Fix, for this unit only: relax ProtectKernelTunables=, ProtectKernelLogs= and ProtectProc=, which mount over parts of /proc")
 	case f.Container == "systemd-unit":
 		return fail("probe.systemd-unit", "this runs in a systemd service whose restrictions refuse namespaces or mounts. Fix, for this unit only: relax RestrictNamespaces=, and a SystemCallFilter= that lacks @mount, keeping the rest")
 	}

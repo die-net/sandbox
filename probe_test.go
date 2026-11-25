@@ -153,6 +153,13 @@ func TestDiagnose(t *testing.T) {
 			f.Container, f.Mounts = "lxc", []mount{{point: "/proc"}, {point: "/proc/sys/fs/binfmt_misc"}}
 		}), "probe.userns", "no known cause"},
 		{"systemd unit", mod(func(f *probeFacts) { f.Container = "systemd-unit" }), "probe.systemd-unit", "RestrictNamespaces="},
+		// ProtectKernelTunables= mounts /proc/sys read-only over itself.
+		{"masked proc in a systemd unit", mod(func(f *probeFacts) {
+			f.Container, f.Mounts = "systemd-unit", []mount{{point: "/proc"}, {point: "/proc/sys"}, {point: "/proc/sys/fs/binfmt_misc"}}
+		}), "probe.masked-proc", "ProtectKernelTunables="},
+		{"binfmt_misc in a systemd unit", mod(func(f *probeFacts) {
+			f.Container, f.Mounts = "systemd-unit", []mount{{point: "/proc"}, {point: "/proc/sys/fs/binfmt_misc"}}
+		}), "probe.systemd-unit", "RestrictNamespaces="},
 		{"unknown", mod(func(*probeFacts) {}), "probe.userns", "No permissions"},
 		// Order: AppArmor before sysctl before container seccomp.
 		{"apparmor first", mod(func(f *probeFacts) {
