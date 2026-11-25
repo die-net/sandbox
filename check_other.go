@@ -49,3 +49,7 @@ func platformSockets() []string {
 	}
 	return socks
 }
+
+// platformScratch is empty here, where the view's only exceptions are the paths
+// of the Spec.
+func platformScratch() []string { return nil }

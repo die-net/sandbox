@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -222,6 +223,81 @@ func TestSpecDrivenChecks(t *testing.T) {
 	}
 	if entries, _ := os.ReadDir(ro); len(entries) != 0 {
 		t.Errorf("writes.outside left %v", entries)
+	}
+}
+
+// TestCheckSpecCoversShowLinkedFiles checks the covers as the child does,
+// against the Spec that checkSpec gives it, on a host where a link in /etc
+// leads under a cover, as Ubuntu's /etc/resolv.conf leads into /run. prepare
+// binds that file back, and bubblewrap makes its parent directories as empty
+// mount points in the cover. They are not in the caller's Spec, so a check
+// that judged by it failed every Ubuntu host, and the check stays strict for
+// any other entry.
+// Row: Covers.
+func TestCheckSpecCoversShowLinkedFiles(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	run, home := filepath.Join(root, "run"), filepath.Join(root, "home")
+	stub := filepath.Join(run, "systemd", "resolve", "stub-resolv.conf")
+	// What the cover shows in the sandbox: the stub's empty parents and the
+	// stub, as bubblewrap leaves them, on the real files so the check can walk them.
+	if err := os.MkdirAll(filepath.Dir(stub), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(home, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(stub, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The host the spec is prepared against is a fake one with the same names.
+	host := fakeHost(
+		[]string{home, run},
+		[]string{stub},
+		map[string]string{"/etc/resolv.conf": stub},
+	)
+	h := hostView{fs: host, cover: []string{run}}
+	name := "covers:" + run
+
+	caller := Spec{Home: home}
+	// The caller's Spec alone does not explain the stub's parents. Run is a
+	// default cover of the host here, so the caller's Spec has to name it for
+	// the check to look.
+	named := Spec{Home: home, Cover: []string{run}}
+	if m := byName(t, checkCovers(&checkEnv{spec: &named})); m[name].Status != Fail {
+		t.Fatalf("the caller's Spec explains the linked file: %+v", m[name])
+	}
+	child, err := checkSpec(caller, h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(child.Read, stub) || !slices.Contains(child.Cover, run) {
+		t.Fatalf("checkSpec = Read %q, Cover %q, want %s read and %s covered", child.Read, child.Cover, stub, run)
+	}
+	if len(child.Command) != 0 {
+		t.Errorf("checkSpec kept Command %q, which the child's own start sets", child.Command)
+	}
+	if m := byName(t, checkCovers(&checkEnv{spec: &child})); m[name].Status != Pass {
+		t.Errorf("a cover that shows only the way to a linked file failed: %+v", m[name])
+	}
+
+	// Any other entry still fails: a sibling of the stub's parent, and one
+	// beside the stub in its own directory.
+	for _, extra := range []string{
+		filepath.Join(run, "systemd", "other"),
+		filepath.Join(run, "systemd", "resolve", "other"),
+		filepath.Join(run, "user"),
+	} {
+		if err := os.Mkdir(extra, 0o750); err != nil {
+			t.Fatal(err)
+		}
+		m := byName(t, checkCovers(&checkEnv{spec: &child}))
+		if m[name].Status != Fail || !strings.Contains(m[name].Detail, extra) {
+			t.Errorf("with %s, covers = %+v, want a failure naming it", extra, m[name])
+		}
+		if err := os.Remove(extra); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 

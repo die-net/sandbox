@@ -122,7 +122,7 @@ func Check(ctx context.Context, spec *Spec, want Expect) ([]Result, error)
 | `NotEnforceable` | It applies, but nothing on this platform can enforce it, such as memory on macOS. |
 | `Skipped` | It doesn't apply, or there was nothing to try. |
 
-- **`spec != nil`:** the child runs inside a sandbox built from `spec`. Call it with the `Spec` a program really builds, in its own tests, not only the library's. `spec.Command` is ignored.
+- **`spec != nil`:** the child runs inside a sandbox built from `spec`. Call it with the `Spec` a program really builds, in its own tests, not only the library's. `spec.Command` is ignored. The `covers` results judge each covered directory by the `Spec` as the sandbox prepares it, not as given: it also has the covers for the homes and the mount table, and the files that links in `/etc` lead to under a cover (Ubuntu's `/etc/resolv.conf` leads into `/run`), with the empty directories they are mounted in. Any other entry in a cover fails.
 - **`spec == nil`:** the child inherits the caller's context as it is. That's what an operator's container or systemd unit gives, so an operator who isolates untrusted code with their own boundary can see what it enforces.
 
 `Expect` adds the program's own claims: `Unreadable` and `Unwritable` paths (each `Unreadable` path is also tried through its filesystem's snapshot directories), `Unreachable` endpoints as `tcp:127.0.0.1:8080`, `udp:host:port` or `unix:/path`, and a `Proxy` with `Allowed` and `Refused` CONNECT targets.

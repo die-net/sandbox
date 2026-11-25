@@ -249,7 +249,7 @@ type hostView struct {
 }
 
 // prepare checks spec and returns it with every path absolute, clean, and
-// with symlinks resolved. Cover gains the defaults and homes, the people's
+// with symlinks resolved. The working directory defaults to the home. Cover gains the defaults and homes, the people's
 // homes found on the host, which may live outside /home, and loses each cover
 // that another already hides. Read gains the files that links in the host's
 // /etc lead to under a default cover. h is what prepare needs of the host.
@@ -313,6 +313,9 @@ func prepare(spec Spec, h hostView) (Spec, error) {
 		return Spec{}, err
 	}
 	spec.Home = home
+	if spec.Dir == "" {
+		spec.Dir = home
+	}
 	binds := slices.Concat([]string{home}, spec.Write, spec.Read)
 	spec.Cover = covers(slices.Concat(shared, private, elsewhere), binds)
 	linked, err := linkedFiles(host, "etc", slices.Concat(shared, h.aliases), slices.Concat(private, []string{home}, spec.Write))
@@ -337,16 +340,14 @@ func prepare(spec Spec, h hostView) (Spec, error) {
 			}
 		}
 	}
-	if spec.Dir != "" {
-		dir, err := resolve(host, spec.Dir, writable)
-		if err != nil {
-			return Spec{}, fmt.Errorf("working directory: %w", err)
-		}
-		if !shown(dir, binds, spec.Cover) {
-			return Spec{}, fmt.Errorf("working directory %s lies under a covered path", spec.Dir)
-		}
-		spec.Dir = dir
+	dir, err := resolve(host, spec.Dir, writable)
+	if err != nil {
+		return Spec{}, fmt.Errorf("working directory: %w", err)
 	}
+	if !shown(dir, binds, spec.Cover) {
+		return Spec{}, fmt.Errorf("working directory %s lies under a covered path", spec.Dir)
+	}
+	spec.Dir = dir
 	return spec, nil
 }
 

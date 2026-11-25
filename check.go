@@ -125,19 +125,27 @@ type checkHints struct {
 }
 
 // Check runs the suite in a child of this binary and returns the results,
-// in a fixed order. With spec the child runs inside a sandbox built from it.
+// in a fixed order. With spec the child runs inside a sandbox built from it,
+// and judges what the view shows by the Spec as the sandbox prepares it.
 // With nil it inherits this process's context as it is, which is what an
 // operator's container or unit gives.
 //
 // The child is started as the current binary with checkArg as its first
 // argument, so the program must call Stage first in main.
 func Check(ctx context.Context, spec *Spec, want Expect) ([]Result, error) {
-	in := checkInput{Want: want, Hints: platformHints(spec)}
+	var in checkInput
 	if spec != nil {
-		c := *spec
-		c.Command = nil
+		h, err := currentHost()
+		if err != nil {
+			return nil, fmt.Errorf("check: %w", err)
+		}
+		c, err := checkSpec(*spec, h)
+		if err != nil {
+			return nil, fmt.Errorf("check: %w", err)
+		}
 		in.Spec = &c
 	}
+	in.Want, in.Hints = want, platformHints(in.Spec)
 	payload, err := json.Marshal(in)
 	if err != nil {
 		return nil, fmt.Errorf("check: %w", err)
@@ -205,6 +213,22 @@ func Check(ctx context.Context, spec *Spec, want Expect) ([]Result, error) {
 	return results, nil
 }
 
+// checkSpec returns the Spec the check child runs under, which is spec as
+// prepare returns it for h. The child judges what its view shows by that, and
+// not by the caller's Spec, since prepare adds the covers of the homes and the
+// mount table and the files that links in /etc lead to under a cover, and only
+// the caller's side can see the host those come from. Command is empty, as
+// the child's own is set at the start.
+func checkSpec(spec Spec, h hostView) (Spec, error) {
+	spec.Command = []string{SelfPath, checkArg}
+	spec, err := prepare(spec, h)
+	if err != nil {
+		return Spec{}, err
+	}
+	spec.Command = nil
+	return spec, nil
+}
+
 // checkStage is the check child's entry point, which Stage calls when
 // os.Args[1] is checkArg. It returns the exit status.
 func checkStage() int {
@@ -225,7 +249,7 @@ func checkStage() int {
 	}
 	defer out.Close()
 	enc := json.NewEncoder(out)
-	for _, res := range runChecks(&checkEnv{want: in.Want, spec: in.Spec, hints: in.Hints}) {
+	for _, res := range runChecks(&checkEnv{want: in.Want, spec: in.Spec, hints: in.Hints, scratch: platformScratch()}) {
 		if err := enc.Encode(res); err != nil {
 			fmt.Fprintf(os.Stderr, "sandbox check: %v\n", err)
 			return checkFailed
@@ -240,6 +264,9 @@ type checkEnv struct {
 	want  Expect
 	spec  *Spec
 	hints checkHints
+	// scratch are the paths inside the covers that the sandbox mounts a
+	// tmpfs of its own on, which the covers check doesn't walk.
+	scratch []string
 }
 
 // checkFn runs one check, or a group of them, and returns its results.
@@ -675,7 +702,9 @@ func checkCovers(e *checkEnv) []Result {
 		return []Result{skipped("covers", "no sandbox spec given")}
 	}
 	// Paths the sandbox shows on purpose, and the directories that lead to them.
-	shown := slices.Concat([]string{e.spec.Home, e.spec.Dir}, e.spec.Write, e.spec.Read)
+	// The Spec is the prepared one, which has the files that links in /etc
+	// lead to under a cover.
+	shown := slices.Concat([]string{e.spec.Home, e.spec.Dir}, e.spec.Write, e.spec.Read, e.scratch)
 	shown = slices.DeleteFunc(shown, func(s string) bool { return s == "" })
 	covers := slices.Concat(defaultCover, e.spec.Cover)
 	slices.Sort(covers)

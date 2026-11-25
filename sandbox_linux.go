@@ -151,23 +151,11 @@ func (c *Cmd) Start() error {
 	if err != nil {
 		return err
 	}
-	homes, err := hostHomes()
+	h, err := currentHost()
 	if err != nil {
 		return err
 	}
-	// The account the program runs as may come from a directory service that
-	// /etc/passwd does not list.
-	if home, err := os.UserHomeDir(); err == nil {
-		homes = append(homes, home)
-	}
-	if spec.Dir == "" {
-		spec.Dir = spec.Home
-	}
-	mounts, err := hostMounts()
-	if err != nil {
-		return err
-	}
-	spec, err = prepare(spec, hostView{fs: os.DirFS("/"), homes: homes, mounts: mounts, cover: defaultCover})
+	spec, err = prepare(spec, h)
 	if err != nil {
 		return err
 	}

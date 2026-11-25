@@ -170,6 +170,8 @@ The AppArmor fix is a profile for this one binary's path, which the package gene
 - read well-known secrets and reach well-known sockets;
 - write outside the home, read under each cover and reach the network directly.
 
+The check of a cover lists what the cover shows and fails on any entry that isn't a path the sandbox binds back, or a directory on the way to one. It judges by the `Spec` as `prepare` returns it, which `Check` makes on the caller's side, since only there can it see the host's `/etc`. That `Spec` has the files that links in `/etc` lead to under a default cover, such as Ubuntu's `/etc/resolv.conf` into `/run/systemd/resolve/`. bubblewrap makes their parent directories as empty mount points in the cover's tmpfs. The caller's own `Spec` doesn't name them, so a check by it failed every Ubuntu host. The scratch directories (`/tmp`, `/var/tmp`, `/dev/shm`) are the sandbox's own tmpfs mounts and are not walked.
+
 It also reports capabilities, `no_new_privs`, the seccomp mode and supplementary groups, and it takes a caller's own `Unreadable`, `Unwritable` and `Unreachable` lists. A pass means one attempt failed, not that every path is closed.
 
 ## Tried and dropped

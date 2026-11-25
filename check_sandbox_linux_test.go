@@ -47,6 +47,15 @@ func TestCheckSandbox(t *testing.T) {
 			t.Errorf("%s = %+v, want %v", name, r, st)
 		}
 	}
+	// The covers that the library makes a mount point in, for the files that
+	// links in /etc lead to (Ubuntu's resolv.conf into /run, Debian's
+	// sgml catalog into /var/lib) and for the scratch directories (/var/tmp),
+	// show nothing else. A check by the caller's Spec failed both on every host.
+	for _, c := range []string{"/run", "/var"} {
+		if r := m["covers:"+c]; r.Status != Pass {
+			t.Errorf("covers:%s = %+v, want Pass", c, r)
+		}
+	}
 	for _, name := range []string{"writes.outside", "covers"} {
 		ran := false
 		for n, r := range m {
