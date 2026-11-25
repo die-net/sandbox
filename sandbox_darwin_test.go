@@ -22,6 +22,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -39,10 +40,13 @@ var childModes = map[string]func(args []string) int{}
 // budget, so that it reports it could not prove the sandbox empty.
 const stageUnprovableEnv = "SANDBOX_TEST_STAGE_UNPROVABLE"
 
-// stageOrphanZombiesEnv, in the same place, hides the parent of every zombie and
-// exiting process from the stage's scan, so that none is taken as a non-member's
-// child and a lingering zombie costs the scan that sees it.
-const stageOrphanZombiesEnv = "SANDBOX_TEST_STAGE_ORPHAN_ZOMBIES"
+// stageOrphanZombieEnv, in the same place, holds the pid of a zombie whose parent
+// the stage's scan is not to see, so that it is not taken as a non-member's
+// child and costs the scan that first sees it. Only that pid is changed: the
+// account's other processes that exit while the scan runs keep their parents,
+// as they do for a real teardown, or every scan on a busy machine would be
+// unclean.
+const stageOrphanZombieEnv = "SANDBOX_TEST_STAGE_ORPHAN_ZOMBIE"
 
 // stageKillBeforeReplyEnv, in the same place, makes the stage end itself with
 // SIGKILL 300 ms after it started sandbox-exec, before it replied: a stage
@@ -76,12 +80,17 @@ func TestMain(m *testing.M) {
 	registerEscMode()
 	var opts stageOptions
 	var hooks []func(*prober)
-	if os.Getenv(stageOrphanZombiesEnv) != "" {
+	if v := os.Getenv(stageOrphanZombieEnv); v != "" {
+		zombie, err := strconv.Atoi(v)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%s = %q: %v\n", stageOrphanZombieEnv, v, err)
+			os.Exit(2)
+		}
 		hooks = append(hooks, func(p *prober) {
 			stat := p.stat
 			p.stat = func(pid int) (procStat, error) {
 				st, err := stat(pid)
-				if st.Zombie || st.Exiting {
+				if pid == zombie && (st.Zombie || st.Exiting) {
 					st.PPid = 1
 				}
 				return st, err
