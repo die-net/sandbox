@@ -1115,7 +1115,7 @@ func TestAPIServices(t *testing.T) {
 		t.Errorf("id -un with ServiceDirectory = %q, want %q: %s", r.stdout, me, r)
 	}
 	// A repeated group is one group.
-	if _, err := Command(t.Context(), Spec{Command: []string{"/usr/bin/true"}, Home: realTemp(t), Services: []Service{ServiceDirectory, ServiceDirectory, ServiceFirefox}}); err != nil {
+	if _, err := Command(t.Context(), Spec{Command: []string{"/usr/bin/true"}, Home: realTemp(t), Services: []Service{ServiceDirectory, ServiceDirectory, ServiceLaunchServices}}); err != nil {
 		t.Error(err)
 	}
 }

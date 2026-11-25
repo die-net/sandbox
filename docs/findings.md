@@ -250,7 +250,7 @@ A review of the finished backend by Fable 5.2 found four issues and no full esca
 
 - **How it worked.** `file-read*` of `/` shows `/dev/ttys*`, `/dev/ptmx`, `/dev/bpf*` and the disks. The account is usually in `access_bpf`, and its own terminals share its uid, so a sandbox could read keystrokes and type output into another terminal, or sniff.
 - **What stops it.** The profile denies all of `/dev` but `null`, `zero`, `random`, `urandom` and `/dev/fd/N`, so a terminal reaches the command only as a descriptor it was handed, and `TIOCSTI` on that one is refused. A first version denied those four families by name, and missed `/dev/console` (`crw--w--w-`, owned by the login user) and `/dev/cu.*` and `/dev/uart.*` (`rw-rw-rw-`), whose stat worked, and so, by their permissions, probably their open. Nothing opened one, since opening a serial port can toggle a line on attached hardware.
-- **Test.** `TestEscapeTerminals` opens each device for reading and for writing. `TestEscapeDevices` stats every entry of `/dev` and shows each refused but the allowed ones, which it uses, and `TestFirefoxScreenshot` still renders. It has a control for `TIOCSTI`, which the kernel on 27.x refuses outside a sandbox too, so there the check is only the profile's refusal to open another terminal.
+- **Test.** `TestEscapeTerminals` opens each device for reading and for writing. `TestEscapeDevices` stats every entry of `/dev` and shows each refused but the allowed ones, which it uses. It has a control for `TIOCSTI`, which the kernel on 27.x refuses outside a sandbox too, so there the check is only the profile's refusal to open another terminal.
 
 ### A setuid program doesn't run
 
@@ -278,11 +278,22 @@ A review of the finished backend by Fable 5.2 found four issues and no full esca
 
 ### Launching apps and URLs
 
-- **How it worked.** Not an escape: this is what was checked. `open` of an app and of a URL, `open -a`, and `osascript` telling Calculator to launch all fail under every `Services` group, even the one that allows the lookup of `launchservicesd`. No app starts and the default browser fetches nothing. A raw XPC client that connects to `launchservicesd` directly gets a connection with the group and `Connection invalid` without it, and nothing opens.
-- **What stops it.** The profile never allows `lsopen` ([macos.md](macos.md#m3-launchservices-and-lsopen)).
-- **What wasn't checked.** The message the XPC client sends is rejected by `launchservicesd` outside the sandbox as well, since the real request is private to LaunchServices. The library's calls to it don't go through any public `xpc_connection_create*` function, so interposing couldn't capture one to replay. The `lsopen` denial is logged against the calling process, which suggests the check is on the caller's side. Whether `launchservicesd` checks it on the server side is untested, and a review should look at it.
-- **Test.** `TestEscapeLaunchServices` snapshots the Calculator processes by executable path before, looks after each attempt, and reports any it didn't find, with its pid and path, without ending it. `TestEscapeLaunchServicesRawXPC` is the raw client.
+- **How it worked.** Not an escape: this is what was checked. `open` of an app and of a URL, `open -a`, and `osascript` telling Calculator to launch all fail under every `Services` group, even `ServiceLaunchServices`, which allows the lookup of `launchservicesd`. No app starts and the default browser fetches nothing. `lsappinfo`, a client of `launchservicesd`, finds a running app with that group and none without it, so the group is what reaches the service.
+- **What stops it.** The profile never allows `lsopen` ([macos.md](macos.md#m2-launchservices-and-lsopen)).
+- **What wasn't checked.** A raw XPC client that sent its own open request got a connection with the group and `Connection invalid` without it, and nothing opened, but `launchservicesd` rejected that message outside the sandbox as well, since the real request is private to LaunchServices. The library's calls to it don't go through any public `xpc_connection_create*` function, so interposing couldn't capture one to replay. That client needed a C compiler, and was replaced by `lsappinfo`. The `lsopen` denial is logged against the calling process, which suggests the check is on the caller's side. Whether `launchservicesd` checks it on the server side is untested, and a review should look at it.
+- **Test.** `TestEscapeLaunchServices` snapshots the Calculator processes by executable path before, makes every attempt at once, and after them reports any it didn't find, with its pid and path, without ending it. `TestEscapeServiceLookups` runs `lsappinfo` with the group and without it.
 - **A false alarm.** An earlier run of this test reported "an app was launched: 2 processes of Calculator, was 0", and the profile-in-argv test saw profile text in `ps`. Both were the suite's own checks matching command lines of other programs. The Calculator count matched any command line that named `Calculator.app`, including a hand-run `lsopen` experiment that did launch it. The argv check looked at every process on the machine, where other tools run `sandbox-exec -p` with a profile. The tests now count executables by path, snapshot before, and look only at the sandbox's own process tree.
+
+### A sandbox could take a Mach name from outside
+
+- **How it worked.** A `Service` group allowed `mach-register` and `mach-lookup` of every name under one fixed prefix, the one a browser's processes find each other by. A registered name is in the bootstrap namespace of the user's whole session, not the sandbox's. A probe, a C program run as an experiment, showed it on macOS 27.2 with names under that prefix:
+  - A sandbox checked in a name, and a process outside any sandbox looked it up and sent to it. The sandbox received the message.
+  - A process outside checked in a name, and the sandbox looked it up and sent to it, which arrived.
+  - Two sandboxes given the group reached each other the same way.
+  - A sandbox that checked a name in first kept it: the outside process's own check-in of the same name was refused with 1100 (`BOOTSTRAP_NOT_PRIVILEGED`). So a sandbox could take the name that the user's own browser, or any program using the prefix, would register, and receive what that program's clients send it.
+  - Without the group, or for a name outside the prefix, both `bootstrap_check_in` and `bootstrap_register` were refused with 1100.
+- **What stops it.** No `Service` allows `mach-register`. The group was removed, and its two lookups became `ServiceSystemConfiguration` and `ServiceLaunchServices`. A program whose processes find each other by registered names doesn't run.
+- **Test.** `TestEscapeProfileNeverAllows` fails if any profile holds `mach-register`, and `TestEscapeServiceLookups` that each group allows its own lookups and no other.
 
 ## Found by the review of the macOS teardown proof
 

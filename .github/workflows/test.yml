@@ -90,8 +90,7 @@ jobs:
 
   # The tests start real sandboxes with /usr/bin/sandbox-exec, as the runner's
   # own user, so they need no setup. A runner is not inside a Seatbelt profile,
-  # which Probe would refuse. Firefox is on the runner image, so
-  # TestFirefoxScreenshot and TestFirefoxNetwork run, and skip where it is not.
+  # which Probe would refuse.
   # The race detector needs cgo on macOS, so only that leg runs it.
   #
   # Seatbelt's rules differ between releases: macOS 15 and 26 allowed a hard

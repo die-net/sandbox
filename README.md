@@ -112,7 +112,7 @@ Both backends are built and tested, on Linux (amd64 and arm64, Debian 12 and 13,
 
 ## Documentation
 
-- [docs/usage.md](docs/usage.md): adopting the library. `Stage`, egress, `Probe` and `Check`, tools under covered paths, limits, `ErrSurvivors`, Firefox.
+- [docs/usage.md](docs/usage.md): adopting the library. `Stage`, egress, `Probe` and `Check`, tools under covered paths, limits, `ErrSurvivors`, and what a program meets under the sandbox.
 - [docs/security-model.md](docs/security-model.md): the threat model, every guarantee with its test, the limits and the open issues.
 - [docs/linux.md](docs/linux.md) and [docs/macos.md](docs/macos.md): how each backend works.
 - [docs/findings.md](docs/findings.md): every way past the sandbox that has been found. Read it before changing the sandbox.

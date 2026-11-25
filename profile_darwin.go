@@ -38,13 +38,16 @@ type profileInput struct {
 var defaultRead = []string{"/private/var/select", "/private/var/db/timezone"}
 
 // serviceRules are the Mach services each Service group allows, as profile
-// rules. A new group is a reviewed change.
+// rules. A new group is a reviewed change. None allows mach-register: a
+// registered name is in the bootstrap namespace of the user's whole session,
+// so a sandbox could take a name a program outside looks up
+// (docs/findings.md, "A sandbox could take a Mach name from outside").
 var serviceRules = map[Service][]string{
-	ServiceFirefox: {
-		`(allow mach-register (global-name-regex #"^org\.mozilla\.machname\."))`,
-		`(allow mach-lookup (global-name-regex #"^org\.mozilla\.machname\."))`,
-		`(allow mach-lookup (global-name "com.apple.coreservices.launchservicesd"))`,
+	ServiceSystemConfiguration: {
 		`(allow mach-lookup (global-name "com.apple.SystemConfiguration.configd"))`,
+	},
+	ServiceLaunchServices: {
+		`(allow mach-lookup (global-name "com.apple.coreservices.launchservicesd"))`,
 	},
 	ServiceDirectory: {
 		`(allow mach-lookup (global-name "com.apple.system.opendirectoryd.libinfo"))`,

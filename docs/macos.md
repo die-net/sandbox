@@ -8,13 +8,13 @@ macOS has no namespaces, no seccomp and no cgroups, so this backend is a differe
 
 The package writes a Seatbelt profile from the `Spec` and runs the command under `/usr/bin/sandbox-exec`, by that absolute path and never one found on `PATH`. There's no cgo. The profile language is Apple's, but `sandbox-exec` is the one program that applies it without linking `libsandbox`, so the module builds with `CGO_ENABLED=0`.
 
-Seatbelt is the engine App Sandbox and Firefox's own content sandboxes use. It's deprecated, and undocumented but for what Apple's own profiles in `/System/Library/Sandbox/Profiles` show. So every rule here came from running something and reading the deny log:
+Seatbelt is the engine App Sandbox uses. It's deprecated, and undocumented but for what Apple's own profiles in `/System/Library/Sandbox/Profiles` show. So every rule here came from running something and reading the deny log:
 
 ```
 log stream --predicate 'sender == "Sandbox"'
 ```
 
-A process that is already inside a profile can't apply another. `Probe` tries a trivial profile and says so. A Firefox started under one can't start its own child processes' sandboxes, which is why [Firefox](usage.md#firefox) needs three environment switches.
+A process that is already inside a profile can't apply another. `Probe` tries a trivial profile and says so. A program that puts its own child processes in profiles of their own can't under this one: `sandbox_init` fails, with `forbidden-sandbox-reinit` in the log, and such a program has to be told not to ([usage.md](usage.md#programs-under-the-sandbox)).
 
 ## The profile
 
@@ -38,7 +38,7 @@ The base rules are:
 - `signal` and `process-info*` to the sandbox's own processes, `(target same-sandbox)`, and no others.
 - Writes to `/dev/null` and `/dev/zero`.
 
-All of `/dev` is denied but `null`, `zero`, `random`, `urandom` and `/dev/fd/N`, so a command reaches a terminal, a console, a serial port, packet capture or a disk only as a descriptor it was given. A list of what to deny had missed `/dev/console` and `/dev/cu.*`. `dtracehelper`, which every process tries to open, is denied too, and Firefox renders without it.
+All of `/dev` is denied but `null`, `zero`, `random`, `urandom` and `/dev/fd/N`, so a command reaches a terminal, a console, a serial port, packet capture or a disk only as a descriptor it was given. A list of what to deny had missed `/dev/console` and `/dev/cu.*`. `dtracehelper`, which every process tries to open, is denied too.
 
 Last, the home and each `Write` path get a deny of unlink, create and hard link at their own path, so the sandbox can't remove, rename, replace or hard-link its own root ([findings](findings.md#a-sandbox-could-replace-its-own-home-with-a-link)).
 
@@ -226,20 +226,21 @@ Any local process reaches these ports too. A command that serves must bind `127.
 
 ## The environment, the home and temporary files
 
-`Start` sets `HOME`, `TMPDIR`, `XDG_RUNTIME_DIR` and `XDG_*` over `Cmd.Env`, as on Linux. It also sets `CFFIXED_USER_HOME` to the home, since Cocoa finds `~/Library` by that and not by `$HOME`.
+`Start` sets `HOME`, `TMPDIR`, `XDG_RUNTIME_DIR` and `XDG_*` over `Cmd.Env`, as on Linux. It also sets `CFFIXED_USER_HOME` to the home, since Cocoa finds `~/Library` by that and not by `$HOME`. Without it a Cocoa program reaches for the real `~/Library`, which the profile covers and TCC guards. Some lookups still resolve the real path themselves, such as CFPreferences' of `~/Library/Preferences` and `getconf DARWIN_USER_TEMP_DIR`, and the covers refuse them.
 
 `TMPDIR` and `XDG_RUNTIME_DIR` are a directory named `tmp` in the home, which `Start` makes with mode 0700. There's no private `/tmp`, so a program that hard-codes `/tmp` is refused. The directory has no size cap beyond `RLIMIT_FSIZE` per file, and stays until the caller removes the home. `ScratchSize` and `Hostname` are ignored.
 
 ## Services
 
-A `Service` is a reviewed group of Mach services to allow lookups of. There are two, each with the evidence it came from:
+A `Service` is a reviewed group of Mach services to allow lookups of. Each is named by the service it reaches, and each was checked with a real client of the service, with the group and without it (`TestEscapeServiceLookups`):
 
-- **`ServiceFirefox`:** `mach-register` and `mach-lookup` of `org.mozilla.machname.*`, which Firefox's processes register and look each other up by. Also the lookups of `launchservicesd` and `configd`, which it aborts or crashes without. The `launchservicesd` lookup doesn't let the command open anything, since `lsopen` is a different operation ([below](#m3-launchservices-and-lsopen)).
+- **`ServiceSystemConfiguration`:** the lookup of `configd`, where the SystemConfiguration framework and CFNetwork read the network's state and the proxy settings. With it `scutil` reads `State:/Network/Global/IPv4` (the primary interface and service) and the proxies, and without it is refused. It changes nothing, since `configd` takes changes only from root. `NetworkHost` allows the same lookup.
+- **`ServiceLaunchServices`:** the lookup of `launchservicesd`, which Cocoa programs ask about applications. With it `lsappinfo` lists and finds the session's running apps, with their pids and bundles, and without it finds none. It doesn't let the command open anything, since `lsopen` is a different operation ([below](#m2-launchservices-and-lsopen)). Not tried: whether `lsappinfo`'s operations that change an app's information work through it, since a test that succeeded would change the user's session. Changes to the LaunchServices database go through `com.apple.lsd.modifydb`, which no group allows.
 - **`ServiceDirectory`:** the `opendirectoryd.libinfo` lookup, which `getpwuid` and `getpwnam` use. Without it they find nothing, since the sandbox has no passwd entry of its own, and `id -un` prints only the number. With it the command can look up, and list, every account on the host.
 
-The `org.mozilla.machname.` names are one namespace for the whole user session, shared with the user's own Firefox and with every other sandbox given this group. So two sandboxes can find each other's services and pass ports, and one can register a name before the other. Firefox 160.0.1 builds the name from a compiled-in format (`org.mozilla.machname.%d`, as `strings` on its `XUL` shows) and has no setting that was found for a prefix per instance. So the group can't be narrowed to one sandbox's own processes. If the sandboxes don't trust each other, run Firefox sandboxes one at a time, and not beside another program that registers such names.
+No group allows `mach-register`. A registered name is in the bootstrap namespace of the user's whole session, not the sandbox's, so a sandbox allowed to register under a prefix can take a name that a program outside looks up, before that program does, and receive what it is sent ([findings](findings.md#a-sandbox-could-take-a-mach-name-from-outside)). A program whose processes find each other by registered names doesn't run.
 
-A fonts group isn't defined: Firefox renders text from `/System/Library/Fonts` with file reads alone, and a group needs evidence. `Command` refuses a name it doesn't know.
+`Command` refuses a name it doesn't know.
 
 ## Limits
 
@@ -260,12 +261,12 @@ An error that says no process is left means the command and all it started have 
 - **No control socket.** The parent binds the listeners, so settings, the reply and the lifeline are pipes.
 - **`Command` binds the `Listen` listeners and reserves the `Loopback` ports**, since `ListenAddrs` and `LoopbackPorts` are known before `Start`. `Start` frees the reserved ports just before the command can bind them. A `Cmd` that is never started gives its sockets back when its context ends.
 - **`SelfPath`** is a variable, the binary's real path, and every profile lets the command read and run exactly that file. On Linux it's the constant `/dev/sandbox-stage`.
-- **`Service`** names only two groups, and `Command` refuses any other.
+- **`Service`** names three groups, and `Command` refuses any other.
 - **`Kernel`.** Every level gets the one profile, which is at least as strict as the request.
 - **`argv[0]`** of the command is the `PATH`-resolved path, since `sandbox-exec` takes the program and not a name for it.
 - **The command can't call `setsid`** (it leads its group), but its children can, and it can leave the group with `setpgid`. Neither matters to teardown now.
 - **Unix sockets.** The command can't bind one anywhere, which Linux allows.
-- **Firefox's `Library/Application Support`** in the home is made with an ACL that denies deletion, so a caller that removes the home runs `chmod -RN` on it first.
+- **ACLs in the home.** A program can make a directory in the home with an ACL that denies deletion, as one was seen to do for `Library/Application Support`, so a caller that removes the home runs `chmod -RN` on it first.
 
 ## Probe and Check
 
@@ -290,7 +291,7 @@ Its `Checks` end with a `NotEnforceable` finding for each gap: no pid namespace,
 
 ## Measurements from the early experiments
 
-Three experiments on macOS 27.0.1 (Apple silicon) settled the design. Their code was throwaway, and what they measured is kept here.
+Two experiments on macOS 27.0.1 (Apple silicon) settled the design. Their code was throwaway, and what they measured is kept here.
 
 ### M1: Seatbelt's per-port deny
 
@@ -303,39 +304,14 @@ The question was whether a profile could allow `localhost` broadly and deny sing
 
 So `NetworkNone` with single-port allows holds. A later finding showed one form of broad-then-deny does work, and it's the one `NetworkHost` uses ([findings](findings.md#a-localhost-deny-held-in-only-one-form)).
 
-### M2: headless Firefox under sandbox-exec
+### M2: LaunchServices and lsopen
 
-Firefox 160 renders a page under a deny-default profile, byte-identical to an unsandboxed render. [usage.md](usage.md#firefox) says how to run it. What the experiment measured:
-
-- **The first attempt hung with no sandbox at all.** `~/Library/Application Support/Firefox` is protected by TCC on macOS 27, and reading it without Full Disk Access fails with `EPERM`. Firefox 152 reads it even when `-profile` points elsewhere, and spins when it can't (fixed upstream in Firefox 158). The fix is `CFFIXED_USER_HOME` pointed at an empty directory, which is why `Start` sets it.
-- **The `sandbox_extension_issue_file_to_process … Operation not permitted` line is noise.** It prints on every run, including the ones that work.
-- **Child processes fail `sandbox_init`.** All of them run the same `plugin-container` binary, and a process already inside a profile can't apply another (`forbidden-sandbox-reinit` in the log):
-
-  | Child | Unswitched | Switch that fixes it |
-  |---|---|---|
-  | content (tab) | crash loop: 523 `sandbox_init` failures in 25 s, no screenshot | `MOZ_DISABLE_CONTENT_SANDBOX=1` |
-  | socket | fails init; the render still completes | `MOZ_DISABLE_SOCKET_PROCESS_SANDBOX=1` |
-  | RDD | fails init; the render still completes | `MOZ_DISABLE_RDD_SANDBOX=1` |
-  | GPU, utility, GMP | never started for this page | their switches changed nothing here |
-
-- **The minimal profile** was found by widening a deny-default profile only from the deny log, then removing one rule at a time. It needs: the app bundle, `/System`, `/usr/lib` and `/` itself (a directory read); `sysctl-read`; and Mach lookups of `launchservicesd`, `configd` and `org.mozilla.machname.*`, which Firefox also registers. Dropping `launchservicesd` aborts it (`SIGABRT`) and dropping `configd` crashes it (`SIGSEGV`).
-- **About 25 other Mach services are looked up and refused with no effect**, among them `windowserver.active`, `CARenderServer`, `tccd`, `opendirectoryd.*`, `diagnosticd`, `logd`, `pasteboard.1` and `dock.server`.
-- **`iokit-open` isn't needed.** Firefox asks for `IOSurfaceRootUserClient`, `AGXDeviceUserClient` and `AppleNVMeEANUC` and is refused each time. Headless falls back to software rendering, and the PNG is unchanged.
-- **Refused with no effect:** `/Library/Fonts`, `/usr/share` (ICU, zoneinfo), `/dev/urandom` (Firefox uses `getentropy`), `/dev/null`, `/private/etc/passwd`, `/Library/Preferences/*`, and `file-read-metadata` almost everywhere else. The page's Helvetica comes from `/System/Library/Fonts`.
-- **`/Users` stays covered.** Firefox still tries the real `~/Library/Preferences/*.plist` through CFPreferences, which resolves that path itself, and `$(getconf DARWIN_USER_TEMP_DIR)/firefox`, despite `TMPDIR`. All are refused with no effect on the render. Nothing was written outside the run directory.
-- **Other refused operations:** `signal` to another process from a system framework, `system-socket domain:17` (`AF_ROUTE`), `network-outbound /private/var/run/mDNSResponder` (so no DNS under `NetworkNone`), and `file-issue-extension`.
-- **A failure that looks like success.** Without the `mach-register` rule, children can't check in (`bootstrap_check_in failed`), yet Firefox exits 0 and writes no PNG. The caller has to check that the output exists.
-- **Network.** A page that loads a green image from one loopback port and a blue one from another got the green one only when the profile allowed that one port. With no network rule it got neither, and a `file://` page still rendered.
-- **Not run:** geckodriver and Marionette under the profile, trmnlp's runtimes, web fonts and media, and windowed-mode parity.
-
-### M3: LaunchServices and lsopen
-
-Firefox needs a lookup of `launchservicesd`. The question was whether that lets a sandboxed process open an app or a URL, which would start a process outside the profile. It doesn't. The test ran `open -g` on an app and on a URL, with a local server logging requests, since a URL open reaches the default browser outside the profile:
+`ServiceLaunchServices` allows a lookup of `launchservicesd`. The question was whether that lets a sandboxed process open an app or a URL, which would start a process outside the profile. It doesn't. The test ran `open -g` on an app and on a URL, with a local server logging requests, since a URL open reaches the default browser outside the profile:
 
 | Profile | App open | URL open | Key denial |
 |---|---|---|---|
-| Firefox's set plus `open`, without `launchservicesd` | fails | fails | not needed |
-| plus `launchservicesd` (Firefox's set) | fails, `kLSNoExecutableErr` | fails, no request logged | lookups of `lsd.mapdb`, `lsd.modifydb`, `coreservicesd` |
+| A deny-default profile with what `open` reads, without `launchservicesd` | fails | fails | not needed |
+| plus `launchservicesd`, with `configd` and a group of registered Mach names since removed | fails, `kLSNoExecutableErr` | fails, no request logged | lookups of `lsd.mapdb`, `lsd.modifydb`, `coreservicesd` |
 | plus those services and the file and system rules they asked for | fails, error -54 | fails, error -54, no request logged | `deny(1) lsopen` |
 | plus `(allow lsopen)` | **Calculator launched** | **Safari fetched the beacon** | none |
 

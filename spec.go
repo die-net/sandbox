@@ -150,6 +150,8 @@ func (n *Network) Set(v string) error {
 }
 
 // Service is a reviewed group of macOS Mach services a sandbox may look up.
+// Each is named by the service it allows, and none lets the command register
+// a Mach name, since names are one namespace for the user's whole session.
 // Linux ignores the field. macOS refuses a name it does not know, so a typo
 // cannot quietly leave a service out or put one in. Adding a group is a
 // reviewed change to this package, as adding a system call to the Linux
@@ -157,13 +159,21 @@ func (n *Network) Set(v string) error {
 type Service string
 
 const (
-	// ServiceFirefox is what headless Firefox needs beyond the base profile:
-	// the Mach ports its own processes register and look each other up by
-	// (org.mozilla.machname.*), and LaunchServices' and configd's lookups,
-	// which it aborts or crashes without. The lookup of LaunchServices does
-	// not let a process open an app or a URL, since that is the lsopen
-	// operation, which no profile here ever allows (docs/macos.md, M3).
-	ServiceFirefox Service = "firefox"
+	// ServiceSystemConfiguration lets the command look up configd
+	// (com.apple.SystemConfiguration.configd), where the SystemConfiguration
+	// framework and CFNetwork read the network's state and the proxy
+	// settings. It lets the command read them: the interfaces and their
+	// addresses, the primary service, DNS and proxies. It changes nothing,
+	// since configd takes changes only from root. NetworkHost allows the same
+	// lookup.
+	ServiceSystemConfiguration Service = "systemconfiguration"
+	// ServiceLaunchServices lets the command look up launchservicesd
+	// (com.apple.coreservices.launchservicesd), which Cocoa programs ask about
+	// applications. It also lets the command list the user's running
+	// applications, with their pids and bundles. It does not let it open an
+	// app or a URL, which is the lsopen operation that no profile here allows
+	// (docs/macos.md, LaunchServices and lsopen).
+	ServiceLaunchServices Service = "launchservices"
 	// ServiceDirectory lets the command look accounts up through Directory
 	// Services (getpwuid, getpwnam). Without it those find nothing, since the
 	// sandbox has no passwd entry of its own on macOS. It also lets the command list every
