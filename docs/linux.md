@@ -82,7 +82,7 @@ bubblewrap doesn't start the command itself. With `--as-pid-1`, it starts this b
 2. Joins a new, anonymous session keyring, so the sandbox doesn't share the caller's.
 3. Drops every capability, its bounding set included, and sets `no_new_privs`. Both belong to a thread, so it does this on the one thread it has locked, the one that execs next. It also asks to die with bubblewrap's outer process.
 4. Execs itself again. `unshare` moves only the calling thread, which leaves the whole of pid 1 in the new namespace and no process inside in bubblewrap's. The new image starts with that one thread's empty sets, so no thread of pid 1 holds a capability, and neither does the command, even as uid 0 inside. This second run, the reaper, makes itself undumpable, so the command can't open its memory, descriptors or root through `/proc`.
-5. Reads its settings from the control socket, binds the `Listen` listeners, sets the `Rlimits` (pid 1 holds them too), marks every inherited descriptor but the command's own close-on-exec, and installs the seccomp filter on all its threads.
+5. Reads its settings from the control socket, binds the `Listen` listeners, sets the `Rlimits` (pid 1 holds them too), marks every inherited descriptor but the command's own close-on-exec (with `close_range`, or from `/proc/self/fd` before Linux 5.11, and if neither works it starts nothing and replies with the error), and installs the seccomp filter on all its threads.
 6. Sends the caller the listeners, or its setup error, on the control socket, and closes the socket.
 7. Starts the command. It then passes any `SIGTERM` or `SIGHUP` it gets on to the command, reaps orphans, and exits with the command's status, which ends everything left inside.
 

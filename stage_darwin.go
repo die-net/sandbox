@@ -143,6 +143,10 @@ type stageOptions struct {
 	// budget is how long the stage's teardowns keep scanning. Zero is
 	// teardownBudget.
 	budget time.Duration
+	// fdDir, if set, is the directory markCloseOnExec lists the stage's
+	// descriptors from in place of /dev/fd, so that a test can make the listing
+	// fail.
+	fdDir string
 }
 
 // killAll ends the command's group and every other process under the
@@ -226,7 +230,7 @@ func supervise(command []string, opts stageOptions) (int, error) {
 		return 0, err
 	}
 	st.mark = settings.Marker
-	child, send, err := startCommand(settings, command, &st.mu, &st.group)
+	child, send, err := startCommand(settings, command, opts, &st.mu, &st.group)
 	if err != nil {
 		_ = json.NewEncoder(st.status).Encode(stageReply{Kind: kindReply, Error: err.Error()})
 		_ = st.status.Close()
@@ -344,7 +348,7 @@ func (s stageSettings) check() error {
 // stage killed after the fork and before the exec went on to apply it and run
 // the command, which the caller, with no reply, had no pid to look for
 // (docs/findings.md).
-func startCommand(s stageSettings, command []string, mu *sync.Mutex, group *int) (p *os.Process, send func(), err error) {
+func startCommand(s stageSettings, command []string, opts stageOptions, mu *sync.Mutex, group *int) (p *os.Process, send func(), err error) {
 	// The command is looked up on the PATH the stage was given, which is the
 	// command's, from the working directory the command starts in.
 	path, err := exec.LookPath(command[0])
@@ -363,8 +367,11 @@ func startCommand(s stageSettings, command []string, mu *sync.Mutex, group *int)
 	}
 	// Every inherited descriptor but the command's own is marked close-on-exec,
 	// and none is closed by number: once the Go runtime is up, a number may be
-	// one of its own.
-	markCloseOnExec()
+	// one of its own. A stage that can't mark them starts nothing, since the
+	// command would inherit the stage's.
+	if err := opts.markCloseOnExec(); err != nil {
+		return nil, nil, err
+	}
 	// Stdin, stdout and stderr, then the caller's files, then the profile.
 	files := []*os.File{os.Stdin, os.Stdout, os.Stderr}
 	for i := range s.Files {
@@ -415,17 +422,23 @@ func startCommand(s stageSettings, command []string, mu *sync.Mutex, group *int)
 
 // markCloseOnExec sets close-on-exec on every open descriptor from 3 up,
 // including the ones the command is given, which os.StartProcess maps to
-// their places in it and which lose the flag there. /dev/fd lists them.
-func markCloseOnExec() {
-	ents, err := os.ReadDir("/dev/fd")
+// their places in it and which lose the flag there. /dev/fd lists them. It
+// fails if it can't list them, since it can't tell which it missed.
+func (o stageOptions) markCloseOnExec() error {
+	dir := o.fdDir
+	if dir == "" {
+		dir = "/dev/fd"
+	}
+	ents, err := os.ReadDir(dir)
 	if err != nil {
-		return
+		return fmt.Errorf("mark descriptors close-on-exec: %w", err)
 	}
 	for _, e := range ents {
 		if fd, err := strconv.Atoi(e.Name()); err == nil && fd >= 3 {
 			unix.CloseOnExec(fd)
 		}
 	}
+	return nil
 }
 
 // killGroup ends every process in the group, and keeps going until none is

@@ -326,13 +326,19 @@ A Fable review of the proof-based teardown, reading the code against XNU's sourc
 
 ## Found in the code and plans of the projects that adopt it
 
-These came from the code and plans of the project the library was extracted from, which changed to meet them. Most are for the adopting program to get right, not the sandbox, and are listed in [usage.md](usage.md#files-a-caller-handles-for-a-run). Two are about the library itself.
+These came from the code and plans of the project the library was extracted from, which changed to meet them, and from those projects' reviews of the library. Most are for the adopting program to get right, not the sandbox, and are listed in [usage.md](usage.md#files-a-caller-handles-for-a-run). Three are about the library itself.
 
 ### bubblewrap as root maps the sandbox to host uid 0
 
 - **How it worked.** bubblewrap run as root maps the sandbox to host uid 0. A launcher that ran it as root gave the command root's identity in the user namespace.
 - **What stops it.** A launcher switches to the child's uid before it runs bubblewrap, so it needs user namespaces as much as any other way of running. `Command` refuses to run as root for the same reason.
 - **Test.** `TestEscapeRefusesEuid0` and `TestCommandRefusesRoot`.
+
+### A stage that couldn't list its descriptors started the command anyway
+
+- **How it worked.** The stage marks every descriptor it inherited close-on-exec before it starts the command. On macOS it lists them from `/dev/fd`, and on Linux it uses `close_range` and falls back to `/proc/self/fd`. When the listing failed, or on Linux both did, the stage went on, and the command would have inherited the stage's own descriptors. With the failure forced, the Linux command held the lifeline's pipe at descriptor 6. Nothing seen on a real host made the listing fail. An adopting project's review of the code found it.
+- **What stops it.** A stage that can't mark its descriptors starts nothing, and replies with the error, so `Start` fails.
+- **Test.** `TestStageThatCannotMarkDescriptorsStartsNothing` on Linux and `TestStageThatCannotListDescriptorsStartsNothing` on macOS make the listing fail through `stageOptions.fdDir`, and on Linux skip `close_range` through `stageOptions.noCloseRange`. The Linux test also checks that the listing alone leaves the command no setup descriptor, as on a kernel before 5.11.
 
 ### macOS `open` allowed any service but the keychain
 

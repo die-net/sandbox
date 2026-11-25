@@ -86,6 +86,25 @@ const maxMessage = 1 << 16
 // and reports false otherwise. A program that uses this package calls it
 // first in main, before it reads its arguments.
 func Stage() (int, bool) {
+	return runStage(stageOptions{})
+}
+
+// stageOptions changes what a stage does, for a test binary. A test binary is
+// its own stage, so only its TestMain can configure the stage, and it calls
+// runStage with the options. Stage passes the zero value, which is what a
+// program runs, and nothing a caller sends the stage can set these.
+type stageOptions struct {
+	// noCloseRange, if set, makes markCloseOnExec skip close_range, as on a
+	// kernel before 5.11, so that a test reaches the listing it falls back to.
+	noCloseRange bool
+	// fdDir, if set, is the directory markCloseOnExec lists the stage's
+	// descriptors from in place of /proc/self/fd, so that a test can make the
+	// listing fail.
+	fdDir string
+}
+
+// runStage is Stage with options.
+func runStage(opts stageOptions) (int, bool) {
 	// The check child is started with checkArg, and runs the checks and
 	// nothing else.
 	if len(os.Args) > 1 && os.Args[1] == checkArg {
@@ -99,7 +118,7 @@ func Stage() (int, bool) {
 	if os.Args[1] == stageArg {
 		err = firstStage()
 	} else {
-		code, err = reaperStage(os.Args[3:])
+		code, err = reaperStage(os.Args[3:], opts)
 	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "sandbox: %v\n", err)
@@ -173,7 +192,7 @@ func firstStage() error {
 // is left. It exits as well when the lifeline reaches EOF, which is when
 // the parent has gone, however it went. The filter goes on here rather than
 // through bubblewrap, since it refuses the calls the first stage makes.
-func reaperStage(command []string) (int, error) {
+func reaperStage(command []string, opts stageOptions) (int, error) {
 	// Undumpable belongs to the process, and execve resets it, so it is
 	// set here rather than in the first stage.
 	if err := unix.Prctl(unix.PR_SET_DUMPABLE, 0, 0, 0, 0); err != nil {
@@ -192,7 +211,7 @@ func reaperStage(command []string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	path, listeners, err := setup(settings, command)
+	path, listeners, err := setup(settings, command, opts)
 	if err != nil {
 		// The parent is waiting for the control socket's one message.
 		_ = send(stageReply{Error: err.Error()}, nil)
@@ -275,7 +294,7 @@ func receiveSettings() (stageSettings, error) {
 
 // setup does everything the command needs of pid 1 before it starts, and
 // returns the path to start and the listeners it bound.
-func setup(s stageSettings, command []string) (string, []*net.TCPListener, error) {
+func setup(s stageSettings, command []string, opts stageOptions) (string, []*net.TCPListener, error) {
 	if err := s.Kernel.Set(string(s.Kernel)); err != nil {
 		return "", nil, err
 	}
@@ -311,8 +330,12 @@ func setup(s stageSettings, command []string) (string, []*net.TCPListener, error
 	}
 	// Every inherited descriptor but the command's own gets
 	// close-on-exec, and none is closed by number: once the Go runtime is
-	// up, a number may be one of its own, such as its epoll descriptor.
-	markCloseOnExec()
+	// up, a number may be one of its own, such as its epoll descriptor. A
+	// stage that can't mark them starts nothing, since the command would
+	// inherit the stage's.
+	if err := opts.markCloseOnExec(); err != nil {
+		return fail(err)
+	}
 	if err := installSeccomp(s.Kernel); err != nil {
 		return fail(err)
 	}
@@ -321,21 +344,30 @@ func setup(s stageSettings, command []string) (string, []*net.TCPListener, error
 
 // markCloseOnExec sets close-on-exec on every open descriptor from 3 up,
 // including the ones the command is given, which os.StartProcess maps to
-// their places in it and which lose the flag there.
-func markCloseOnExec() {
-	if err := unix.CloseRange(3, math.MaxUint32, unix.CLOSE_RANGE_CLOEXEC); err == nil {
-		return
+// their places in it and which lose the flag there. It fails if neither
+// close_range nor a listing of /proc/self/fd works, since it can't tell which
+// descriptors it missed.
+func (o stageOptions) markCloseOnExec() error {
+	if !o.noCloseRange {
+		if err := unix.CloseRange(3, math.MaxUint32, unix.CLOSE_RANGE_CLOEXEC); err == nil {
+			return nil
+		}
 	}
 	// Before Linux 5.11.
-	ents, err := os.ReadDir("/proc/self/fd")
+	dir := o.fdDir
+	if dir == "" {
+		dir = "/proc/self/fd"
+	}
+	ents, err := os.ReadDir(dir)
 	if err != nil {
-		return
+		return fmt.Errorf("mark descriptors close-on-exec: %w", err)
 	}
 	for _, e := range ents {
 		if fd, err := strconv.Atoi(e.Name()); err == nil && fd >= 3 {
 			unix.CloseOnExec(fd)
 		}
 	}
+	return nil
 }
 
 // send sends the parent the one message the control socket carries back,

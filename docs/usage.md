@@ -60,7 +60,7 @@ A `Kernel` level is only ever raised. A level the host can't meet is an error fr
 
 ## Passing descriptors
 
-An `*os.File` in `Spec.Files` reaches the command as descriptor 3, 4 and so on. The caller keeps them open and can close them after `Start`. Only descriptors 0 to 2 and the `Files` are open in the command. Everything else the stage inherited is marked close-on-exec.
+An `*os.File` in `Spec.Files` reaches the command as descriptor 3, 4 and so on. The caller keeps them open and can close them after `Start`. Only descriptors 0 to 2 and the `Files` are open in the command. Everything else the stage inherited is marked close-on-exec. A stage that can't mark them starts nothing, and `Start` returns its error.
 
 A descriptor grants whatever its object's owner and mode let the sandbox's uid do, whatever mode the caller opened it in and whatever the sandbox covers. On Linux the command can reopen a file through `/proc/self/fd/N` with more access: a read-only file under a covered directory can be rewritten, and an append-only log can be truncated. So where a limit matters, pass a pipe or a socket. A socket can't be reopened, and a pipe reopens only as another end of the same pipe. `Stdin`, `Stdout` and `Stderr` that are any other `io.Reader` or `io.Writer` are copied through a pipe, which has the same property.
 

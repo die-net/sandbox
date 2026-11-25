@@ -430,6 +430,35 @@ func TestCommandHoldsNoSetupDescriptors(t *testing.T) {
 	}
 }
 
+// Row: "Descriptors handed in". A stage that can't mark its descriptors
+// close-on-exec, because close_range fails and /proc/self/fd can't be listed,
+// starts nothing, since the command would inherit the stage's own, and Start
+// fails. With close_range failing alone, the stage lists /proc/self/fd, as on
+// a kernel before 5.11, and the command holds no setup descriptor.
+func TestStageThatCannotMarkDescriptorsStartsNothing(t *testing.T) {
+	t.Parallel()
+	t.Run("listing", func(t *testing.T) {
+		t.Parallel()
+		r := runReport(t, Spec{}, []string{stageNoCloseRangeEnv + "=1"})
+		if len(r.Fds) != 0 {
+			t.Errorf("the command holds descriptors from 3 up: %v", r.Fds)
+		}
+	})
+	t.Run("neither", func(t *testing.T) {
+		t.Parallel()
+		c, stdout, stderr := testCmd(t.Context(), t, Spec{}, "report")
+		c.Env = []string{stageNoCloseRangeEnv + "=1", stageFdDirEnv + "=/nonexistent"}
+		err := c.Start()
+		if err == nil {
+			_ = c.Wait()
+			t.Fatalf("Start succeeded though the stage could not mark its descriptors, and the command reported %s", stdout)
+		}
+		if !strings.Contains(err.Error(), "close-on-exec") {
+			t.Errorf("Start = %v, want the stage's error: %s", err, stderr)
+		}
+	})
+}
+
 // startSleeper starts a sandbox whose command waits to be killed, once it
 // has said so.
 func startSleeper(ctx context.Context, t *testing.T) *Cmd {
