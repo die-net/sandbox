@@ -193,8 +193,9 @@ func escTTYMode(args []string) int {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	// The command reads a line, which the test types once it sees this.
-	time.Sleep(300 * time.Millisecond)
+	// Start returns once the stage has started sandbox-exec, and so after any
+	// foreground it gave the command. The test types the line the command
+	// reads once it sees this.
 	fg, _ := unix.IoctlGetInt(0, unix.TIOCGPGRP)
 	fmt.Println("caller-foreground", fg == unix.Getpgrp())
 	if err := c.Wait(); err != nil {
@@ -246,6 +247,11 @@ func TestOwnSessionTerminal(t *testing.T) {
 		_ = cmd.Process.Kill()
 		t.Fatalf("the command did not read the line: it was stopped, or never got it\n%s", text())
 	}
+	// esc-tty's last line was written to the pty before it exited, but the
+	// copy from the master may not have read it yet.
+	eventually(t, 10*time.Second, "esc-tty's last line never came through the pty\n", func() bool {
+		return strings.Contains(text(), "caller-foreground-again ")
+	})
 	_ = master.Close()
 	for _, want := range []string{"caller-foreground true", "got typed-line", "caller-foreground-again true"} {
 		if !strings.Contains(text(), want) {
