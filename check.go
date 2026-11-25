@@ -697,6 +697,15 @@ func checkWrites(e *checkEnv) []Result {
 // coverLimit bounds the entries looked at under one cover.
 const coverLimit = 5000
 
+// checkedCovers returns the covers the checks try, sorted and each once: the
+// default covers and spec's, which the child gets prepared, so its Cover
+// already holds the defaults that exist on the host.
+func checkedCovers(spec *Spec) []string {
+	covers := slices.Concat(defaultCover, spec.Cover)
+	slices.Sort(covers)
+	return slices.Compact(covers)
+}
+
 func checkCovers(e *checkEnv) []Result {
 	if e.spec == nil {
 		return []Result{skipped("covers", "no sandbox spec given")}
@@ -706,9 +715,7 @@ func checkCovers(e *checkEnv) []Result {
 	// lead to under a cover.
 	shown := slices.Concat([]string{e.spec.Home, e.spec.Dir}, e.spec.Write, e.spec.Read, e.scratch)
 	shown = slices.DeleteFunc(shown, func(s string) bool { return s == "" })
-	covers := slices.Concat(defaultCover, e.spec.Cover)
-	slices.Sort(covers)
-	covers = slices.Compact(covers)
+	covers := checkedCovers(e.spec)
 	res := make([]Result, 0, len(covers))
 	for _, c := range covers {
 		name := "covers:" + c

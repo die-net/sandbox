@@ -233,7 +233,7 @@ func TestSpecDrivenChecks(t *testing.T) {
 // mount points in the cover. They are not in the caller's Spec, so a check
 // that judged by it failed every Ubuntu host, and the check stays strict for
 // any other entry.
-// Row: Covers.
+// Row: "Self-checks".
 func TestCheckSpecCoversShowLinkedFiles(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
@@ -298,6 +298,21 @@ func TestCheckSpecCoversShowLinkedFiles(t *testing.T) {
 		if err := os.Remove(extra); err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+// TestCheckedCoversListsEachOnce checks that a default cover that the prepared
+// Spec names too is tried once. The child's Cover holds the defaults that exist
+// on the host, and a list that kept both tried each one twice under
+// KernelNested, a namespace child per copy.
+// Row: "Self-checks".
+func TestCheckedCoversListsEachOnce(t *testing.T) {
+	t.Parallel()
+	spec := &Spec{Cover: slices.Concat([]string{"/zz/extra"}, defaultCover, []string{"/zz/extra"})}
+	got := checkedCovers(spec)
+	want := slices.Compact(slices.Sorted(slices.Values(slices.Concat(defaultCover, []string{"/zz/extra"}))))
+	if !slices.Equal(got, want) {
+		t.Errorf("checkedCovers = %q, want %q", got, want)
 	}
 }
 
