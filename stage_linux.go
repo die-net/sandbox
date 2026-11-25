@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"slices"
 	"strconv"
+	"sync/atomic"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -82,6 +83,11 @@ type stageReply struct {
 // maxMessage is the most the control socket's messages hold.
 const maxMessage = 1 << 16
 
+// staged records that this process called Stage. Start runs this binary
+// again inside the sandbox, so without Stage in main that run would be the
+// program's own main. Probe checks it before it starts its trial sandbox.
+var staged atomic.Bool
+
 // Stage runs one of the sandbox's stages if this process was started as it,
 // and reports false otherwise. A program that uses this package calls it
 // first in main, before it reads its arguments.
@@ -105,6 +111,7 @@ type stageOptions struct {
 
 // runStage is Stage with options.
 func runStage(opts stageOptions) (int, bool) {
+	staged.Store(true)
 	// The check child is started with checkArg, and runs the checks and
 	// nothing else.
 	if len(os.Args) > 1 && os.Args[1] == checkArg {

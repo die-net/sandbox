@@ -1,6 +1,6 @@
 #!/bin/sh
 # Load or remove the AppArmor profile the library prints for a test binary,
-# which Ubuntu 24.04 needs before bubblewrap can make a user namespace.
+# which Ubuntu 24.04 and 26.04 need before a sandbox can start.
 #   scripts/apparmor.sh load   /path/to/sandbox.test
 #   scripts/apparmor.sh remove /path/to/sandbox.test
 # It runs where the binary runs, as the test account, and uses sudo. The

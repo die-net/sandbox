@@ -16,7 +16,7 @@
 # (on PATH, /usr/local/go/bin, or /usr/local/bin) and gcc.
 #
 # SBX_APPARMOR=1 loads the AppArmor profile for the test binary before the
-# tests and removes it after, with scripts/apparmor.sh. Ubuntu 24.04 needs it.
+# tests and removes it after, with scripts/apparmor.sh. Ubuntu 24.04 and 26.04 need it.
 # Without it the tests fail there, which is the library's behavior.
 set -euo pipefail
 

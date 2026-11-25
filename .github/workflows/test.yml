@@ -26,12 +26,16 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: "0"
 
+  # Ubuntu 26.04 also attaches an AppArmor profile to /usr/bin/bwrap that
+  # denies capabilities to what bubblewrap starts, whatever the sysctl says,
+  # which the library's profile undoes for the test binary (docs/linux.md).
   test:
-    name: test linux/amd64 cgo=${{ matrix.cgo }}
-    runs-on: ubuntu-24.04
+    name: test ${{ matrix.os }} linux/amd64 cgo=${{ matrix.cgo }}
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-24.04, ubuntu-26.04]
         cgo: ["0", "1"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -43,7 +47,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y bubblewrap
           bwrap --version
-      # Ubuntu 24.04 sets kernel.apparmor_restrict_unprivileged_userns=1, so
+      # Ubuntu sets kernel.apparmor_restrict_unprivileged_userns=1, so
       # bubblewrap can make a user namespace only for a program with an
       # AppArmor profile that allows it. scripts/apparmor.sh loads the profile
       # the library prints for the test binary, and removes it after.
@@ -56,6 +60,13 @@ jobs:
         env:
           SBX_LOCAL: "1"
           SBX_APPARMOR: "1"
+          CGO: ${{ matrix.cgo }}
+      # Without the profile no sandbox starts here. TestProbeVM checks that
+      # Probe says so, and names the fix, rather than passing.
+      - name: Probe without the profile
+        run: scripts/linux-test.sh -test.v -test.run '^TestProbe'
+        env:
+          SBX_LOCAL: "1"
           CGO: ${{ matrix.cgo }}
 
   # The tests start real sandboxes with /usr/bin/sandbox-exec, as the runner's

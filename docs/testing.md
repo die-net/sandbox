@@ -38,10 +38,11 @@ The counts include subtests, and are the same with and without cgo. They are the
 | Debian 12, arm64, kernel 6.1, bubblewrap 0.8.0 from apt, Lima VM `sbx-debian12` | `SBX_VM=sbx-debian12` | 294 | 5 | 0 |
 | Debian 13, x86_64, Proxmox kernel 7.0.14, LXC container, bubblewrap 0.12.0 | `SBX_SSH=user@host` | 293 | 5 | 0 |
 | Ubuntu 24.04.5, arm64, kernel 6.8, bubblewrap 0.9.0 from apt, AppArmor restriction on, Lima VM `sbx-ubuntu` | `SBX_VM=sbx-ubuntu SBX_APPARMOR=1` | 293 | 5 | 0 |
+| Ubuntu 26.04.1, arm64, kernel 7.0, bubblewrap 0.11.1 from apt, AppArmor 5.0.2 with its `bwrap` profile, Lima VM `sbx-ubuntu2604`, with `kernel.apparmor_restrict_unprivileged_userns` at 1 and at 0 | `SBX_VM=sbx-ubuntu2604 SBX_APPARMOR=1` | 302 | 5 | 0 |
 
-Each was run with `CGO_ENABLED=0` and with cgo on (`CGO=1`, which builds on the target, since the host has no C cross-compiler). Each was rerun after the macOS review fixes. Debian 12 was run at v0.1.0 with `CGO_ENABLED=0` only. Debian 13 run at the same time also gave 294 passes and the same 5 skips, so the older rows' 293 predates one more subtest.
+Each was run with `CGO_ENABLED=0` and with cgo on (`CGO=1`, which builds on the target, since the host has no C cross-compiler). Each was rerun after the macOS review fixes. Debian 12 was run at v0.1.0 with `CGO_ENABLED=0` only. Debian 13 run at the same time also gave 294 passes and the same 5 skips, so the older rows' 293 predates one more subtest. Ubuntu 26.04 was run with `CGO_ENABLED=0` only, since its VM has no Go, and CI runs it with cgo. After the AppArmor profile and `Probe`'s trial changed for 26.04, `sbx-dev`, `sbx-ubuntu` and `sbx-debian12` were rerun with `CGO_ENABLED=0`, and each passed 302 and skipped the same 5.
 
-Without `SBX_APPARMOR=1`, the same Ubuntu run fails 159 of the tests that start a sandbox, in 11 seconds and with no hang, and `TestProbeVM` shows the diagnostic. On Ubuntu 24.04 the tests run as the account's uid under a profile for the test binary. The suite passes on apt's bubblewrap 0.9.0, and the symlink flaw fixed in 0.12.0 stays open there as [security-model.md](security-model.md#open-issues) notes.
+Without `SBX_APPARMOR=1`, the same Ubuntu run fails 159 of the tests that start a sandbox, in 11 seconds and with no hang, and `TestProbeVM` shows the diagnostic. On Ubuntu 26.04 every test that starts a sandbox fails without the profile, whether the sysctl is 1 or 0, as it did with the profile before it was rewritten ([linux.md](linux.md#probe-and-check)), and `TestProbeVM` passes, since `Probe` fails too and names `probe.apparmor-bwrap`. On Ubuntu 24.04 the tests run as the account's uid under a profile for the test binary. The suite passes on apt's bubblewrap 0.9.0, and the symlink flaw fixed in 0.12.0 stays open there as [security-model.md](security-model.md#open-issues) notes.
 
 **The skips** are the same on every target except where noted:
 
@@ -78,7 +79,7 @@ The full suite also passes on GitHub's 3-core arm64 runners, macOS 15.8.2 (`maco
 `.github/workflows/test.yml` runs on every push and pull request. It has not run yet, since this repository has no GitHub remote.
 
 - **Vet:** `go vet` for linux amd64, arm64 and arm, with `CGO_ENABLED=0`.
-- **Linux:** the tests on `ubuntu-24.04` with apt's bubblewrap, with cgo off and on. The runner keeps `kernel.apparmor_restrict_unprivileged_userns` at 1 and loads the test binary's profile, so CI exercises the fix users get (`SBX_LOCAL=1 SBX_APPARMOR=1`).
+- **Linux:** the tests on `ubuntu-24.04` and `ubuntu-26.04` with apt's bubblewrap, with cgo off and on. The runner keeps `kernel.apparmor_restrict_unprivileged_userns` at 1 and loads the test binary's profile, so CI exercises the fix users get (`SBX_LOCAL=1 SBX_APPARMOR=1`). Then it runs the `Probe` tests without the profile, where `TestProbeVM` checks that `Probe` fails, since no sandbox starts there.
 - **macOS:** `go build`, `go vet` for arm64 and amd64, and `go test` on `macos-15` and `macos-26`, with cgo off and on, and `go test -race` on the cgo leg.
 - **Go toolchain:** CI takes its Go from the `toolchain` line of `go.mod`, which is 1.26.5. Go 1.26.0 to 1.26.4 with `-race` on darwin can crash the child of a fork before it execs, with `signal: segmentation fault` from `Wait` for a program that never ran (golang/go#79804, fixed in 1.26.5 by #79806). It hit `TestProfileCutShortDoesNotRun` on `macos-26` in PR 2: the shell that runs `sandbox-exec` died before it wrote anything, so `sandbox-exec` never ran and the profile was not at fault. `TestRaceDetectorToolchainCanForkOnDarwin` fails under a `-race` build with an older Go.
 
@@ -130,7 +131,7 @@ Targets:
 | `SBX_SSH=user@host` | A machine reached by passwordless ssh. Its architecture comes from `uname -m`. |
 | `SBX_LOCAL=1` | This machine, which must be Linux. CI uses it. |
 | `CGO=1` | Build with cgo. The default is `CGO_ENABLED=0`, as releases are. Cgo needs a C compiler for the target, so the script copies the sources to the target and builds there. The target needs `go` (on `PATH`, `/usr/local/go/bin`, or `/usr/local/bin`) and `gcc`. |
-| `SBX_APPARMOR=1` | Load the AppArmor profile for the test binary before the tests and remove it after, with `scripts/apparmor.sh`. Ubuntu 24.04 needs it. Without it the tests fail there, which is the library's behavior. |
+| `SBX_APPARMOR=1` | Load the AppArmor profile for the test binary before the tests and remove it after, with `scripts/apparmor.sh`. Ubuntu 24.04 and 26.04 need it. Without it the tests fail there, which is the library's behavior. |
 
 ### The Debian 12 VM
 
@@ -142,18 +143,26 @@ limactl create --name=sbx-debian12 --cpus=4 --memory=4 --set '.mounts=[]' templa
 
 Then start it and install `bubblewrap` with apt. Run the tests with `SBX_VM=sbx-debian12 scripts/linux-test.sh`.
 
-### The Ubuntu VM
+### The Ubuntu VMs
 
-`sbx-ubuntu` is a Lima VM with Ubuntu 24.04. Make it with:
+`sbx-ubuntu` is a Lima VM with Ubuntu 24.04, and `sbx-ubuntu2604` one with Ubuntu 26.04. Make them with:
 
 ```bash
 limactl create --name=sbx-ubuntu --cpus=4 --memory=4 --set '.mounts=[]' template:ubuntu-24.04
 ```
 
-Then start it, install `bubblewrap` and `gcc` with apt, and copy Go in for cgo builds. Run the tests with:
+```bash
+limactl create --name=sbx-ubuntu2604 --cpus=4 --memory=4 --set '.mounts=[]' template:ubuntu-26.04
+```
+
+Then start each, install `bubblewrap` and `gcc` with apt, and copy Go in for cgo builds. Run the tests with:
 
 ```bash
 SBX_VM=sbx-ubuntu SBX_APPARMOR=1 scripts/linux-test.sh
+```
+
+```bash
+SBX_VM=sbx-ubuntu2604 SBX_APPARMOR=1 scripts/linux-test.sh
 ```
 
 ## Host safety on macOS
@@ -176,6 +185,7 @@ A check is only worth its passes if it fails when the guarantee is taken away. E
 
 - **Linux:** the covers, the filter, the first stage's private mounts, `--as-pid-1`, the cover of other file types, the mount order, the netfilter rule, and the four from the latest review: the sandbox's process group and foreground, the read-only `/dev` and the session keyring. The descriptor test documents a behavior and fails if it changes. The ZFS fix was checked by hand on the ZFS host.
 - **Both, the covers check on a host whose `/etc` links under a cover:** `checkSpec` returning the caller's `Spec` instead of `prepare`'s (`TestCheckSpecCoversShowLinkedFiles` fails: the `Spec` has no linked file. `TestCheckSandbox` fails on Linux: `covers:/run` and `covers:/var` fail on the empty directories that lead to the files that `/etc/resolv.conf` and the sgml catalog link to), and `checkCovers` that ignores the entries it finds (`TestCheckSpecCoversShowLinkedFiles` fails: a cover with an unexplained entry passes). `checkedCovers` without its `slices.Compact` (`TestCheckedCoversListsEachOnce` fails: a default cover that the prepared `Spec` names too is tried twice, which under `KernelNested` is a namespace child more per cover). The unit test runs on a fake host with real directories, so it needs no sandbox. **Linux:** `platformScratch` empty (`TestCheckSandbox` fails: `covers:/var` shows `/var/tmp`, the sandbox's own tmpfs).
+- **Linux, Ubuntu 26.04 and `Probe`:** the generated AppArmor profile put back in unconfined mode with only a `userns` rule (every test that starts a sandbox fails on `sbx-ubuntu2604` with `SBX_APPARMOR=1`, such as `TestIsolation`); `Probe`'s trial put back to bubblewrap alone running `true` (`TestProbeVM` fails on `sbx-ubuntu2604` without the profile: `Probe` passed while a sandbox's start failed); the trial started without the check that `Stage` ran (`TestProbeWithoutStage` fails: bubblewrap ran with `--args`); and the diagnosis without its case for bubblewrap's AppArmor label (`TestDiagnose` fails).
 - **macOS:** the foreground of the terminal, the quoting of paths, the `process-info` deny, the group kill when the command exits, the group kill when the stage is killed, the lifeline, the terminal deny, the `localhost` deny of `NetworkHost`, the covers, the signal target, the loopback port rule and the readable `SelfPath`.
 - **macOS teardown proof:** a vanished pid counted as clean (`TestScanVanishedPidForcesAnotherScan`, `TestScanBudget` and `TestTeardownReportsWhatItCouldNotConfirm` fail), and a new zombie counted as safe (`TestScanZombies` and `TestTeardownLingeringZombie` fail).
 - **macOS teardown proof, review findings:** each is a mutation that a test catches. A scan that ignores an exiting process (`TestScanExitingPidForcesAnotherScan`), `statPid` without the exit flag (`TestProcStatOfReadsTheFlagsAndTheName`), `member` that never asks the kernel whether it finds the pid (`TestMemberNeverClearsAnExitingChild`, `TestMemberOfGonePids`), and all three together (`TestRealScanIsNeverCleanWhileAChainLives`); the old In-then-Out order of checks (`TestMemberNeverMatchesAProcessApplyingAProfile`); no rule for an unsandboxed `sandbox-exec` (`TestScanSandboxExecThatHasNotAppliedItsProfile`, `TestRealScanIsNotCleanWhileSandboxExecWaitsForItsProfile`); a message kind that isn't checked (`TestStageMessagesRefuseTheWrongKind`); a list compared with the first size only (`TestListPidsAsksAgainWhenTheListMayBeCut`); a profile that isn't one form, or has its marker last (`TestProfileCutShortDoesNotRun`); a stage that always reports empty or a caller that ignores the report (`TestTeardownStageThatCannotProveLeavesItToTheCaller`); and a missing report counted as empty (`TestWaitScansWhenTheStageWasKilledAndNothingHoldsTheOutput`).

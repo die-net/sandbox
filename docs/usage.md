@@ -105,6 +105,8 @@ A program that sandboxes should tell its operator what the sandbox gives and wha
 
 An error means no sandbox can start, and `Report.Checks` says why. Refuse to run untrusted code only then. Log the report once, and print the first failed finding's `Detail`, which holds the fix.
 
+On Linux, `Probe` starts a real trial sandbox, as `Start` does, so it needs what `Command` needs. It refuses root, and it needs `Stage` first in `main`, since the trial's first stage runs this binary again. In a program that never called `Stage` it starts no sandbox, and its `probe.stage` check fails and says so.
+
 On macOS, `Checks` also lists each gap as `NotEnforceable`.
 
 ### Check
@@ -140,7 +142,10 @@ A pass means one attempt failed, not that every path is closed. The checks have 
 | Finding | How it's detected | Fix |
 |---|---|---|
 | bubblewrap missing, setuid, or older than 0.8 | `PATH`, mode bits, `--version` | The distribution's package. |
-| Ubuntu's AppArmor restriction on user namespaces | `kernel.apparmor_restrict_unprivileged_userns=1`, and the trial sandbox fails | An AppArmor profile for this binary's path with a `userns` rule, which `Probe` prints, plus the commands to load it. A child profile for bubblewrap doesn't work ([linux.md](linux.md#probe-and-check)). |
+| Running as root (`probe.root`) | The effective uid is 0 | Switch to the sandbox's own uid first, as for `Command`. |
+| No `Stage` (`probe.stage`) | `Stage` never ran in this process | Call `sandbox.Stage` first in `main`. |
+| bubblewrap under another AppArmor profile, as on Ubuntu 26.04 (`probe.apparmor-bwrap`) | A program bubblewrap starts has another AppArmor label than this one, such as `bwrap//&unpriv_bwrap`, and the trial sandbox fails | The AppArmor profile for this binary's path, which `Probe` prints, plus the commands to load it. The sysctl below doesn't help here. |
+| Ubuntu's AppArmor restriction on user namespaces (`probe.apparmor-userns`) | `kernel.apparmor_restrict_unprivileged_userns=1`, and the trial sandbox fails | The same profile. It allows everything to this binary and every process it starts, which then stay in it, outside the sandbox too ([linux.md](linux.md#probe-and-check)). |
 | User namespaces turned off | `kernel.unprivileged_userns_clone=0` (older Debian) or `user.max_user_namespaces=0` | The sysctl. |
 | Docker's or Podman's default seccomp profile | `Seccomp: 2`, a container detected, and `unshare(CLONE_NEWUSER)` returns `EPERM`. The default profile grants those calls only with `CAP_SYS_ADMIN`. | A seccomp profile that is the runtime's default plus `clone` with the namespace flags, `unshare`, `mount`, `umount2`, `pivot_root` and the new mount API. Never `seccomp=unconfined`. |
 | Docker's AppArmor profile | `/proc/self/attr/current` reads `docker-default` | A profile that allows `mount`, or `--security-opt apparmor=unconfined` for this container only. |
@@ -148,7 +153,7 @@ A pass means one attempt failed, not that every path is closed. The checks have 
 | A hardened systemd unit | `$INVOCATION_ID` set, the cgroup ends in `.service`, and namespaces or mounts are refused | Relax `RestrictNamespaces=`, and a `SystemCallFilter=` that lacks `@mount`, for this unit only. |
 | macOS: already inside a Seatbelt profile | `sandbox-exec` with a trivial profile fails | Run outside that profile: another tool's sandbox or an App Sandbox. |
 
-In a container, the fix relaxes the outer layer just enough for the inner one, which then applies the stricter filter and the covers to the untrusted code. This is why the sandbox can't start inside default Docker, rootless Podman or a hardened unit: all three refuse the namespace and mount calls that bubblewrap makes. The AppArmor row was verified on Ubuntu 24.04. The masked-`/proc` row and the Docker and Podman options were inferred, not run.
+In a container, the fix relaxes the outer layer just enough for the inner one, which then applies the stricter filter and the covers to the untrusted code. This is why the sandbox can't start inside default Docker, rootless Podman or a hardened unit: all three refuse the namespace and mount calls that bubblewrap makes. The AppArmor rows were verified on Ubuntu 24.04 and 26.04. The masked-`/proc` row and the Docker and Podman options were inferred, not run.
 
 Container detection is best effort: `/.dockerenv`, `/run/.containerenv`, `KUBERNETES_SERVICE_HOST`, cgroup path patterns, and `systemd-detect-virt -c` when it exists.
 

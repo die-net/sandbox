@@ -46,13 +46,16 @@ type probeFacts struct {
 	Setuid  bool              // bubblewrap is setuid
 	Version string            // output of bwrap --version
 	Kernels map[Kernel]Kernel // levels the seccomp filter can be built for
+	Root    bool              // this process runs as root, which Command refuses
+	Staged  bool              // this process called Stage, so Start can run
 	TryErr  string            // why the trial sandbox failed, "" when it started
 
 	Sysctl     map[string]string // by dotted name, absent when unreadable
 	Seccomp    int               // Seccomp: in /proc/self/status
 	Container  string            // detectContainer's answer
 	UnshareErr error             // clone(CLONE_NEWUSER) as an ordinary process
-	AppArmor   string            // /proc/self/attr/current
+	AppArmor   string            // /proc/self/attr/apparmor/current, or attr/current before Linux 5.8
+	BwrapLabel string            // attr/apparmor/current of a process bubblewrap starts, "" when unknown
 	Mounts     []mount           // this process's mount table
 	Self       string            // this binary's path
 }
@@ -91,8 +94,16 @@ func diagnose(f probeFacts) []Result {
 		return append(res, fail("probe.seccomp", "no system call filter can be built for this architecture, so no kernel level can be met"))
 	}
 	res = append(res, pass("probe.seccomp", "a system call filter exists for %d kernel levels", len(f.Kernels)))
+	if f.Root {
+		return append(res, fail("probe.root", "this program runs as root, and the sandbox refuses root, since it opens paths and writes the sandbox's passwd in this process. Fix: switch to the sandbox's own uid before Probe and Command"))
+	}
+	if !f.Staged {
+		return append(res, fail("probe.stage", "this program did not call sandbox.Stage, so Probe started no sandbox. Start runs this binary again inside the sandbox, and without Stage that run would be the program's own main. "+
+			"Fix: call sandbox.Stage first in main, and exit with its code when it reports true"))
+	}
+	res = append(res, pass("probe.stage", "this program called Stage"))
 	if f.TryErr == "" {
-		return append(res, pass("probe.userns", "bubblewrap started a sandbox in a new user namespace and mounted proc, dev and tmpfs"))
+		return append(res, pass("probe.userns", "a trial sandbox started, set itself up and ran its command"))
 	}
 	return append(res, firstBlock(f))
 }
@@ -102,6 +113,17 @@ func diagnose(f probeFacts) []Result {
 func firstBlock(f probeFacts) Result {
 	container := f.Container != "" && f.Container != "systemd-unit"
 	switch {
+	case f.BwrapLabel != "" && f.BwrapLabel != f.AppArmor:
+		profile, name, err := apparmorProfile(f.Self)
+		if err != nil {
+			return fail("probe.apparmor-bwrap", "AppArmor runs what bubblewrap starts under %q, not this program's own %q, and the sandbox failed: %s\n"+
+				"No profile can be generated: %v", f.BwrapLabel, f.AppArmor, f.TryErr, err)
+		}
+		return fail("probe.apparmor-bwrap", "AppArmor runs what bubblewrap starts under %q, not this program's own %q, and the sandbox failed: %s\n"+
+			"Ubuntu 26.04's bwrap profile does this, and its unpriv_bwrap profile denies the capabilities the sandbox's first stage needs, whatever kernel.apparmor_restrict_unprivileged_userns says.\n"+
+			"Fix: save this as /etc/apparmor.d/%s, then run: sudo apparmor_parser -r /etc/apparmor.d/%s\n"+
+			"%s\n\n%s",
+			f.BwrapLabel, f.AppArmor, f.TryErr, name, name, profileGrant(f.Self), profile)
 	case f.Sysctl["kernel.apparmor_restrict_unprivileged_userns"] == "1":
 		profile, name, err := apparmorProfile(f.Self)
 		if err != nil {
@@ -110,8 +132,8 @@ func firstBlock(f probeFacts) Result {
 		}
 		return fail("probe.apparmor-userns", "AppArmor restricts unprivileged user namespaces (kernel.apparmor_restrict_unprivileged_userns=1), and bubblewrap failed: %s\n"+
 			"Fix: save this as /etc/apparmor.d/%s, then run: sudo apparmor_parser -r /etc/apparmor.d/%s\n"+
-			"It grants user namespaces to %s and the processes it starts, and to no other program.\n\n%s",
-			f.TryErr, name, name, f.Self, profile)
+			"%s\n\n%s",
+			f.TryErr, name, name, profileGrant(f.Self), profile)
 	case f.Sysctl["kernel.unprivileged_userns_clone"] == "0":
 		return fail("probe.userns-sysctl", "kernel.unprivileged_userns_clone is 0, which turns user namespaces off for ordinary users. Fix: sudo sysctl -w kernel.unprivileged_userns_clone=1, and put it in /etc/sysctl.d/ to keep it")
 	case f.Sysctl["user.max_user_namespaces"] == "0":
@@ -139,20 +161,32 @@ func masked(mounts []mount) bool {
 	return false
 }
 
-// apparmorProfile writes an AppArmor profile for the binary at self that
-// allows it, and so bubblewrap when it runs it, to create user namespaces,
-// and returns it with the name to save it under. Ubuntu 24.04 and later need
-// it. No other program gets user namespaces. A profile on bubblewrap's own
-// path would give them to every process on the host that runs it.
+// apparmorProfile writes an AppArmor profile for the binary at self, and
+// returns it with the name to save it under. Ubuntu 24.04 and later need it.
+// It applies to this binary and to every process it starts, bubblewrap and
+// the sandbox included, and to no other program. A profile on bubblewrap's
+// own path would give user namespaces to every process on the host that runs
+// it.
 //
-// The profile is flags=(unconfined), so it confines nothing else: the kernel
-// still lets the program do everything it could without a profile, and
-// mediates only the user namespace. A child profile for bubblewrap, entered
-// by a cx rule, would grant less, but the kernel ignores exec rules in an
-// unconfined-mode profile and leaves bubblewrap in the parent's label, where
-// it is refused (tried on Ubuntu 24.04, kernel 6.8, and an enforcing parent
-// would deny every class of access it did not list). Loaded with
-// apparmor_parser -r and exercised by the full test suite on that system.
+// The profile allows everything, user namespaces and capabilities in them
+// included. It is in enforce mode, with an all rule, so that exec inherits
+// it. Ubuntu 26.04 attaches a profile to /usr/bin/bwrap (bwrap-userns-restrict
+// in the apparmor package) that runs whatever bubblewrap starts stacked with
+// unpriv_bwrap, which denies every capability. The first stage then can't
+// make its mount namespace. An unconfined-mode profile, as this was before,
+// looks up the attached profile on exec, and the kernel ignores its exec
+// rules, so it can't keep bubblewrap out of that profile (tried on Ubuntu
+// 26.04, kernel 7.0). The cost is that no program this binary starts moves
+// into a profile of its own, outside the sandbox too.
+//
+// attach_disconnected lets bubblewrap write /proc/<pid>/uid_map, whose path
+// AppArmor can't name from inside the new namespaces, and mediate_deleted is
+// there as in Ubuntu's own bwrap profile. The explicit rules
+// repeat what all grants on AppArmor 5, because the 4.0 parser of Ubuntu
+// 24.04 leaves out of all a mount with MS_SILENT, which bubblewrap's first
+// mount sets, and the creation of sockets (tried on Ubuntu 24.04, kernel
+// 6.8). Loaded with apparmor_parser -r and exercised by the full test suite
+// on both systems.
 func apparmorProfile(self string) (profile, name string, err error) {
 	if !filepath.IsAbs(self) || strings.ContainsAny(self, "\"\\\n{}[]?*^,;@$ ") {
 		return "", "", fmt.Errorf("the path %q is empty, relative, or has a character a profile would need escaped", self)
@@ -166,10 +200,21 @@ func apparmorProfile(self string) (profile, name string, err error) {
 	return fmt.Sprintf(`abi <abi/4.0>,
 include <tunables/global>
 
-profile %[1]s %[2]s flags=(unconfined) {
-  userns,
+profile %[1]s %[2]s flags=(attach_disconnected,mediate_deleted) {
+  allow all,
+  allow mount,
+  allow umount,
+  allow pivot_root,
+  allow network,
+  allow unix,
 }
 `, name, self), name, nil
+}
+
+// profileGrant says what apparmorProfile's profile grants, for the fix.
+func profileGrant(self string) string {
+	return fmt.Sprintf("It lets %s and every process it starts, bubblewrap and the sandbox included, make user namespaces and use capabilities in them, and it grants nothing to any other program. "+
+		"Those processes stay in this profile, so none of them moves into a stricter profile of its own.", self)
 }
 
 // containerFacts is what detectContainer reads.
