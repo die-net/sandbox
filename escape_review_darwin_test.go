@@ -1041,14 +1041,13 @@ func TestEscapeDevices(t *testing.T) {
 // refork defines a shell function, chain, that forks, and the parent exits,
 // again and again, each child making a process group of its own and spinning
 // for its second argument's count of loops first. It runs in /bin/bash, whose &
-// forks without an exec. With a spin of 200, about 0.7 ms, one process is alive
-// at a time for most of a generation, and a generation lives about a
-// millisecond, so a scan that lists a generation and checks it after a pause
-// finds it exiting and its successor missing from the list. Without the spin a
-// generation lives about half a millisecond, and bash's work after the fork
-// keeps the parent alive beside its child, so a scan always finds a live
-// member. A child of the test binary could only fork and exec, which takes
-// milliseconds. set -m, which a subshell turns off, is set again in each
+// forks without an exec. A child of the test binary could only fork and exec,
+// which takes milliseconds. With a spin of 200, about 0.7 ms, one process is
+// alive at a time for most of a generation, and a generation lives about a
+// millisecond: the chain the first teardown failed on, which listed the whole
+// table and signaled afterwards. Without the spin a generation lives about half
+// a millisecond, and bash's work after the fork keeps the parent alive beside
+// its child. set -m, which a subshell turns off, is set again in each
 // generation, so that each puts its child in a new group, as job control does,
 // and a signal to the command's group misses the chain. The chain stops by
 // itself once $SECONDS, the shell's age in whole seconds, which subshells

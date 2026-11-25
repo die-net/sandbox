@@ -8,9 +8,11 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -181,72 +183,152 @@ func TestMemberNeverMatchesAProcessApplyingAProfile(t *testing.T) {
 	}
 }
 
-// ------------------------------------------- a real scan and a draining chain
+// ------------------------------------------- a real scan and a member exiting
 
-// A scan of a sandbox that holds a process re-forking every millisecond is
-// never clean, even when the scanner loses the processor between the snapshot
-// and its first check, as under load, and the member that was alive at the
-// snapshot has begun to exit by the time it is checked. The shell and its sleep,
-// which keep the stage from tearing down, are left out of the membership, so
-// that only the chain is measured, and the scan's kill is a count, so that the
-// chain lives on.
-func TestRealScanIsNeverCleanWhileAChainLives(t *testing.T) {
+// lingerTicks is the SO_LINGER of the lingerer's socket. xnu counts it in
+// ticks of 10 ms (soclose_locked in bsd/kern/uipc_socket.c sleeps so_linger
+// ticks, which a test of 3 showed as 33 ms), so this is about two seconds,
+// which the test cuts short by closing its end.
+const lingerTicks = 200
+
+// registerLingerer adds "lingerer", a member of a sandbox that stays exiting
+// for as long as its test wants. It connects to the address in args[0] and
+// waits for a byte, which the peer sends once it has fixed its receive buffer.
+// Then it fills the connection until a write waits, and sets SO_LINGER on it
+// in blocking mode, so that the close of the socket in its exit waits for the
+// peer to read. It says "ready" once the connection is full, and exits when a
+// second byte arrives, which leaves it exiting, under the flag the kernel sets
+// at the start of exit, until the peer reads or resets the connection.
+func registerLingerer() {
+	childModes["lingerer"] = func(args []string) int {
+		c, err := dialTimeout("tcp", args[0], 3*time.Second)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		buf := make([]byte, 1<<16)
+		if _, err := c.Read(buf[:1]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		tc := c.(*net.TCPConn)
+		if err := tc.SetLinger(lingerTicks); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		// Full is when a write has waited 50 ms: the peer reads nothing, so its
+		// window is shut and the rest stays in this socket, which is what the
+		// close lingers on.
+		for {
+			_ = c.SetWriteDeadline(time.Now().Add(50 * time.Millisecond))
+			if _, err := c.Write(buf); err != nil {
+				break
+			}
+		}
+		// A socket in non-blocking mode skips the linger, and Go's are. The
+		// descriptor from File shares the socket, and so its mode.
+		f, err := tc.File()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		if err := syscall.SetNonblock(int(f.Fd()), false); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		_, _ = os.Stdout.WriteString("ready\n")
+		_, _ = f.Read(buf[:1])
+		return 0
+	}
+}
+
+// A scan never counts a sandbox clean while a member of it is exiting. Under
+// load the scanner can be off the processor between its list and its check of
+// a pid, and a member alive at the list has begun to exit by the check. The
+// test arranges that case: a member whose parent has exited, as each process of
+// a chain that re-forks has, is held in exit by a lingering socket, and the
+// scans run while it is there. The shell that keeps the stage from tearing
+// down is left out of the membership, and a scan's kill is a count, so the
+// member stays.
+func TestRealScanIsNeverCleanWhileAMemberExits(t *testing.T) {
 	t.Parallel()
-	c, err := Command(t.Context(), Spec{Home: realTemp(t), Command: reforkCommand("chain 6 200 & /bin/sleep 3")})
+	// The subshell starts the lingerer and exits, so its parent is gone.
+	c, err := Command(t.Context(), Spec{Home: realTemp(t), Listen: 1, Command: []string{"/bin/sh", "-c", `( "$0" lingerer "$1" & ); read x`, self(t)}})
 	if err != nil {
 		t.Fatal(err)
 	}
+	c.spec.Command = append(c.spec.Command, c.ListenAddrs()[0])
+	stdin, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stdin.Close()
+	defer w.Close() // the shell's read ends
+	c.Stdin = stdin
+	out := &syncBuffer{}
+	c.Stdout = out
 	c.Env = []string{shellPath}
-	c.Stdout = &syncBuffer{}
 	if err := c.Start(); err != nil {
 		t.Fatal(err)
 	}
 	endAtCleanup(t, c)
-	time.Sleep(300 * time.Millisecond)
+	l := c.Listeners()[0]
+	conn, err := l.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close() // resets the connection, which ends the linger
+	// A receive buffer the test sets stops the kernel growing it as data comes
+	// in (SB_USRSIZE in bsd/kern/uipc_socket2.c), which would open the window
+	// again and let the lingerer's data drain, ending the linger early.
+	if err := conn.(*net.TCPConn).SetReadBuffer(1 << 14); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Write([]byte("g")); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, 10*time.Second, "the lingerer never filled its connection", func() bool { return strings.Contains(out.String(), "ready") })
+	all, err := c.run.mark.processes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	all = slices.DeleteFunc(all, func(pid int) bool { return pid == c.run.group })
+	if len(all) != 1 {
+		t.Fatalf("members besides the shell: %v, want the lingerer alone", all)
+	}
+	member := all[0]
+	if _, err := conn.Write([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	// The kernel's own flag and state, read directly, since the scan's reading
+	// of them is part of what is tested.
+	exiting := func() bool {
+		b, err := readBSD(member)
+		return err == nil && b.Flags&flagInExit != 0 && b.Status != stateZombie
+	}
+	eventually(t, 5*time.Second, "the lingerer never began to exit", exiting)
 	p := c.run.mark.prober(c.run.group)
-	found := 0
-	p.kill = func(int) { found++ }
-	fixed := map[int]bool{c.run.group: true}
-	all, _ := c.run.mark.processes()
-	for _, pid := range all {
-		if b, err := readBSD(pid); err == nil && int(b.PPid) == c.run.group && strings.HasPrefix(string(b.Comm[:]), "sleep") {
-			fixed[pid] = true
-		}
-	}
-	list := p.list
-	p.list = func() ([]int, error) {
-		pids, err := list()
-		// The scanner is off the processor for a while.
-		for end := time.Now().Add(400 * time.Microsecond); time.Now().Before(end); { //nolint:revive // empty-block: the loop spins on purpose, to keep the scanner off the processor.
-		}
-		return pids, err
-	}
+	p.kill = func(int) {}
 	look := p.look
 	p.look = func(pid int) lookup {
-		if fixed[pid] {
+		if pid == c.run.group {
 			return lookup{Known: true}
 		}
 		return look(pid)
 	}
 	var mem memory
-	scans, clean := 0, 0
-	for end := time.Now().Add(2 * time.Second); time.Now().Before(end); {
+	for range 5 {
 		ok, next, err := p.scan(mem)
 		if err != nil {
 			t.Fatal(err)
 		}
-		scans++
 		if ok {
-			clean++
+			t.Error("a scan was clean while a member of the sandbox was exiting")
 		}
 		mem = next
 	}
-	t.Logf("%d scans, %d members found, %d clean", scans, found, clean)
-	if clean > 0 {
-		t.Errorf("%d of %d scans were clean while a process of the sandbox was alive", clean, scans)
-	}
-	if err := waitWithin(t, c, 9*time.Second); err != nil {
-		t.Errorf("Wait: %v", err)
+	if !exiting() {
+		t.Fatal("the lingerer finished exiting during the scans, so they did not all see it exiting")
 	}
 }
 
@@ -1105,7 +1187,7 @@ func TestWaitReturnsAfterAGiveUpWhileAMemberHoldsTheOutput(t *testing.T) {
 	if !errors.Is(err, ErrSurvivors) {
 		t.Errorf("Wait: %v, want ErrSurvivors", err)
 	}
-	if d := time.Since(start); d > giveUpAfter+8*time.Second {
+	if d := time.Since(start); d > stageNoKillGiveUp+8*time.Second {
 		t.Errorf("Wait took %v, with the member due to end by itself at 30 s", d)
 	}
 	if n := c.run.callerScans.Load(); n != 0 {

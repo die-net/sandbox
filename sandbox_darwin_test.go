@@ -56,8 +56,14 @@ const stageKillBeforeReplyEnv = "SANDBOX_TEST_STAGE_KILL_BEFORE_REPLY"
 
 // stageNoKillEnv, in the same place, makes the stage's scan signal nothing, so
 // that a member it finds is there again at the next scan, as a process that
-// keeps forking against the teardown is.
+// keeps forking against the teardown is. The stage then gives up on members
+// after stageNoKillGiveUp, not giveUpAfter, so that a test of the give-up
+// waits a fraction of a second.
 const stageNoKillEnv = "SANDBOX_TEST_STAGE_NO_KILL"
+
+// stageNoKillGiveUp is the stage's giveUpAfter under stageNoKillEnv: long
+// enough for more than ten scans at the backoff's pace.
+const stageNoKillGiveUp = 300 * time.Millisecond
 
 // stageFdDirEnv, in the same place, holds the directory the stage lists its
 // descriptors from in place of /dev/fd, so that a test can make the listing
@@ -83,6 +89,7 @@ func TestMain(m *testing.M) {
 	registerProbeMode()
 	registerSleepForever()
 	registerLeaver()
+	registerLingerer()
 	registerEscMode()
 	registerOwnSession()
 	registerFdsListed()
@@ -107,6 +114,7 @@ func TestMain(m *testing.M) {
 	}
 	if os.Getenv(stageNoKillEnv) != "" {
 		hooks = append(hooks, func(p *prober) { p.kill = func(int) {} })
+		giveUpAfter = stageNoKillGiveUp
 	}
 	if os.Getenv(stageUnprovableEnv) != "" {
 		opts.budget = 200 * time.Millisecond
