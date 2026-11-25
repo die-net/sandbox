@@ -8,31 +8,37 @@ import (
 	"time"
 )
 
-// The stage's teardown proves the sandbox empty with one scan, tells the
-// caller, and the caller's Wait scans no more. A zombie of this account that
-// the test process never reaped, which other tests leave, is excused by its
-// parent, which is no member, but one whose parent the scan cannot clear costs
-// the stage a second scan, so with one the test accepts two. Another
-// process of the account starting during the scan costs one more, and how often
-// that happens depends on the load of the machine (a parallel build can make
-// half of all scans unclean). So the test goes on until enough runs have made
-// the scans expected, up to a limit, and the limit is generous: a stage that
-// needs two scans always never gets there. None of the runs may have the
+// The stage's teardown proves the sandbox empty with as few scans as the
+// machine allows, tells the caller, and the caller's Wait scans no more. How
+// many scans a teardown takes depends on the rest of the account: a process
+// that exits between the list and its read makes a scan unclean, and with a few
+// fork loops running most first scans are (docs/macos.md, "Process churn"). So
+// each run is measured against a baseline: once Wait has returned, the test
+// tears down the same sandbox, now empty, with the same scan from outside, and
+// counts its scans. Both see the same churn and the same zombies, and a stage
+// that needs one scan more than it should, on every run, stands out by a scan
+// a run. The test allows half that. With a few fork loops running, the
+// difference of one run has a spread of about two scans, so it takes hundreds
+// of runs to tell half a scan a run from noise. The test stops sooner when it
+// can: once it has made enough runs that a scan a run more could not hide in
+// the noise, it stops as soon as the stage has made no more scans than the
+// baseline, which on a quiet machine is at once. None of the runs may have the
 // caller scan, whatever the load, since the stage has its whole budget.
 func TestTeardownOneScanInTheStageAndNoneInTheCaller(t *testing.T) {
 	t.Parallel()
 	home := realTemp(t)
-	const tries, most = 60, 5
-	hits, ran := 0, 0
-	for ran < tries && hits < most {
-		ran++
-		// A zombie whose parent is no process of this account, or that the scan
-		// has not cleared yet, costs a second scan.
-		zombies := len(foreignZombies(t)) > 0
+	const least, most = 50, 400
+	stage, base, runs := 0, 0, 0
+	for runs < most && (runs < least || stage > base) {
+		runs++
 		c, err := Command(t.Context(), Spec{Home: home, Command: []string{"/usr/bin/true"}})
 		if err != nil {
 			t.Fatal(err)
 		}
+		// The stage is this test binary, and one built with -race sleeps a second
+		// as it exits, for races to be reported, which over 50 runs or more is most
+		// of a minute. Other tests' stages keep the sleep.
+		c.Env = []string{"GORACE=atexit_sleep_ms=0"}
 		if err := c.Start(); err != nil {
 			t.Fatal(err)
 		}
@@ -42,32 +48,17 @@ func TestTeardownOneScanInTheStageAndNoneInTheCaller(t *testing.T) {
 		if n := callerSideScans(c); n != 0 {
 			t.Fatalf("the caller made %d scans after the stage reported the sandbox empty", n)
 		}
-		if n := c.run.stageScans; n == 1 || (n == 2 && zombies) {
-			hits++
-		} else {
-			t.Logf("the stage made %d scans, want 1 (or 2 with a foreign zombie: %v)", c.run.stageScans, zombies)
+		n, end := c.run.mark.kill(c.run.budget, c.run.group)
+		if end != endEmpty {
+			t.Fatalf("the baseline teardown of the empty sandbox ended with %v after %d scans", end, n)
 		}
+		stage += c.run.stageScans
+		base += n
 	}
-	if hits < most {
-		t.Errorf("the stage made the scans expected in %d of %d runs, want %d", hits, ran, most)
+	t.Logf("%d runs: the stage made %d scans, the baseline %d", runs, stage, base)
+	if 2*(stage-base) > runs {
+		t.Errorf("the stage made %d scans in %d runs, more than half a scan a run over the baseline's %d", stage, runs, base)
 	}
-}
-
-// foreignZombies returns the zombies of this account, which include this
-// process's own children that other tests left unreaped.
-func foreignZombies(t *testing.T) []int {
-	t.Helper()
-	pids, err := listUIDPids(euid())
-	if err != nil {
-		t.Fatal(err)
-	}
-	var out []int
-	for _, pid := range pids {
-		if st, err := statPid(pid); err == nil && st.Zombie {
-			out = append(out, pid)
-		}
-	}
-	return out
 }
 
 // A zombie that nothing reaps, as a program might leave, makes the first scan
