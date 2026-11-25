@@ -15,6 +15,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -46,6 +47,19 @@ func registerEscapeChecks() {
 	escChecks["procinfo"] = escProcInfo
 	escChecks["dial-denied"] = escDialDenied
 	escChecks["dial-ok"] = escDialOK
+	escChecks["dial-allowed"] = escDialAllowed
+	// egress-rows prints Check's egress rows, tried against a TCP address and a
+	// UDP one, as JSON.
+	escChecks["egress-rows"] = func(e *escT, args []string) {
+		b, err := json.Marshal(egressRows(args[0], args[1]))
+		if err != nil {
+			e.failf("marshal the rows: %v", err)
+			return
+		}
+		_, _ = os.Stdout.Write(b)
+	}
+	escChecks["lookup-allowed"] = escLookupAllowed
+	escChecks["lookup-denied"] = escLookupDenied
 	escChecks["bind-ok"] = escBindOK
 	escChecks["bind-denied"] = escBindDenied
 	escChecks["loopback"] = escLoopback
@@ -120,9 +134,9 @@ func gotSignals(dir string) string {
 	return strings.TrimSpace(string(b))
 }
 
-// lanAddr returns an address of this host that is not loopback, or "" if
-// there is none.
-func lanAddr() string {
+// lanIP returns an IPv4 address of this host that is neither loopback nor
+// link-local, or "" if it has none.
+func lanIP() string {
 	addrs, _ := net.InterfaceAddrs()
 	for _, a := range addrs {
 		if ip, ok := a.(*net.IPNet); ok && ip.IP.To4() != nil && !ip.IP.IsLoopback() && !ip.IP.IsLinkLocalUnicast() {
@@ -131,6 +145,78 @@ func lanAddr() string {
 	}
 	return ""
 }
+
+// lanAddr returns lanIP, and fails the test if the host has no such address.
+// The tests use it as an address of the host's own that is not loopback, and
+// as a target outside the sandbox that needs no internet. A host without one
+// can't run them, and the test says so rather than pass without them.
+func lanAddr(t testing.TB) string {
+	t.Helper()
+	ip := lanIP()
+	if ip == "" {
+		t.Fatal("this host has no IPv4 address but loopback and link-local ones, and the test needs one as a target outside the sandbox")
+	}
+	return ip
+}
+
+// offHost is an address that is not the host's and that nothing answers:
+// 192.0.2.1, in TEST-NET-1, which RFC 5737 reserves for documentation, so no
+// network routes it to anyone. The profile refuses a connection it doesn't
+// allow at once, with EPERM, while one it lets out times out or finds no
+// route, which tells the two apart with no internet.
+const offHost = "192.0.2.1"
+
+// udpResponder starts a UDP server on the host's LAN address that answers each
+// datagram with 12 bytes, the size of a DNS header, and returns its address. A
+// sandbox that gets an answer reached it.
+func udpResponder(t testing.TB) string {
+	t.Helper()
+	c, err := listenPacket("udp4", net.JoinHostPort(lanAddr(t), "0"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	go func() {
+		var buf [512]byte
+		for {
+			_, from, err := c.ReadFrom(buf[:])
+			if err != nil {
+				return
+			}
+			_, _ = c.WriteTo(make([]byte, 12), from)
+		}
+	}()
+	return c.LocalAddr().String()
+}
+
+// mdnsName returns the host's own name in .local, which mDNSResponder answers
+// with no network, and which nothing else resolves: /etc/hosts doesn't list
+// it, and a name that /etc/hosts lists resolves in a sandbox without
+// mDNSResponder. It fails the test if the host can't resolve the name itself.
+// port is a port that a listener of the test's holds.
+func mdnsName(t testing.TB, port int) string {
+	t.Helper()
+	out, err := exec.CommandContext(t.Context(), "/usr/sbin/scutil", "--get", "LocalHostName").Output()
+	name := strings.TrimSpace(string(out))
+	if err != nil || name == "" {
+		t.Fatalf("scutil --get LocalHostName: %q, %v", out, err)
+	}
+	name += ".local"
+	cmd := exec.CommandContext(t.Context(), "/bin/sh", "-c", curlResolve, "sh", name, strconv.Itoa(port)) //nolint:gosec // G204: the test binary or a tool the test names, run as the test's own child.
+	out, err = cmd.Output()
+	if err != nil || strings.TrimSpace(string(out)) == curlCannotResolve {
+		t.Fatalf("this host can't resolve its own name %s, which the test needs as a name that only mDNSResponder answers: %q, %v", name, out, err)
+	}
+	return name
+}
+
+// curlResolve is a script that connects with curl to http://$1:$2/ and prints
+// curl's exit status, which is curlCannotResolve when the name did not
+// resolve.
+const curlResolve = `/usr/bin/curl -s -m 5 -o /dev/null "http://$1:$2/"; echo $?`
+
+// curlCannotResolve is curl's exit status for a name it could not resolve.
+const curlCannotResolve = "6"
 
 // listenAny starts a TCP listener on all addresses of the host, which a
 // connection to 127.0.0.1, ::1 and the LAN address each reach, that accepts
@@ -376,6 +462,44 @@ func escDialDenied(e *escT, args []string) {
 	}
 }
 
+// escDialAllowed fails for each address in args whose connection the profile
+// refuses. Any other end, a connection, a timeout or no route, is one the
+// profile let out. A UDP address is sent a datagram too.
+func escDialAllowed(e *escT, args []string) {
+	for _, a := range args {
+		network, addr, _ := strings.Cut(a, ":")
+		c, err := dialTimeout(network, addr, time.Second)
+		if err == nil {
+			if network == "udp" {
+				_, err = c.Write([]byte("x"))
+			}
+			_ = c.Close()
+		}
+		if isPerm(err) {
+			e.failf("dial %s: %v, refused by the profile", a, err)
+		}
+	}
+}
+
+// escLookupAllowed fails for each Mach service name in args that this
+// process's profile does not let it look up, and escLookupDenied for each that
+// it does. sandbox_check asks the profile, so this needs no service to answer.
+func escLookupAllowed(e *escT, args []string) {
+	for _, name := range args {
+		if allowed, ok := lookupAllowed(os.Getpid(), name); !allowed || !ok {
+			e.failf("mach-lookup %s: allowed %v, answered %v; want allowed", name, allowed, ok)
+		}
+	}
+}
+
+func escLookupDenied(e *escT, args []string) {
+	for _, name := range args {
+		if allowed, ok := lookupAllowed(os.Getpid(), name); allowed || !ok {
+			e.failf("mach-lookup %s: allowed %v, answered %v; want denied", name, allowed, ok)
+		}
+	}
+}
+
 // escDialOK fails for each address in args that cannot be reached.
 func escDialOK(e *escT, args []string) {
 	for _, a := range args {
@@ -440,7 +564,10 @@ func escLoopback(e *escT, args []string) {
 		ports = append(ports, n-1, n+1)
 	}
 	ports = append(ports, 80, 8080)
-	lan := lanAddr()
+	lan := lanIP()
+	if lan == "" {
+		e.failf("this host has no IPv4 address but loopback and link-local ones to try")
+	}
 	for _, n := range ports {
 		if slices.Contains(args, strconv.Itoa(n)) {
 			continue
@@ -586,8 +713,9 @@ func registerDialInSession() {
 }
 
 // escDaemon starts a process that makes its own session and so leaves the
-// command's process group, and tells the caller its pid and where it records
-// what it can reach. args are the log file and the paths to try to read.
+// command's process group, and tells the caller its pid once it has recorded
+// what it can reach, at least once. args are the log file, a TCP address to
+// try to connect to, and the paths to try to read.
 func escDaemon(e *escT, args []string) {
 	cmd := exec.CommandContext(context.Background(), self1(), append([]string{"esc", "daemon-child"}, args...)...) //nolint:gosec // G204: the test binary or a tool the test names, run as the test's own child.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
@@ -596,6 +724,17 @@ func escDaemon(e *escT, args []string) {
 		e.failf("start the daemon: %v", err)
 		return
 	}
+	// The sandbox ends as soon as this exits, so without the wait the daemon
+	// can be ended before it tries anything.
+	for end := time.Now().Add(10 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		if b, _ := readFile(args[0]); len(b) > 0 {
+			break
+		}
+		if time.Now().After(end) {
+			e.failf("the daemon recorded nothing in 10 s")
+			return
+		}
+	}
 	fmt.Println(cmd.Process.Pid)
 }
 
@@ -603,7 +742,7 @@ func self1() string { exe, _ := os.Executable(); return exe }
 
 func registerDaemonChild() {
 	escChecks["daemon-child"] = func(_ *escT, args []string) {
-		log, paths := args[0], args[1:]
+		log, target, paths := args[0], args[1], args[2:]
 		for i := 0; ; i++ {
 			var worked []string
 			for _, p := range paths {
@@ -611,7 +750,7 @@ func registerDaemonChild() {
 					worked = append(worked, p)
 				}
 			}
-			if c, err := dialTimeout("tcp", "1.1.1.1:443", 200*time.Millisecond); err == nil {
+			if c, err := dialTimeout("tcp", target, 200*time.Millisecond); err == nil {
 				worked = append(worked, "net")
 				_ = c.Close()
 			}
@@ -1238,28 +1377,33 @@ func TestEscapeStageKilled(t *testing.T) {
 // ---------------------------------------------------------------- network
 
 // Row: "Network namespace, proxy listener handed out": with NetworkNone the
-// sandbox reaches no address: a public one, a local listener on 127.0.0.1,
-// ::1 or the host's LAN address, a UDP resolver. It cannot resolve names or
-// connect to the sockets of system services.
+// sandbox reaches no address: one off the host, a listener on 127.0.0.1, ::1
+// or the host's LAN address, a UDP server on the LAN address, the metadata
+// address. It cannot resolve names, look up the services that NetworkHost
+// allows, or connect to the sockets of system services. None of it needs the
+// internet.
 func TestEscapeNetworkNone(t *testing.T) {
 	t.Parallel()
 	port := listenAny(t)
-	targets := []string{
-		"tcp:1.1.1.1:443", "tcp:127.0.0.1:" + strconv.Itoa(port), "tcp:[::1]:" + strconv.Itoa(port),
-		"udp:9.9.9.9:53", "tcp:169.254.169.254:80",
+	p := strconv.Itoa(port)
+	escRun(t, Spec{}, "dial-denied",
+		"tcp:"+lanAddr(t)+":"+p, "tcp:127.0.0.1:"+p, "tcp:[::1]:"+p, "tcp:"+offHost+":443",
+		"udp:"+udpResponder(t), "udp:"+offHost+":53", "tcp:169.254.169.254:80")
+	// Names do not resolve: the host's own .local name, which mDNSResponder
+	// answers, does with NetworkHost (TestEscapeNetworkHost).
+	if r := sh(t, Spec{}, curlResolve, mdnsName(t, port), p); strings.TrimSpace(r.stdout) != curlCannotResolve {
+		t.Errorf("curl resolved the host's name with NetworkNone: %s", r)
 	}
-	if lan := lanAddr(); lan != "" {
-		targets = append(targets, "tcp:"+lan+":"+strconv.Itoa(port))
-	}
-	escRun(t, Spec{}, "dial-denied", targets...)
-	// Names do not resolve: the resolver needs the network.
-	if r := sh(t, Spec{}, "/usr/bin/curl -sS -m 5 -o /dev/null https://example.com; echo status $?"); strings.Contains(r.stdout, "status 0") {
-		t.Errorf("curl reached the internet with NetworkNone: %s", r)
-	}
+	escRun(t, Spec{}, "lookup-denied", networkHostServices...)
 	// The sockets of system services, which are covered paths, and the ones
 	// that are not.
 	escRun(t, Spec{}, "unix-connect", "no:/private/var/run/mDNSResponder", "no:/var/run/mDNSResponder", "no:/var/run/syslog")
 }
+
+// networkHostServices are the Mach services that NetworkHost lets a sandbox
+// look up: the network's configuration, the resolver, and certificate checks
+// (findings.md, "TLS needed a Mach service from 27.2").
+var networkHostServices = []string{"com.apple.SystemConfiguration.configd", "com.apple.dnssd.service", "com.apple.TrustEvaluationAgent"}
 
 // Row: "parent-bound port allowed by number ... Test that other ports
 // refuse": the Listen ports and nothing else, on 127.0.0.1 and ::1 alike.
@@ -1339,10 +1483,8 @@ func TestGapBroadLoopback(t *testing.T) {
 	t.Parallel()
 	port := listenAny(t)
 	p := strconv.Itoa(port)
-	targets := []string{"tcp:127.0.0.1:" + p, "tcp:[::1]:" + p}
-	if lan := lanAddr(); lan != "" {
-		targets = append(targets, "tcp:"+lan+":"+p)
-	}
+	lan := lanAddr(t)
+	targets := []string{"tcp:127.0.0.1:" + p, "tcp:[::1]:" + p, "tcp:" + lan + ":" + p}
 	escRun(t, Spec{}, "dial-denied", targets...)
 	escRun(t, Spec{BroadLoopback: true}, "dial-ok", targets...)
 	escRun(t, Spec{BroadLoopback: true, Network: NetworkHost}, "dial-ok", targets...)
@@ -1351,35 +1493,36 @@ func TestGapBroadLoopback(t *testing.T) {
 	escRun(t, Spec{}, "bind-denied", "127.0.0.1:0")
 	// It is wider than the dial: bind and accept on every address and any port,
 	// the wildcard and the LAN address too, and UDP as well as TCP.
-	bind := []string{"0.0.0.0:0", "[::]:0"}
-	if lan := lanAddr(); lan != "" {
-		bind = append(bind, lan+":0")
-	}
+	bind := []string{"0.0.0.0:0", "[::]:0", lan + ":0"}
 	escRun(t, Spec{BroadLoopback: true}, "bind-ok", bind...)
 	escRun(t, Spec{BroadLoopback: true}, "udp-ok")
 	escRun(t, Spec{}, "bind-denied", bind...)
 }
 
 // Row: "Network: NetworkHost (asked for explicitly): allow outbound, deny
-// localhost": the sandbox reaches the internet and no local listener, over
-// 127.0.0.1, ::1 and the LAN address, and for every one of a run of ports,
-// since a per-port rule after a broad allow is what failed in M1.
+// localhost": the sandbox's connections off the host go out, TCP and UDP, its
+// names resolve, and it can look up the services that name lookups and
+// certificate checks need. It reaches no local listener, over 127.0.0.1, ::1
+// and the LAN address, and for every one of a run of ports, since a per-port
+// rule after a broad allow is what failed in M1. None of it needs the internet:
+// the address off the host answers nothing, and the profile's refusal is told
+// from a timeout.
 func TestEscapeNetworkHost(t *testing.T) {
 	t.Parallel()
-	conn, err := dialTimeout("tcp", "1.1.1.1:443", 3*time.Second)
-	if err != nil {
-		t.Skipf("no internet to reach outside the sandbox: %v", err)
-	}
-	_ = conn.Close()
 	spec := Spec{Network: NetworkHost}
-	escRun(t, spec, "dial-ok", "tcp:1.1.1.1:443")
-	// Names resolve, through the system resolver.
-	if r := sh(t, spec, "/usr/bin/curl -sS -m 10 -o /dev/null -w '%{http_code}' https://example.com"); r.code != 0 || !strings.HasPrefix(r.stdout, "2") && !strings.HasPrefix(r.stdout, "3") {
-		t.Errorf("curl with NetworkHost: %s", r)
+	escRun(t, spec, "dial-allowed", "tcp:"+offHost+":443", "udp:"+offHost+":53")
+	// The host's own .local name resolves, through mDNSResponder, which
+	// NetworkNone refuses. The connection that follows is to the host's own
+	// address, which is refused.
+	port := listenAny(t)
+	if r := sh(t, spec, curlResolve, mdnsName(t, port), strconv.Itoa(port)); strings.TrimSpace(r.stdout) == curlCannotResolve || r.code != 0 {
+		t.Errorf("curl could not resolve the host's name with NetworkHost: %s", r)
 	}
-	var targets []string
-	lan := lanAddr()
-	for range 40 {
+	escRun(t, spec, "lookup-allowed", networkHostServices...)
+	const ports = 40
+	targets := make([]string, 0, 3*ports)
+	lan := lanAddr(t)
+	for range ports {
 		l, err := listen("tcp", ":0")
 		if err != nil {
 			t.Fatal(err)
@@ -1395,10 +1538,7 @@ func TestEscapeNetworkHost(t *testing.T) {
 			}
 		}()
 		p := strconv.Itoa(l.Addr().(*net.TCPAddr).Port)
-		targets = append(targets, "tcp:127.0.0.1:"+p, "tcp:[::1]:"+p)
-		if lan != "" {
-			targets = append(targets, "tcp:"+lan+":"+p)
-		}
+		targets = append(targets, "tcp:127.0.0.1:"+p, "tcp:[::1]:"+p, "tcp:"+lan+":"+p)
 	}
 	escRun(t, spec, "dial-denied", targets...)
 	// A sandbox cannot listen either.
@@ -1847,9 +1987,10 @@ func TestEscapeSandboxExecAbsolute(t *testing.T) {
 func TestEscapeKernelLevels(t *testing.T) {
 	t.Parallel()
 	secret := hostSecret(t)
+	lan := "tcp:" + lanAddr(t) + ":" + strconv.Itoa(listenAny(t))
 	for _, k := range []Kernel{"", KernelStrict, KernelNested, KernelOpen} {
 		escRun(t, Spec{Kernel: k}, "denied", secret, filepath.Dir(secret))
-		escRun(t, Spec{Kernel: k}, "dial-denied", "tcp:1.1.1.1:443")
+		escRun(t, Spec{Kernel: k}, "dial-denied", lan, "tcp:"+offHost+":443")
 	}
 	rep, err := Probe()
 	if err != nil {

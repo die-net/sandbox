@@ -295,7 +295,9 @@ func TestEscapeSetsidDiesWithTeardown(t *testing.T) {
 	home := realTemp(t)
 	secret := hostSecret(t)
 	log := filepath.Join(home, "log")
-	c := escCmd(t.Context(), t, Spec{Home: home, Rlimits: []Rlimit{{ResourceCPU, 600, 600}}}, "daemon", log, secret, "/etc/hosts")
+	// A listener on the host's LAN address is the network it must not reach.
+	target := net.JoinHostPort(lanAddr(t), strconv.Itoa(listenAny(t)))
+	c := escCmd(t.Context(), t, Spec{Home: home, Rlimits: []Rlimit{{ResourceCPU, 600, 600}}}, "daemon", log, target, secret, "/etc/hosts")
 	var out bytes.Buffer
 	c.Stdout = &out
 	if err := c.Start(); err != nil {
@@ -310,10 +312,15 @@ func TestEscapeSetsidDiesWithTeardown(t *testing.T) {
 		t.Fatalf("no daemon pid in %q", out.String())
 	}
 	eventually(t, 5*time.Second, "the process that made its own session outlived the sandbox", func() bool { return !alive(pid) })
-	// And while it ran it saw nothing but /etc/hosts and reached no network.
+	// And while it ran it saw nothing but /etc/hosts and reached no network. The
+	// command waited for its first record.
 	b, _ := readFile(log)
-	for _, line := range strings.Split(strings.TrimSpace(string(b)), "\n") {
-		if line != "" && !strings.Contains(line, "worked=[/etc/hosts]") {
+	text := strings.TrimSpace(string(b))
+	if text == "" {
+		t.Error("the daemon recorded nothing, so nothing was checked")
+	}
+	for line := range strings.Lines(text) {
+		if !strings.Contains(line, "worked=[/etc/hosts]") {
 			t.Errorf("the daemon reached more than /etc/hosts: %q", line)
 		}
 	}
@@ -740,14 +747,13 @@ func TestEscapeLoopbackPortsAllAddresses(t *testing.T) {
 	ports := c.LoopbackPorts()
 	p0, p1 := strconv.Itoa(ports[0]), strconv.Itoa(ports[1])
 	other := listenAny(t) // a port in use outside, which the sandbox is not given
-	var args []string
+	lan := lanAddr(t)
+	refused := []int{ports[1] + 1, ports[1] + 2, other, 80, 8080}
+	args := make([]string, 0, 2+5*len(refused))
 	args = append(args, "tcp:127.0.0.1:"+p0, "tcp:127.0.0.1:"+p1)
-	for _, p := range []int{ports[1] + 1, ports[1] + 2, other, 80, 8080} {
+	for _, p := range refused {
 		s := strconv.Itoa(p)
-		args = append(args, "tcp:127.0.0.1:"+s+"!", "tcp:0.0.0.0:"+s+"!", "tcp:[::1]:"+s+"!", "tcp:[::]:"+s+"!")
-		if lan := lanAddr(); lan != "" {
-			args = append(args, "tcp:"+lan+":"+s+"!")
-		}
+		args = append(args, "tcp:127.0.0.1:"+s+"!", "tcp:0.0.0.0:"+s+"!", "tcp:[::1]:"+s+"!", "tcp:[::]:"+s+"!", "tcp:"+lan+":"+s+"!")
 	}
 	c.spec.Command = append([]string{self(t), "esc", "bind-addrs"}, args...)
 	var errb bytes.Buffer
@@ -840,10 +846,7 @@ func registerServeChecks() {
 // this Mac (its connections to any port time out with no sandbox at all).
 func TestGapLoopbackBindsLANAddress(t *testing.T) {
 	t.Parallel()
-	lan := lanAddr()
-	if lan == "" {
-		t.Skip("this host has no LAN address")
-	}
+	lan := lanAddr(t)
 	c := escCmd(t.Context(), t, Spec{Loopback: 1}, "serve-addr")
 	port := strconv.Itoa(c.LoopbackPorts()[0])
 	c.spec.Command = []string{self(t), "esc", "serve-addr", net.JoinHostPort(lan, port), "8"}
@@ -1187,11 +1190,8 @@ func TestEscapeInheritedListenerIsLoopbackOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer f.Close()
-	args := []string{port, "0.0.0.0", "::1", "::"}
-	lan := lanAddr()
-	if lan != "" {
-		args = append(args, lan)
-	}
+	lan := lanAddr(t)
+	args := []string{port, "0.0.0.0", "::1", "::", lan}
 	home := realTemp(t)
 	c, err := Command(t.Context(), Spec{Home: home, Files: []*os.File{f}, Command: append([]string{self(t), "esc", "inherit-serve"}, args...)})
 	if err != nil {
@@ -1221,11 +1221,9 @@ func TestEscapeInheritedListenerIsLoopbackOnly(t *testing.T) {
 	if err := waitWithin(t, c, 10*time.Second); err != nil {
 		t.Errorf("the command: %v\n%s", err, stderr.buf.String())
 	}
-	if lan != "" {
-		if conn, err := dialTimeout("tcp", net.JoinHostPort(lan, port), time.Second); err == nil {
-			conn.Close() //nolint:gosec // G104: nothing can be done about a failed close here, and the test is over or has what it needs.
-			t.Error("the LAN address reached a listener bound on 127.0.0.1")
-		}
+	if conn, err := dialTimeout("tcp", net.JoinHostPort(lan, port), time.Second); err == nil {
+		conn.Close() //nolint:gosec // G104: nothing can be done about a failed close here, and the test is over or has what it needs.
+		t.Error("the LAN address reached a listener bound on 127.0.0.1")
 	}
 }
 

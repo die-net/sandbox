@@ -521,10 +521,17 @@ func reachResult(name, what string, out outcome, detail string) Result {
 }
 
 func checkEgress(*checkEnv) []Result {
-	out, d := tryDial("tcp", "1.1.1.1:443", netTimeout)
+	return egressRows("1.1.1.1:443", "9.9.9.9:53")
+}
+
+// egressRows tries TCP to tcpAddr and a DNS query over UDP to udpAddr, and
+// fails each that gets through: public addresses for Check, and ones a test
+// holds, which need no internet.
+func egressRows(tcpAddr, udpAddr string) []Result {
+	out, d := tryDial("tcp", tcpAddr, netTimeout)
 	return []Result{
-		reachResult("egress.direct-tcp", "TCP to 1.1.1.1:443", out, d),
-		dnsProbe("egress.direct-udp", "9.9.9.9:53"),
+		reachResult("egress.direct-tcp", "TCP to "+tcpAddr, out, d),
+		dnsProbe("egress.direct-udp", udpAddr),
 	}
 }
 
