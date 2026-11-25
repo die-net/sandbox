@@ -320,19 +320,11 @@ func (c *Cmd) Start() error {
 	if self == "" {
 		return errors.New("find this binary, which the stage runs")
 	}
-	homes, err := hostHomes()
+	h, err := currentHost()
 	if err != nil {
 		return err
 	}
-	// The account the program runs as may live in a directory service that
-	// /etc/passwd does not list.
-	if home, err := os.UserHomeDir(); err == nil {
-		homes = append(homes, home)
-	}
-	if spec.Dir == "" {
-		spec.Dir = spec.Home
-	}
-	spec, err = prepare(spec, hostView{fs: os.DirFS("/"), homes: homes, cover: defaultCover, aliases: coverAliases})
+	spec, err = prepare(spec, h)
 	if err != nil {
 		return err
 	}

@@ -327,6 +327,11 @@ func checkNested(e *checkEnv) []Result {
 	}
 }
 
+// platformScratch are the paths inside the covers that the sandbox mounts a
+// tmpfs of its own on, which are its scratch directories. They list what the
+// command made there, and nothing of the host's.
+func platformScratch() []string { return scratchDirs }
+
 // platformSockets are the sockets of this platform that socketCandidates does
 // not list: none on Linux, whose list is the generic one.
 func platformSockets() []string { return nil }
