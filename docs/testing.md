@@ -35,12 +35,13 @@ The counts include subtests, and are the same with and without cgo. They are the
 | Target | How | Pass | Skip | Fail |
 |---|---|---|---|---|
 | Debian 13, arm64, kernel 6.12, bubblewrap 0.12.0, Lima VM `sbx-dev` | default | 293 | 5 | 0 |
+| Debian 12, arm64, kernel 6.1, bubblewrap 0.8.0 from apt, Lima VM `sbx-debian12` | `SBX_VM=sbx-debian12` | 294 | 5 | 0 |
 | Debian 13, x86_64, Proxmox kernel 7.0.14, LXC container, bubblewrap 0.12.0 | `SBX_SSH=user@host` | 293 | 5 | 0 |
 | Ubuntu 24.04.5, arm64, kernel 6.8, bubblewrap 0.9.0 from apt, AppArmor restriction on, Lima VM `sbx-ubuntu` | `SBX_VM=sbx-ubuntu SBX_APPARMOR=1` | 293 | 5 | 0 |
 
-Each was run with `CGO_ENABLED=0` and with cgo on (`CGO=1`, which builds on the target, since the host has no C cross-compiler). Each was rerun after the macOS review fixes.
+Each was run with `CGO_ENABLED=0` and with cgo on (`CGO=1`, which builds on the target, since the host has no C cross-compiler). Each was rerun after the macOS review fixes. Debian 12 was run at v0.1.0 with `CGO_ENABLED=0` only. Debian 13 run at the same time also gave 294 passes and the same 5 skips, so the older rows' 293 predates one more subtest.
 
-Without `SBX_APPARMOR=1`, the same Ubuntu run fails 159 of the tests that start a sandbox, in 11 seconds and with no hang, and `TestProbeVM` shows the diagnostic. On Ubuntu 24.04 the tests run as the account's uid under a profile for the test binary. The suite passes on apt's bubblewrap 0.9.0, so the 0.8 floor is tested at 0.9, and the symlink flaw fixed in 0.12.0 stays open there as [security-model.md](security-model.md#open-issues) notes.
+Without `SBX_APPARMOR=1`, the same Ubuntu run fails 159 of the tests that start a sandbox, in 11 seconds and with no hang, and `TestProbeVM` shows the diagnostic. On Ubuntu 24.04 the tests run as the account's uid under a profile for the test binary. The suite passes on apt's bubblewrap 0.9.0, and the symlink flaw fixed in 0.12.0 stays open there as [security-model.md](security-model.md#open-issues) notes.
 
 **The skips** are the same on every target except where noted:
 
@@ -88,7 +89,7 @@ The full suite also passes on GitHub's 3-core arm64 runners, macOS 15.8.2 (`maco
 - A replay of a real `launchservicesd` open request wasn't possible. `TestEscapeLaunchServicesRawXPC` shows the lookup and that nothing opens from the test's own message, and not that the server checks `lsopen`.
 - `syscall-unix` rules in a Seatbelt profile weren't tried, since nothing here claims a system call filter on macOS.
 - A second machine reaching a macOS `Loopback` port wasn't tried. The test connects from the host to its own LAN address.
-- The lowest bubblewrap version, 0.8, has no run.
+- bubblewrap 0.8.0 has had no run with cgo on.
 
 ## Running the tests
 
@@ -125,11 +126,21 @@ Targets:
 | Variable | Target |
 |---|---|
 | none | The `sbx-dev` Lima VM (Debian 13, arm64, bubblewrap from apt). |
-| `SBX_VM=name` | Another Lima VM, such as `sbx-ubuntu`. |
+| `SBX_VM=name` | Another Lima VM, such as `sbx-ubuntu` or `sbx-debian12`. |
 | `SBX_SSH=user@host` | A machine reached by passwordless ssh. Its architecture comes from `uname -m`. |
 | `SBX_LOCAL=1` | This machine, which must be Linux. CI uses it. |
 | `CGO=1` | Build with cgo. The default is `CGO_ENABLED=0`, as releases are. Cgo needs a C compiler for the target, so the script copies the sources to the target and builds there. The target needs `go` (on `PATH`, `/usr/local/go/bin`, or `/usr/local/bin`) and `gcc`. |
 | `SBX_APPARMOR=1` | Load the AppArmor profile for the test binary before the tests and remove it after, with `scripts/apparmor.sh`. Ubuntu 24.04 needs it. Without it the tests fail there, which is the library's behavior. |
+
+### The Debian 12 VM
+
+`sbx-debian12` is a Lima VM with Debian 12, whose apt bubblewrap is 0.8.0, the oldest the library accepts. Make it with:
+
+```bash
+limactl create --name=sbx-debian12 --cpus=4 --memory=4 --set '.mounts=[]' template:debian-12
+```
+
+Then start it and install `bubblewrap` with apt. Run the tests with `SBX_VM=sbx-debian12 scripts/linux-test.sh`.
 
 ### The Ubuntu VM
 
