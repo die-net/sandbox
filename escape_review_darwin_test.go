@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"os"
 	"os/exec"
@@ -34,10 +35,16 @@ import (
 )
 
 func registerReviewChecks() {
+	// stat-denied stats each path and fails unless the profile refuses it. A
+	// path that is not there gives ENOENT before the profile is asked, so it is
+	// printed as gone, for the test to check that the host no longer has it
+	// either: a pty can close between the test's listing and this stat.
 	escChecks["stat-denied"] = func(e *escT, args []string) {
 		for _, p := range args {
 			if _, err := os.Lstat(p); err == nil { //nolint:gosec // G703: the path is an argument the test passed to this child, whose job is to try it.
 				e.failf("stat %s: worked", p)
+			} else if errors.Is(err, fs.ErrNotExist) {
+				fmt.Printf("gone %s\n", p)
 			} else if !isPerm(err) {
 				e.failf("stat %s: %v, want a refusal by the profile", p, err)
 			}
@@ -983,7 +990,24 @@ func TestEscapeDevices(t *testing.T) {
 	// serial port here could block, or toggle a line on attached hardware. The
 	// rule that refuses the stat is the one that refuses the open, since
 	// file-read* covers both, and TestEscapeTerminals opens the terminals.
-	escRun(t, Spec{}, "stat-denied", denied...)
+	gone := 0
+	for line := range strings.Lines(escRun(t, Spec{}, "stat-denied", denied...)) {
+		p, ok := strings.CutPrefix(strings.TrimSpace(line), "gone ")
+		if !ok {
+			continue
+		}
+		// Gone in the sandbox and still on the host would be the profile
+		// hiding an entry rather than refusing it.
+		if _, err := os.Lstat(p); err == nil {
+			t.Errorf("stat %s in the sandbox: not there, but the host has it; want a refusal by the profile", p)
+		} else {
+			t.Logf("%s went away during the test", p)
+			gone++
+		}
+	}
+	if gone == len(denied) {
+		t.Fatal("every entry went away during the test, so none was tried")
+	}
 	escRun(t, Spec{}, "dev-ok")
 	// The profile says it, whatever this host has.
 	p, err := profile(profileInput{Home: "/h"})
