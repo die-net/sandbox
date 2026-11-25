@@ -122,6 +122,10 @@ type checkHints struct {
 	Secrets      []string `json:"secrets,omitempty"`
 	Sockets      []string `json:"sockets,omitempty"`
 	WriteTargets []string `json:"write_targets,omitempty"`
+	// Linked are the Read paths of the caller's prepare of the Spec, which
+	// hold the files that links in /etc lead to under a cover, which Start
+	// binds back. Linux only; Set stays false for it.
+	Linked []string `json:"linked,omitempty"`
 }
 
 // Check runs the suite in a child of this binary and returns the results,
@@ -303,15 +307,24 @@ func verdict(name, tried string, worked []string) Result {
 	return pass(name, "%s: refused or absent", tried)
 }
 
+// checkGroups fails when the process holds a group beyond its own gid.
+// getgroups may list the primary gid too, as Docker and initgroups do, which
+// grants nothing the process doesn't already have.
 func checkGroups(*checkEnv) []Result {
 	gs, err := os.Getgroups()
 	if err != nil {
 		return []Result{fail("groups.supplementary", "getgroups: %v", err)}
 	}
-	if len(gs) > 0 {
-		return []Result{fail("groups.supplementary", "getgroups returned %v", gs)}
+	if extra := extraGroups(gs, os.Getgid(), os.Getegid()); len(extra) > 0 {
+		return []Result{fail("groups.supplementary", "getgroups returned %v, beyond the process's own gid %d and egid %d", extra, os.Getgid(), os.Getegid())}
 	}
-	return []Result{pass("groups.supplementary", "getgroups returned none")}
+	return []Result{pass("groups.supplementary", "getgroups returned no group beyond the process's own gid %d and egid %d", os.Getgid(), os.Getegid())}
+}
+
+// extraGroups returns the groups in gs other than the process's own gid and
+// egid.
+func extraGroups(gs []int, gid, egid int) []int {
+	return slices.DeleteFunc(slices.Clone(gs), func(g int) bool { return g == gid || g == egid })
 }
 
 func checkIdentity(*checkEnv) []Result {
@@ -674,8 +687,12 @@ func checkCovers(e *checkEnv) []Result {
 	if e.spec == nil {
 		return []Result{skipped("covers", "no sandbox spec given")}
 	}
-	// Paths the sandbox shows on purpose, and the directories that lead to them.
-	shown := slices.Concat([]string{e.spec.Home, e.spec.Dir}, e.spec.Write, e.spec.Read)
+	// Paths the sandbox shows on purpose, and the directories that lead to
+	// them. Its scratch mount points, such as /var/tmp in /var, are explained
+	// too, but the walk still goes into them, so anything there that the
+	// sandbox didn't write shows.
+	scratch := scratchPaths()
+	shown := slices.Concat([]string{e.spec.Home, e.spec.Dir}, e.spec.Write, e.spec.Read, e.hints.Linked)
 	shown = slices.DeleteFunc(shown, func(s string) bool { return s == "" })
 	covers := slices.Concat(defaultCover, e.spec.Cover)
 	slices.Sort(covers)
@@ -700,14 +717,14 @@ func checkCovers(e *checkEnv) []Result {
 			if slices.ContainsFunc(shown, func(s string) bool { return under(p, s) }) {
 				return fs.SkipDir
 			}
-			if slices.ContainsFunc(shown, func(s string) bool { return under(s, p) }) {
-				return nil // on the way to a shown path
+			if slices.ContainsFunc(shown, func(s string) bool { return under(s, p) }) || slices.Contains(scratch, p) {
+				return nil // on the way to a shown path, or the sandbox's scratch
 			}
 			leak = p
 			return fs.SkipAll
 		})
 		if leak != "" {
-			res = append(res, fail(name, "%s shows %s, which no Home, Write or Read path explains", c, leak))
+			res = append(res, fail(name, "%s shows %s, which no Home, Write or Read path, link in /etc or scratch directory explains", c, leak))
 		} else {
 			res = append(res, pass(name, "%s lists nothing but paths the spec shows", c))
 		}

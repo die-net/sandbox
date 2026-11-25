@@ -327,13 +327,36 @@ func checkNested(e *checkEnv) []Result {
 	}
 }
 
+// scratchPaths are the mount points a sandbox makes for its own scratch
+// space, which a cover may hold, such as /var/tmp in /var.
+func scratchPaths() []string { return scratchDirs }
+
 // platformSockets are the sockets of this platform that socketCandidates does
 // not list: none on Linux, whose list is the generic one.
 func platformSockets() []string { return nil }
 
-// platformHints is empty on Linux, where the child finds its own targets in the
-// view it is given.
-func platformHints(*Spec) checkHints { return checkHints{} }
+// platformHints gives the child, on Linux, only the files Start binds back
+// read-only because links in /etc lead to them under a cover. The child finds
+// its other targets in the view it is given. These come from the caller's own
+// prepare of spec, as Start's does, and not from the child's view, which would
+// explain whatever a broken cover let it see. A spec prepare refuses gets no
+// hints, and Start then fails with the same error.
+func platformHints(spec *Spec) checkHints {
+	if spec == nil {
+		return checkHints{}
+	}
+	hv, err := currentHostView()
+	if err != nil {
+		return checkHints{}
+	}
+	s := *spec
+	s.Command = []string{SelfPath}
+	prepared, err := prepare(s, hv)
+	if err != nil {
+		return checkHints{}
+	}
+	return checkHints{Linked: prepared.Read}
+}
 
 // foreignPIDs returns the pids in /proc that are neither this process nor
 // its descendants, the parent first.
@@ -401,7 +424,7 @@ func parseStatPPID(s string) (int, bool) {
 // probeLimit bounds how many outside processes each attempt tries.
 const probeLimit = 16
 
-func checkProcesses(*checkEnv) []Result {
+func checkProcesses(e *checkEnv) []Result {
 	pids, err := foreignPIDs()
 	if err != nil {
 		return []Result{
@@ -409,29 +432,36 @@ func checkProcesses(*checkEnv) []Result {
 			skipped("proc.trace", "%v", err), skipped("proc.environ", "%v", err),
 		}
 	}
-	if len(pids) == 0 {
-		return []Result{
-			pass("proc.visible", "no process outside this tree is listed in /proc"),
-			pass("proc.signal", "no outside process to signal"),
-			pass("proc.trace", "no outside process to trace"),
-			pass("proc.environ", "no outside process whose environment to read"),
-		}
+	// In a sandbox Check built, the parent is pid 1, the sandbox's own first
+	// stage, which started the check child. It is part of the sandbox, so it
+	// isn't counted as visible, and signal 0 to it works by design. It is
+	// still tried for tracing and its environment, since it holds the
+	// sandbox's setup and must stay undumpable. A sandbox without a pid
+	// namespace of its own would give the child a parent with another pid.
+	outside := pids
+	if e.spec != nil && os.Getppid() == 1 {
+		outside = slices.DeleteFunc(slices.Clone(pids), func(p int) bool { return p == 1 })
 	}
-	res := []Result{fail("proc.visible", "%d processes outside this tree are listed in /proc, such as pid %d", len(pids), pids[0])}
-	try := pids[:min(len(pids), probeLimit)]
+	var res []Result
+	if len(outside) == 0 {
+		res = append(res, pass("proc.visible", "no process outside this tree is listed in /proc"))
+	} else {
+		res = append(res, fail("proc.visible", "%d processes outside this tree are listed in /proc, such as pid %d", len(outside), outside[0]))
+	}
 	attempts := []struct {
 		name string
+		pids []int
 		fn   func(pid int) bool
 	}{
-		{"proc.signal", func(pid int) bool { return syscall.Kill(pid, 0) == nil }},
-		{"proc.trace", func(pid int) bool {
+		{"proc.signal", outside, func(pid int) bool { return syscall.Kill(pid, 0) == nil }},
+		{"proc.trace", pids, func(pid int) bool {
 			f, err := os.Open("/proc/" + strconv.Itoa(pid) + "/mem")
 			if err == nil {
 				f.Close() //nolint:gosec // G104: the open worked, which is the result.
 			}
 			return err == nil
 		}},
-		{"proc.environ", func(pid int) bool {
+		{"proc.environ", pids, func(pid int) bool {
 			f, err := os.Open("/proc/" + strconv.Itoa(pid) + "/environ")
 			if err != nil {
 				return false
@@ -442,13 +472,18 @@ func checkProcesses(*checkEnv) []Result {
 		}},
 	}
 	for _, a := range attempts {
+		if len(a.pids) == 0 {
+			res = append(res, pass(a.name, "no other process to try"))
+			continue
+		}
+		try := a.pids[:min(len(a.pids), probeLimit)]
 		var worked []string
 		for _, pid := range try {
 			if a.fn(pid) {
 				worked = append(worked, strconv.Itoa(pid))
 			}
 		}
-		res = append(res, verdict(a.name, fmt.Sprintf("%d outside processes tried", len(try)), worked))
+		res = append(res, verdict(a.name, fmt.Sprintf("%d other processes tried", len(try)), worked))
 	}
 	return res
 }
@@ -587,7 +622,7 @@ func cgroupLimit(dir, file string) (string, bool) {
 	return "", false
 }
 
-func checkLimits(*checkEnv) []Result {
+func checkLimits(e *checkEnv) []Result {
 	dir, cgErr := cgroupDir()
 	one := func(name, file string, rlimit int) Result {
 		if cgErr == nil {
@@ -599,6 +634,12 @@ func checkLimits(*checkEnv) []Result {
 		if unix.Getrlimit(rlimit, &rl) == nil && rl.Cur != unix.RLIM_INFINITY {
 			return pass(name, "no cgroup limit, but the rlimit is %d", rl.Cur)
 		}
+		// Check starts its sandbox in the caller's cgroup, with no
+		// Cmd.CgroupFD, so a limit the caller's own sandboxes get from the
+		// cgroup it passes them is out of its sight.
+		if e.spec != nil {
+			return skipped(name, "no finite %s on the cgroup of the sandbox Check started, or its parents, and no rlimit in the Spec. Check starts its sandbox with no Cmd.CgroupFD, so it can't see the limit a caller's own cgroup sets. A sandbox from this Spec has none unless its Cmd.CgroupFD sets one", file)
+		}
 		return fail(name, "no finite %s on this cgroup or its parents, and no rlimit", file)
 	}
 	return []Result{
@@ -608,9 +649,14 @@ func checkLimits(*checkEnv) []Result {
 }
 
 // checkDelegate makes a child of the process's own cgroup, as a unit with
-// Delegate=yes allows, and removes it again.
-func checkDelegate(*checkEnv) []Result {
+// Delegate=yes allows, and removes it again. It asks whether the caller can
+// make a cgroup to pass as Cmd.CgroupFD, which only the caller's own context
+// answers: inside a sandbox the cgroup tree is read-only.
+func checkDelegate(e *checkEnv) []Result {
 	const name = "cgroup.delegate"
+	if e.spec != nil {
+		return []Result{skipped(name, "the check runs inside the sandbox Check started, whose cgroup tree is read-only. Check with no Spec tries it in the caller's own context")}
+	}
 	dir, err := cgroupDir()
 	if err != nil {
 		return []Result{fail(name, "%v", err)}

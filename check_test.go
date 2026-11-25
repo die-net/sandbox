@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -222,6 +223,28 @@ func TestSpecDrivenChecks(t *testing.T) {
 	}
 	if entries, _ := os.ReadDir(ro); len(entries) != 0 {
 		t.Errorf("writes.outside left %v", entries)
+	}
+}
+
+// TestExtraGroups checks that the primary gid, which Docker and initgroups put
+// in getgroups' list, isn't counted as a supplementary group, and that any
+// other group is.
+func TestExtraGroups(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		gs        []int
+		gid, egid int
+		want      []int
+	}{
+		{nil, 1000, 1000, nil},
+		{[]int{1000}, 1000, 1000, nil},
+		{[]int{1000, 999}, 1000, 1000, []int{999}},
+		{[]int{5}, 1000, 5, nil},
+		{[]int{65534}, 1000, 1000, []int{65534}},
+	} {
+		if got := extraGroups(tc.gs, tc.gid, tc.egid); !slices.Equal(got, tc.want) {
+			t.Errorf("extraGroups(%v, %d, %d) = %v, want %v", tc.gs, tc.gid, tc.egid, got, tc.want)
+		}
 	}
 }
 

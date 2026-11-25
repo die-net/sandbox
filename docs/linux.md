@@ -180,6 +180,15 @@ The enforce-mode profile isn't used everywhere because AppArmor 4.0.1, Ubuntu 24
 
 It also reports capabilities, `no_new_privs`, the seccomp mode and supplementary groups, and it takes a caller's own `Unreadable`, `Unwritable` and `Unreachable` lists. A pass means one attempt failed, not that every path is closed.
 
+Inside a sandbox built from a `Spec`, the checks count what the library itself puts there as the sandbox's own:
+
+- The sandbox's pid 1 is its first stage, the check child's parent. `proc.visible` doesn't count it and `proc.signal` doesn't try it, since signal 0 to it works by design. `proc.trace` and `proc.environ` still try it, since it must stay undumpable. A sandbox without a pid namespace of its own would give the child a parent with another pid, which still counts.
+- Under the covers, the scratch mount points (`/var/tmp` in `/var`) and the files that links in `/etc` lead to, which `Start` binds back, are explained. The caller works those files out with the same `prepare` that `Start` runs, and hands them to the child, which doesn't trust its own view for them. The walk still goes into the scratch directories.
+- `limits.memory` and `limits.tasks` are `Skipped`, not failed, when neither a cgroup limit nor an rlimit is seen, since `Check` starts its sandbox with no `Cmd.CgroupFD` and can't see the limit a caller's own sandboxes get from theirs. A limit it sees still passes.
+- `cgroup.delegate` is `Skipped`, since the cgroup tree is read-only inside. `Check` with no `Spec` tries it in the caller's own context.
+
+`groups.supplementary` ignores the process's own gid, which Docker and `initgroups` put in `getgroups`' list too.
+
 ## Tried and dropped
 
 - **Landlock alone.** Before ABI 9 it doesn't check socket files, so it doesn't keep a sandbox off the account's own services, and it leaves ptys, SysV IPC and other processes' command lines open too.

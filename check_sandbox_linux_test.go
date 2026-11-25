@@ -42,9 +42,26 @@ func TestCheckSandbox(t *testing.T) {
 		"expect.unreadable:" + secret: Pass,
 		// Not vacuous: a path under Home is writable, so the check says so.
 		"expect.unwritable:" + inHome: Fail,
+		// The sandbox's own pid 1, the check child's parent, is not outside
+		// it, and its own /var/tmp is not a leak of /var.
+		"proc.visible": Pass,
+		"proc.signal":  Pass,
+		// pid 1 is still tried, and is undumpable.
+		"proc.trace":   Pass,
+		"proc.environ": Pass,
+		"covers:/var":  Pass,
+		// Only the caller's own context can make a cgroup to delegate.
+		"cgroup.delegate": Skipped,
 	} {
 		if r, ok := m[name]; !ok || r.Status != st {
 			t.Errorf("%s = %+v, want %v", name, r, st)
+		}
+	}
+	// Check's sandbox gets no CgroupFD, so it can't fail a limit that the
+	// caller's own sandboxes may get from one. A limit it sees still passes.
+	for _, name := range []string{"limits.memory", "limits.tasks"} {
+		if r, ok := m[name]; !ok || r.Status == Fail {
+			t.Errorf("%s = %+v, want Pass or Skipped", name, r)
 		}
 	}
 	for _, name := range []string{"writes.outside", "covers"} {

@@ -37,6 +37,10 @@ func initialUserNS() bool { return true }
 // grandchild has no modes here.
 func grandchild([]string) (int, bool) { return 0, false }
 
+// scratchPaths is empty off Linux, where a sandbox makes no mount points of
+// its own.
+func scratchPaths() []string { return nil }
+
 // platformSockets are the sockets of the container runtimes that run on macOS
 // in a VM, and which a program that reaches can start anything as the user:
 // Docker Desktop's, and Colima's, OrbStack's, and Podman's.

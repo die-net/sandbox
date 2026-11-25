@@ -151,23 +151,14 @@ func (c *Cmd) Start() error {
 	if err != nil {
 		return err
 	}
-	homes, err := hostHomes()
-	if err != nil {
-		return err
-	}
-	// The account the program runs as may come from a directory service that
-	// /etc/passwd does not list.
-	if home, err := os.UserHomeDir(); err == nil {
-		homes = append(homes, home)
-	}
 	if spec.Dir == "" {
 		spec.Dir = spec.Home
 	}
-	mounts, err := hostMounts()
+	hv, err := currentHostView()
 	if err != nil {
 		return err
 	}
-	spec, err = prepare(spec, hostView{fs: os.DirFS("/"), homes: homes, mounts: mounts, cover: defaultCover})
+	spec, err = prepare(spec, hv)
 	if err != nil {
 		return err
 	}
@@ -320,6 +311,25 @@ func (c *Cmd) Wait() error {
 		err = serr
 	}
 	return err
+}
+
+// currentHostView reads what prepare needs of this host: its homes, which
+// count the account's own, and its mount table.
+func currentHostView() (hostView, error) {
+	homes, err := hostHomes()
+	if err != nil {
+		return hostView{}, err
+	}
+	// The account the program runs as may come from a directory service that
+	// /etc/passwd does not list.
+	if home, err := os.UserHomeDir(); err == nil {
+		homes = append(homes, home)
+	}
+	mounts, err := hostMounts()
+	if err != nil {
+		return hostView{}, err
+	}
+	return hostView{fs: os.DirFS("/"), homes: homes, mounts: mounts, cover: defaultCover}, nil
 }
 
 // receiveReply reads the stage's one message from the control socket: its

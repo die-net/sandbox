@@ -34,17 +34,21 @@ The counts include subtests, and are the same with and without cgo. They are the
 
 | Target | How | Pass | Skip | Fail |
 |---|---|---|---|---|
-| Debian 13, arm64, kernel 6.12, bubblewrap 0.12.0, Lima VM `sbx-dev` | default | 293 | 5 | 0 |
+| Debian 13, arm64, kernel 6.12, bubblewrap 0.12.0, Lima VM `sbx-dev` | default | 307 | 5 | 0 |
 | Debian 13, x86_64, Proxmox kernel 7.0.14, LXC container, bubblewrap 0.12.0 | `SBX_SSH=user@host` | 293 | 5 | 0 |
-| Ubuntu 24.04.5, arm64, kernel 6.8, bubblewrap 0.9.0 from apt, AppArmor restriction on, Lima VM `sbx-ubuntu` | `SBX_VM=sbx-ubuntu SBX_APPARMOR=1` | 293 | 5 | 0 |
+| Ubuntu 24.04.5, arm64, kernel 6.8, bubblewrap 0.9.0 from apt, AppArmor restriction on, Lima VM `sbx-ubuntu` | `SBX_VM=sbx-ubuntu SBX_APPARMOR=1` | 307 | 5 | 0 |
+| Ubuntu 26.04.1, arm64, kernel 7.0, bubblewrap 0.11.1 from apt, AppArmor restriction on and `bwrap-userns-restrict` loaded, Lima VM `sbx-ubuntu2604` | `SBX_VM=sbx-ubuntu2604 SBX_APPARMOR=1` | 307 | 5 | 0 |
 
-Each was run with `CGO_ENABLED=0` and with cgo on (`CGO=1`, which builds on the target, since the host has no C cross-compiler). Each was rerun after the macOS review fixes.
+Each was run with `CGO_ENABLED=0` and with cgo on (`CGO=1`, which builds on the target, since the host has no C cross-compiler), and rerun after the macOS review fixes. The counts for `sbx-dev`, `sbx-ubuntu` and `sbx-ubuntu2604` are from the AppArmor fix, with `CGO_ENABLED=0` only, since `sbx-ubuntu2604` has no Go; CI runs Ubuntu 24.04 and 26.04 with cgo on and off, on amd64, where the foreign-ABI case runs too.
+
+On Ubuntu 26.04 the suite runs under the enforce-mode profile, and on 24.04 under the unconfined-mode one, each the profile `Probe` prints there. Each fails on the other's host: the unconfined-mode profile on 26.04 leaves every first stage without its capabilities, and the enforce-mode one on 24.04 has bubblewrap's mounts and sockets refused ([linux.md](linux.md#probe-and-check)).
 
 Without `SBX_APPARMOR=1`, the same Ubuntu run fails 159 of the tests that start a sandbox, in 11 seconds and with no hang, and `TestProbeVM` shows the diagnostic. On Ubuntu 24.04 the tests run as the account's uid under a profile for the test binary. The suite passes on apt's bubblewrap 0.9.0, so the 0.8 floor is tested at 0.9, and the symlink flaw fixed in 0.12.0 stays open there as [security-model.md](security-model.md#open-issues) notes.
 
 **The skips** are the same on every target except where noted:
 
 - `TestWriteApparmorProfile` is the helper that `scripts/apparmor.sh` calls, and skips unless asked.
+- `TestBwrapLabel` skips where AppArmor is off. It ran on every target above.
 - `TestAPIRlimits` skips where the host's hard core limit is unlimited, so no higher one can be asked for.
 - `TestAPICgroupFD` skips where the login session has no delegated cgroup to start in.
 - The `.zfs` case of `TestEscapeMountTableCovers` skips where there's no ZFS dataset (`TestMountCovers` checks the rule on a fake mount table).
@@ -74,10 +78,10 @@ The full suite also passes on GitHub's 3-core arm64 runners, macOS 15.8.2 (`maco
 
 ### CI
 
-`.github/workflows/test.yml` runs on every push and pull request. It has not run yet, since this repository has no GitHub remote.
+`.github/workflows/test.yml` runs on every push and pull request.
 
 - **Vet:** `go vet` for linux amd64, arm64 and arm, with `CGO_ENABLED=0`.
-- **Linux:** the tests on `ubuntu-24.04` with apt's bubblewrap, with cgo off and on. The runner keeps `kernel.apparmor_restrict_unprivileged_userns` at 1 and loads the test binary's profile, so CI exercises the fix users get (`SBX_LOCAL=1 SBX_APPARMOR=1`).
+- **Linux:** the tests on `ubuntu-24.04` and `ubuntu-26.04` with apt's bubblewrap, with cgo off and on. Both runners keep `kernel.apparmor_restrict_unprivileged_userns` at 1, and the test loads the profile the library prints for the test binary there, so CI exercises the fix users get (`SBX_LOCAL=1 SBX_APPARMOR=1`). 26.04 also loads Ubuntu's `bwrap-userns-restrict`, which takes the other profile, and its legs fail if Ubuntu's `bwrap` profile isn't loaded. CI loads the `ip_tables` module, which the 26.04 runner doesn't load itself: without it, `TestIsolation`'s `open` level gets `ENOPROTOOPT` from the kernel before any permission check, where it wants `EPERM`.
 - **macOS:** `go build`, `go vet` for arm64 and amd64, and `go test` on `macos-15` and `macos-26`, with cgo off and on, and `go test -race` on the cgo leg.
 - **Go toolchain:** CI takes its Go from the `toolchain` line of `go.mod`, which is 1.26.5. Go 1.26.0 to 1.26.4 with `-race` on darwin can crash the child of a fork before it execs, with `signal: segmentation fault` from `Wait` for a program that never ran (golang/go#79804, fixed in 1.26.5 by #79806). It hit `TestProfileCutShortDoesNotRun` on `macos-26` in PR 2: the shell that runs `sandbox-exec` died before it wrote anything, so `sandbox-exec` never ran and the profile was not at fault. `TestRaceDetectorToolchainCanForkOnDarwin` fails under a `-race` build with an older Go.
 
@@ -129,14 +133,18 @@ Targets:
 | `SBX_SSH=user@host` | A machine reached by passwordless ssh. Its architecture comes from `uname -m`. |
 | `SBX_LOCAL=1` | This machine, which must be Linux. CI uses it. |
 | `CGO=1` | Build with cgo. The default is `CGO_ENABLED=0`, as releases are. Cgo needs a C compiler for the target, so the script copies the sources to the target and builds there. The target needs `go` (on `PATH`, `/usr/local/go/bin`, or `/usr/local/bin`) and `gcc`. |
-| `SBX_APPARMOR=1` | Load the AppArmor profile for the test binary before the tests and remove it after, with `scripts/apparmor.sh`. Ubuntu 24.04 needs it. Without it the tests fail there, which is the library's behavior. |
+| `SBX_APPARMOR=1` | Load the AppArmor profile for the test binary before the tests and remove it after, with `scripts/apparmor.sh`. Ubuntu 24.04 and later need it. The profile is the one the library prints on that host. Without it the tests fail there, which is the library's behavior. |
 
 ### The Ubuntu VM
 
-`sbx-ubuntu` is a Lima VM with Ubuntu 24.04. Make it with:
+`sbx-ubuntu` is a Lima VM with Ubuntu 24.04, and `sbx-ubuntu2604` one with Ubuntu 26.04, which loads `bwrap-userns-restrict`. Make them with:
 
 ```bash
 limactl create --name=sbx-ubuntu --cpus=4 --memory=4 --set '.mounts=[]' template:ubuntu-24.04
+```
+
+```bash
+limactl create --name=sbx-ubuntu2604 --cpus=4 --memory=4 --set '.mounts=[]' template:ubuntu-26.04
 ```
 
 Then start it, install `bubblewrap` and `gcc` with apt, and copy Go in for cgo builds. Run the tests with:
@@ -164,6 +172,7 @@ So these rules hold for every darwin test:
 A check is only worth its passes if it fails when the guarantee is taken away. Each check that guards a finding was run with the fix removed, on a copy of the tree, and seen to fail.
 
 - **Linux:** the covers, the filter, the first stage's private mounts, `--as-pid-1`, the cover of other file types, the mount order, the netfilter rule, and the four from the latest review: the sandbox's process group and foreground, the read-only `/dev` and the session keyring. The descriptor test documents a behavior and fails if it changes. The ZFS fix was checked by hand on the ZFS host.
+- **Linux, `Probe` and `Check` on Ubuntu 26.04** (on `sbx-ubuntu2604`): `Probe`'s trial put back to running `true` in bubblewrap (`TestProbeTrialStartsTheFirstStage` fails: `Probe` passes with a bubblewrap that leaves the stage no capabilities); `apparmorEnforce` always false, `apparmorInForce` always false, or `apparmorApplies` always true (`TestDiagnoseApparmor` fails); a trial that couldn't be built not reported as `probe.trial` (`TestDiagnose` fails). In `Check`: the sandbox's pid 1 counted as outside (`TestCheckSandbox` fails on `proc.visible` and `proc.signal`); a reaper left dumpable (`proc.environ` fails, so pid 1 is still tried; `proc.trace` passes anyway under Ubuntu's Yama setting); the scratch mount points, or the caller's linked `/etc` files, not explained (`covers:/var` fails, on `/var/tmp` and on `/var/lib` from `/etc/sgml/catalog`); `limits.*` failed rather than skipped under a `Spec` (`limits.memory` fails); `cgroup.delegate` run inside the sandbox (it fails with a read-only file system); `extraGroups` that keeps the primary gid (`TestExtraGroups` fails). The enforce-mode profile without `attach_disconnected`, loaded by hand, fails every sandbox with `Failed name lookup - disconnected path`.
 - **macOS:** the foreground of the terminal, the quoting of paths, the `process-info` deny, the group kill when the command exits, the group kill when the stage is killed, the lifeline, the terminal deny, the `localhost` deny of `NetworkHost`, the covers, the signal target, the loopback port rule and the readable `SelfPath`.
 - **macOS teardown proof:** a vanished pid counted as clean (`TestScanVanishedPidForcesAnotherScan`, `TestScanBudget` and `TestTeardownReportsWhatItCouldNotConfirm` fail), and a new zombie counted as safe (`TestScanZombies` and `TestTeardownLingeringZombie` fail).
 - **macOS teardown proof, review findings:** each is a mutation that a test catches. A scan that ignores an exiting process (`TestScanExitingPidForcesAnotherScan`), `statPid` without the exit flag (`TestProcStatOfReadsTheFlagsAndTheName`), `member` that never asks the kernel whether it finds the pid (`TestMemberNeverClearsAnExitingChild`, `TestMemberOfGonePids`), and all three together (`TestRealScanIsNeverCleanWhileAChainLives`); the old In-then-Out order of checks (`TestMemberNeverMatchesAProcessApplyingAProfile`); no rule for an unsandboxed `sandbox-exec` (`TestScanSandboxExecThatHasNotAppliedItsProfile`, `TestRealScanIsNotCleanWhileSandboxExecWaitsForItsProfile`); a message kind that isn't checked (`TestStageMessagesRefuseTheWrongKind`); a list compared with the first size only (`TestListPidsAsksAgainWhenTheListMayBeCut`); a profile that isn't one form, or has its marker last (`TestProfileCutShortDoesNotRun`); a stage that always reports empty or a caller that ignores the report (`TestTeardownStageThatCannotProveLeavesItToTheCaller`); and a missing report counted as empty (`TestWaitScansWhenTheStageWasKilledAndNothingHoldsTheOutput`).
