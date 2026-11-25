@@ -53,6 +53,9 @@ Every field is honored or harmlessly ignored on both backends. `Probe` lists the
 | `Files`, `Rlimits` | Through bubblewrap, set by pid 1. | Through `sandbox-exec`, set by the stage before it execs. |
 | Memory and tasks | `CgroupFD`, or `Footprint`. | `Footprint`. |
 | `Hostname`, `ScratchSize` | Supported. | Ignored. `TMPDIR` is in `Home`. |
+| `OwnSession` | bubblewrap's `--new-session`: pid 1, which `Pid` names, leads the session. The caller keeps the terminal's foreground. | The caller starts the stage with `setsid`, so the stage, which `Pid` names, leads the session. |
+
+`OwnSession` is for a caller that tells sandboxes apart by a peer's session, as a bridge can on macOS, which has no pid namespace: the peer's session is `Pid`, unless the peer called `setsid`, and a session the caller can't place should be refused. It costs the command its controlling terminal. A terminal on `Stdin` still reads and writes, but `/dev/tty` doesn't open, and a Ctrl-C at the terminal goes to the caller.
 
 A `Kernel` level is only ever raised. A level the host can't meet is an error from `Command`, never a silent fall to a weaker one. For example, 32-bit arm has no system call list, so `strict` and `nested` are refused there.
 

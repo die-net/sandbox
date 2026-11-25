@@ -92,6 +92,7 @@ func TestMain(m *testing.M) {
 	registerEscapeModes()
 	registerEscRoot()
 	registerHardeningChecks()
+	registerOwnSession()
 	opts := stageOptions{
 		noCloseRange: os.Getenv(stageNoCloseRangeEnv) != "",
 		fdDir:        os.Getenv(stageFdDirEnv),

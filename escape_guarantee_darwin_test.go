@@ -1689,71 +1689,87 @@ func openPty(t *testing.T) (*os.File, string) {
 // that keys on the session of the peer sees a session that is neither the
 // sandbox's start nor the caller's. This documents what a bridge check may
 // rely on: the peer is the sandbox's process, and nothing says which session
-// it is in. It fails if setsid stops working.
+// it is in. OwnSession doesn't change that: the command is in the stage's
+// session, and the process that calls setsid leaves it. It fails if setsid
+// stops working.
 func TestGapSetsidConnect(t *testing.T) {
 	t.Parallel()
-	short, err := os.MkdirTemp("/private/tmp", "sbx")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(short) })
-	sock := filepath.Join(short, "bridge.sock")
-	l, err := listen("unix", sock)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer l.Close()
-	var peerPid, peerSid, peerPgid int
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		conn, err := l.Accept()
-		if err != nil {
-			return
+	for _, own := range []bool{false, true} {
+		name := "caller's session"
+		if own {
+			name = "own session"
 		}
-		defer conn.Close()
-		raw, _ := conn.(*net.UnixConn).SyscallConn()
-		_ = raw.Control(func(fd uintptr) {
-			// LOCAL_PEERPID, which is for unix sockets, as a bridge's is.
-			peerPid, _ = unix.GetsockoptInt(int(fd), 0 /* SOL_LOCAL */, 0x002 /* LOCAL_PEERPID */)
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			short, err := os.MkdirTemp("/private/tmp", "sbx")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.RemoveAll(short) })
+			sock := filepath.Join(short, "bridge.sock")
+			l, err := listen("unix", sock)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer l.Close()
+			var peerPid, peerSid, peerPgid int
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				conn, err := l.Accept()
+				if err != nil {
+					return
+				}
+				defer conn.Close()
+				raw, _ := conn.(*net.UnixConn).SyscallConn()
+				_ = raw.Control(func(fd uintptr) {
+					// LOCAL_PEERPID, which is for unix sockets, as a bridge's is.
+					peerPid, _ = unix.GetsockoptInt(int(fd), 0 /* SOL_LOCAL */, 0x002 /* LOCAL_PEERPID */)
+				})
+				if peerPid > 0 {
+					peerSid, _ = unix.Getsid(peerPid)
+					peerPgid, _ = unix.Getpgid(peerPid)
+				}
+				// Hold the connection until the command is done.
+				_, _ = io.Copy(io.Discard, conn)
+			}()
+			c := escCmd(t.Context(), t, Spec{Write: []string{sock}, OwnSession: own}, "setsid-connect", "unix-"+sock)
+			var out, errb bytes.Buffer
+			c.Stdout, c.Stderr = &out, &errb
+			if err := c.Start(); err != nil {
+				t.Fatal(err)
+			}
+			if err := c.Wait(); err != nil {
+				t.Fatalf("the sandboxed process could not make a session of its own and connect: %v\n%s", err, errb.String())
+			}
+			<-done
+			mySid, _ := unix.Getsid(0)
+			f := strings.Fields(out.String())
+			if len(f) != 2 {
+				t.Fatalf("output %q", out.String())
+			}
+			if peerPid == 0 {
+				t.Fatal("no peer pid")
+			}
+			if f[1] == strconv.Itoa(mySid) {
+				t.Errorf("the process is in the caller's session %d after setsid", mySid)
+			}
+			// What a bridge check can learn from the connection: the peer's pid,
+			// which is a process of the sandbox, in a session that is neither the
+			// command's nor the caller's, and in a process group of its own. The
+			// peer has exited by now, so its session is read while it held the
+			// connection.
+			// With OwnSession the command's session is the one the stage leads, which
+			// Pid names, and the peer has left it all the same.
+			if own && f[0] != strconv.Itoa(c.Pid()) {
+				t.Errorf("the command is in session %s, not the stage's %d", f[0], c.Pid())
+			}
+			if peerSid == 0 || strconv.Itoa(peerSid) == f[0] || peerSid == mySid {
+				t.Errorf("the peer %d is in session %d, which is the command's %s or the caller's %d: a check by session would have seen a sandbox process", peerPid, peerSid, f[0], mySid)
+			}
+			t.Logf("peer pid %d, session %d, group %d; the command's session is %s", peerPid, peerSid, peerPgid, f[0])
 		})
-		if peerPid > 0 {
-			peerSid, _ = unix.Getsid(peerPid)
-			peerPgid, _ = unix.Getpgid(peerPid)
-		}
-		// Hold the connection until the command is done.
-		_, _ = io.Copy(io.Discard, conn)
-	}()
-	c := escCmd(t.Context(), t, Spec{Write: []string{sock}}, "setsid-connect", "unix-"+sock)
-	var out, errb bytes.Buffer
-	c.Stdout, c.Stderr = &out, &errb
-	if err := c.Start(); err != nil {
-		t.Fatal(err)
 	}
-	if err := c.Wait(); err != nil {
-		t.Fatalf("the sandboxed process could not make a session of its own and connect: %v\n%s", err, errb.String())
-	}
-	<-done
-	mySid, _ := unix.Getsid(0)
-	f := strings.Fields(out.String())
-	if len(f) != 2 {
-		t.Fatalf("output %q", out.String())
-	}
-	if peerPid == 0 {
-		t.Fatal("no peer pid")
-	}
-	if f[1] == strconv.Itoa(mySid) {
-		t.Errorf("the process is in the caller's session %d after setsid", mySid)
-	}
-	// What a bridge check can learn from the connection: the peer's pid,
-	// which is a process of the sandbox, in a session that is neither the
-	// command's nor the caller's, and in a process group of its own. The
-	// peer has exited by now, so its session is read while it held the
-	// connection.
-	if peerSid == 0 || strconv.Itoa(peerSid) == f[0] || peerSid == mySid {
-		t.Errorf("the peer %d is in session %d, which is the command's %s or the caller's %d: a check by session would have seen a sandbox process", peerPid, peerSid, f[0], mySid)
-	}
-	t.Logf("peer pid %d, session %d, group %d; the command's session is %s", peerPid, peerSid, peerPgid, f[0])
 }
 
 // ---------------------------------------------------------------- the profile and its start

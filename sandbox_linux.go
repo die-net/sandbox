@@ -249,7 +249,8 @@ func (c *Cmd) Start() error {
 	// No Pdeathsig, and no --die-with-parent, which is the same call made
 	// in bubblewrap: it fires when the OS thread that started bubblewrap
 	// exits, and a Go server's threads come and go. The lifeline does it.
-	// A process group of its own, always, and the caller's session still.
+	// A process group of its own, always, and the caller's session, which pid
+	// 1 leaves with OwnSession.
 	// The filter allows kill, tgkill and setpriority, so a sandbox that
 	// shared its caller's group could signal and renice the caller and
 	// everything else in it, through kill(0, ...) and setpriority(PRIO_PGRP).
@@ -257,7 +258,16 @@ func (c *Cmd) Start() error {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, UseCgroupFD: c.CgroupFD > 0, CgroupFD: max(c.CgroupFD, 0)}
 	// A background group is stopped when it reads the caller's terminal, so
 	// an interactive command gets the foreground until Wait gives it back.
-	tty := foregroundTerminal(c.Stdin)
+	// With OwnSession the sandbox has no controlling terminal, so job control
+	// doesn't stop its reads (tty_check_change in drivers/tty/tty_jobctrl.c
+	// checks only a process's own one), and no group of the sandbox's session
+	// could hold the terminal's foreground. Handed to bubblewrap's group,
+	// which then holds only bubblewrap's outer process, it would send a
+	// Ctrl-C there and not to the caller (TestOwnSessionTerminal).
+	var tty *terminal
+	if !spec.OwnSession {
+		tty = foregroundTerminal(c.Stdin)
+	}
 	if tty != nil {
 		cmd.SysProcAttr.Foreground, cmd.SysProcAttr.Ctty = true, tty.fd
 	}
@@ -560,10 +570,18 @@ func newLaunch(spec Spec, acct account, stageFiles []*os.File) (*launch, error) 
 		"--as-pid-1",
 		// For the first stage alone, which drops them before the command.
 		"--cap-add", "CAP_SYS_ADMIN", "--cap-add", "CAP_SETPCAP",
-		// No --new-session: a caller may check that a bridge is in the session
-		// of the command's starter, and the filter refuses TIOCSTI,
-		// which a new session would otherwise guard against.
 		"--ro-bind", "/", "/",
+	}
+	// The caller's session by default: a caller may check that a bridge is
+	// in the session of the command's starter, and the filter refuses
+	// TIOCSTI, which a new session would otherwise guard against. With
+	// OwnSession, bubblewrap calls setsid in the namespace's first process,
+	// which --as-pid-1 makes the first stage, so pid 1 leads the session
+	// (TestEscapeOwnSession). It is not a process group leader, since Start
+	// puts bubblewrap in a group of its own, so the call can't fail with
+	// EPERM.
+	if spec.OwnSession {
+		args = append(args, "--new-session")
 	}
 	if spec.Network == NetworkNone {
 		// A network namespace with only a loopback, and abstract sockets
