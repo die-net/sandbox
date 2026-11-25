@@ -138,7 +138,13 @@ func TestDiagnose(t *testing.T) {
 			f.Seccomp, f.Container, f.UnshareErr = 2, "docker", &fakeErr{syscall.EINVAL}
 		}), "probe.userns", "no known cause"},
 		{"docker apparmor", mod(func(f *probeFacts) { f.Container, f.AppArmor = "docker", "docker-default (enforce)" }), "probe.docker-apparmor", "apparmor=unconfined"},
-		{"masked proc", mod(func(f *probeFacts) { f.Mounts = proc }), "probe.masked-proc", "systempaths=unconfined"},
+		{"masked proc", mod(func(f *probeFacts) { f.Container, f.Mounts = "docker", proc }), "probe.masked-proc", "systempaths=unconfined"},
+		// Overmounts under /proc outside a container, such as systemd's
+		// binfmt_misc on every host, don't explain a failed trial.
+		{"overmounts outside a container", mod(func(f *probeFacts) { f.Mounts = proc }), "probe.userns", "no known cause"},
+		{"binfmt_misc in a container", mod(func(f *probeFacts) {
+			f.Container, f.Mounts = "lxc", []mount{{point: "/proc"}, {point: "/proc/sys/fs/binfmt_misc"}}
+		}), "probe.userns", "no known cause"},
 		{"systemd unit", mod(func(f *probeFacts) { f.Container = "systemd-unit" }), "probe.systemd-unit", "RestrictNamespaces="},
 		{"unknown", mod(func(*probeFacts) {}), "probe.userns", "No permissions"},
 		// Order: AppArmor before sysctl before container seccomp.
@@ -187,6 +193,18 @@ func TestMasked(t *testing.T) {
 	}
 	if masked(mounts[:2]) {
 		t.Error("a plain /proc was called masked")
+	}
+	// What systemd mounts on every stock host (Ubuntu 26.04's mount table).
+	const host = `1 0 0:1 / / rw - ext4 /dev/vda1 rw
+2 1 0:5 / /proc rw - proc proc rw
+30 2 0:35 / /proc/sys/fs/binfmt_misc rw,relatime shared:14 - autofs systemd-1 rw,fd=35
+63 30 0:46 / /proc/sys/fs/binfmt_misc rw,nosuid,nodev,noexec,relatime shared:97 - binfmt_misc binfmt_misc rw
+`
+	if mounts, err = parseMountinfo(strings.NewReader(host)); err != nil {
+		t.Fatal(err)
+	}
+	if masked(mounts) {
+		t.Error("systemd's binfmt_misc was called masked")
 	}
 }
 
