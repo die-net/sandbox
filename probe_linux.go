@@ -161,8 +161,26 @@ func runTrial(spec Spec) (failed, built string) {
 	return err.Error(), ""
 }
 
+// labels returns this process's AppArmor label and the one bubblewrap gets
+// when this process runs it, as Probe's diagnosis compares them. Either is ""
+// when it can't be read.
+func labels(bwrap string) (self, bubblewrap string) {
+	return readLabel("/proc/self/attr/"), bwrapLabel(bwrap)
+}
+
+// procIsOwn reports whether /proc belongs to this process's pid namespace,
+// so that the pids this process sees name the same processes there. Under
+// another pid namespace's procfs, /proc/self still resolves to this process,
+// through that procfs's own namespace (proc_self_get_link in Linux
+// fs/proc/self.c), but by another number than os.Getpid.
+func procIsOwn() bool {
+	link, err := os.Readlink("/proc/self")
+	return err == nil && link == strconv.Itoa(os.Getpid())
+}
+
 // bwrapLabel returns the AppArmor label bubblewrap gets when this process
-// runs it, or "" when it can't be read. bubblewrap reads its --args
+// runs it, or "" when it can't be read, as when /proc belongs to another pid
+// namespace, where bubblewrap's pid names another process. bubblewrap reads its --args
 // descriptor to the end while it parses its arguments (parse_args_recurse in
 // bubblewrap.c), which main does before it makes any namespace, so it waits
 // there while the pipe's write end is open. The label is read then, and
@@ -170,6 +188,9 @@ func runTrial(spec Spec) (failed, built string) {
 // unconfined-mode profile, as on Ubuntu 26.04 with its bwrap profile, the
 // label is bubblewrap's own, and what it starts gets more stacked on it.
 func bwrapLabel(bwrap string) string {
+	if !procIsOwn() {
+		return ""
+	}
 	r, w, err := os.Pipe()
 	if err != nil {
 		return ""
@@ -184,17 +205,17 @@ func bwrapLabel(bwrap string) string {
 	if err != nil {
 		return ""
 	}
-	label := readLabel(cmd.Process.Pid)
+	label := readLabel("/proc/" + strconv.Itoa(cmd.Process.Pid) + "/attr/")
 	w.Close()      //nolint:gosec // G104: this ends bubblewrap's read, and the deferred close is then a no-op.
 	_ = cmd.Wait() // bubblewrap exits 1 for want of a command, which is expected.
 	return label
 }
 
-// readLabel returns the AppArmor label of the process pid, from AppArmor's
-// own attr/apparmor/current, which Linux has had since 5.8, or before that
-// from attr/current, which is whichever major LSM the kernel runs.
-func readLabel(pid int) string {
-	dir := "/proc/" + strconv.Itoa(pid) + "/attr/"
+// readLabel returns the AppArmor label of the process whose attr directory
+// under /proc is dir, from AppArmor's own apparmor/current, which Linux has
+// had since 5.8, or before that from current, which is whichever major LSM
+// the kernel runs.
+func readLabel(dir string) string {
 	b, err := os.ReadFile(dir + "apparmor/current") //nolint:gosec // G304: a fixed file of a process's proc directory.
 	if err != nil {
 		b, err = os.ReadFile(dir + "current") //nolint:gosec // G304: a fixed file of a process's proc directory.
@@ -235,8 +256,7 @@ func gatherFailureFacts(f *probeFacts) {
 		st.Close() //nolint:gosec // G104: a read-only descriptor, and nothing can be done about a failed close.
 		f.Seccomp = s.Seccomp
 	}
-	f.AppArmor = readLabel(os.Getpid())
-	f.BwrapLabel = bwrapLabel(f.Bwrap)
+	f.AppArmor, f.BwrapLabel = labels(f.Bwrap)
 	if mi, err := os.Open("/proc/self/mountinfo"); err == nil {
 		f.Mounts, _ = parseMountinfo(mi)
 		mi.Close() //nolint:gosec // G104: a read-only descriptor, and nothing can be done about a failed close.

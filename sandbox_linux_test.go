@@ -94,6 +94,7 @@ func TestMain(m *testing.M) {
 	registerHardeningChecks()
 	registerOwnSession()
 	registerFdsListed()
+	registerProbeLabels()
 	opts := stageOptions{
 		noCloseRange: os.Getenv(stageNoCloseRangeEnv) != "",
 		fdDir:        os.Getenv(stageFdDirEnv),

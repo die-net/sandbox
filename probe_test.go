@@ -125,6 +125,13 @@ func TestDiagnose(t *testing.T) {
 			f.Sysctl["kernel.apparmor_restrict_unprivileged_userns"] = "1"
 			f.Container, f.AppArmor, f.BwrapLabel = "docker", "docker-default (enforce)", "bwrap (enforce)"
 		}), "probe.docker-apparmor", "apparmor=unconfined"},
+		// bubblewrap under a profile other than Ubuntu's bwrap, such as an
+		// operator's child profile, is not blamed, and a later finding
+		// explains the failure.
+		{"another bwrap profile", mod(func(f *probeFacts) {
+			f.AppArmor, f.BwrapLabel = "unconfined", "svc//bwrap_child (enforce)"
+			f.Container, f.Mounts = "lxc", proc
+		}), "probe.masked-proc", "systempaths=unconfined"},
 		{"same label is no cause", mod(func(f *probeFacts) {
 			f.AppArmor, f.BwrapLabel = "sandbox-opt-app-server (enforce)", "sandbox-opt-app-server (enforce)"
 		}), "probe.userns", "no known cause"},

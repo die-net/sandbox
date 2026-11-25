@@ -157,7 +157,7 @@ When no sandbox can start, `Report.Checks` ends at the first prerequisite that b
 2. Running as root.
 3. No call of `Stage`.
 4. A trial that couldn't be built.
-5. bubblewrap getting another AppArmor label than this program's own, as Ubuntu 26.04's `bwrap` profile gives it. `Probe` reads the label while bubblewrap waits to read its `--args`, before it makes any namespace.
+5. bubblewrap getting the label of Ubuntu 26.04's `bwrap` profile, which isn't this program's own. `Probe` reads the label while bubblewrap waits to read its `--args`, before it makes any namespace. It reads this program's own label through `/proc/self`, and leaves bubblewrap's unknown when `/proc` belongs to another pid namespace, where bubblewrap's pid would name another process. bubblewrap under another profile, such as one an operator wrote, isn't blamed, and a later finding explains the failure.
 6. Ubuntu's AppArmor restriction on user namespaces.
 7. A sysctl that turns user namespaces off.
 8. Docker's or Podman's default seccomp profile.
