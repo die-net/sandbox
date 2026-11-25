@@ -27,6 +27,15 @@ The darwin tests run escape attempts on the developer's own machine, as their ui
 - No fork bombs. A test of re-forking processes is bounded, and ends only what it started.
 - Run long suites in the foreground with a timeout. After a darwin run, check that no `sandbox.test`, `sandbox-stage` or `sandbox-exec` process is left.
 
+## Test dependencies
+
+Tests must run, and check what they claim, on a minimal host with no network.
+
+- No network beyond the host. A test that needs an outside peer opens its own listener on loopback or on the host's own non-loopback address. No test names a public address, host name or DNS server.
+- Only programs a minimal host has. On Linux that's a Debian or Ubuntu minimal install plus bubblewrap. On macOS it's a clean install with no Xcode or Command Line Tools. That means `/bin/sh`, the base system's own tools, and the test binary's own child modes. No compiler, no Perl, Python or other scripting runtime, no app installed separately, and nothing the OS has deprecated or plans to drop, such as macOS's bundled Perl or Linux's net-tools.
+- A test that skips without the network or such a program doesn't count as checking anything. Replace the dependency rather than skip.
+- A test takes about a second or less when it passes in a normal `go test ./...` run, alongside the rest of the suite. It arranges the case it checks instead of repeating until the case happens, and it waits for events instead of sleeping a fixed time.
+
 ## Guarantees
 
 - Every guarantee in `security-model.md` has an escape test that runs code in a real sandbox and asserts the attempt fails. It cites the row it checks as `Row: ...`. A guarantee a platform can't give has a `TestGap...` test that shows the gap and fails when it closes.
