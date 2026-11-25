@@ -35,6 +35,20 @@ import (
 )
 
 func registerReviewChecks() {
+	// rename calls rename(2) on its two arguments and exits 1 if it fails.
+	// os.Rename would refuse a directory as the new name before it asked the
+	// kernel, and mv would move the directory inside it.
+	childModes["rename"] = func(args []string) int {
+		if len(args) != 2 {
+			fmt.Fprintln(os.Stderr, "rename old new")
+			return 2
+		}
+		if err := unix.Rename(args[0], args[1]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		return 0
+	}
 	// stat-denied stats each path and fails unless the profile refuses it. A
 	// path that is not there gives ENOENT before the profile is asked, so it is
 	// printed as gone, for the test to check that the host no longer has it
@@ -456,7 +470,7 @@ try rm "$3"
 try mv "$3" "$3.moved"
 # A directory made in Home renamed over an empty Write root, with rename(2)
 # itself, since mv would move it inside.
-mkdir "$HOME/empty"; try /usr/bin/perl -e 'rename($ARGV[0], $ARGV[1]) or exit 1' "$HOME/empty" "$1"
+mkdir "$HOME/empty"; try "$5" rename "$HOME/empty" "$1"
 rmdir "$HOME/empty" 2>/dev/null
 # A root moved out of the way.
 try mv "$2" "$HOME/stolen"
@@ -465,7 +479,7 @@ try rm -rf "$2"
 # What it may do: write inside each root.
 echo ok > "$HOME/inside" && echo ok > "$1/inside" || worked="$worked [could not write inside]"
 echo "$worked"
-`, w, w2, sock, private)
+`, w, w2, sock, private, self(t))
 	if res.code != 0 {
 		t.Fatalf("%s", res)
 	}
@@ -1021,23 +1035,37 @@ func TestEscapeDevices(t *testing.T) {
 
 // ------------------------------------------------------ a process that re-forks
 
-// reforkScript is a perl program that forks, and the parent exits, again and
-// again, the child making a session of its own each time and sleeping about
-// 0.3 ms first. One process is alive at a time, each generation lives about a
-// millisecond, and a real fork costs about 0.7 ms, so a scan that lists a
-// generation and signals it after listing the rest finds its successor missing
-// from the list. It stops by itself after $ARGV[0] seconds, which is what keeps
-// a teardown that fails from leaving anything running on this machine.
-const reforkScript = `use POSIX qw(setsid _exit); use Time::HiRes qw(time usleep);
-my $end = time + $ARGV[0];
-while (time < $end) {
-	my $pid = fork();
-	defined $pid or _exit(1);
-	_exit(0) if $pid;
-	setsid();
-	usleep(300);
+// refork defines a shell function, chain, that forks, and the parent exits,
+// again and again, each child making a process group of its own and spinning
+// for its second argument's count of loops first. It runs in /bin/bash, whose &
+// forks without an exec. With a spin of 200, about 0.7 ms, one process is alive
+// at a time for most of a generation, and a generation lives about a
+// millisecond, so a scan that lists a generation and checks it after a pause
+// finds it exiting and its successor missing from the list. Without the spin a
+// generation lives about half a millisecond, and bash's work after the fork
+// keeps the parent alive beside its child, so a scan always finds a live
+// member. A child of the test binary could only fork and exec, which takes
+// milliseconds. set -m, which a subshell turns off, is set again in each
+// generation, so that each puts its child in a new group, as job control does,
+// and a signal to the command's group misses the chain. The chain stops by
+// itself once $SECONDS, the shell's age in whole seconds, which subshells
+// inherit, reaches the first argument, so between one second short of it and
+// it. That is what keeps a teardown that fails from leaving anything running on
+// this machine. bash, not sh: the chain needs $SECONDS, and set -m in a
+// subshell.
+const refork = `chain() {
+	set -m
+	i=0; while [ "$i" -lt "$2" ]; do i=$((i+1)); done
+	[ "$SECONDS" -ge "$1" ] && exit 0
+	chain "$1" "$2" & exit 0
 }
-_exit(0);`
+`
+
+// reforkCommand is the command of a sandbox whose shell runs script after
+// defining chain.
+func reforkCommand(script string) []string {
+	return []string{"/bin/bash", "-c", refork + script}
+}
 
 // Row: "Teardown: pid 1 dies, all die": a single process that re-forks about
 // every millisecond does not outlast the sandbox. The first teardown scanned
@@ -1049,7 +1077,7 @@ _exit(0);`
 func TestEscapeReforkingProcessEnds(t *testing.T) {
 	t.Parallel()
 	home := realTemp(t)
-	c, err := Command(t.Context(), Spec{Home: home, Command: []string{"/usr/bin/perl", "-e", reforkScript, "10"}})
+	c, err := Command(t.Context(), Spec{Home: home, Command: reforkCommand("chain 10 200")})
 	if err != nil {
 		t.Fatal(err)
 	}

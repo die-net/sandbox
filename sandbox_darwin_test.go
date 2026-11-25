@@ -82,6 +82,7 @@ func TestMain(m *testing.M) {
 	registerRootsChecks()
 	registerProbeMode()
 	registerSleepForever()
+	registerLeaver()
 	registerEscMode()
 	registerOwnSession()
 	registerFdsListed()

@@ -105,7 +105,7 @@ func TestTeardownStageKilledMidTeardown(t *testing.T) {
 	t.Parallel()
 	delay := 150 * time.Millisecond
 	for range 5 {
-		c, err := Command(t.Context(), Spec{Home: realTemp(t), Command: []string{"/usr/bin/perl", "-e", reforkScript, "10"}})
+		c, err := Command(t.Context(), Spec{Home: realTemp(t), Command: reforkCommand("chain 10 200")})
 		if err != nil {
 			t.Fatal(err)
 		}
