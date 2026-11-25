@@ -150,7 +150,7 @@ func firstBlock(f probeFacts) Result {
 			"Fix: run the container with a seccomp profile that is the runtime's default plus clone with the namespace flags, unshare, mount, umount2, pivot_root and the new mount API (open_tree, move_mount, fsopen, fsmount, fsconfig, mount_setattr). Never seccomp=unconfined", f.Container)
 	case container && strings.HasPrefix(f.AppArmor, "docker-default"):
 		return fail("probe.docker-apparmor", "the container runs under Docker's docker-default AppArmor profile, which denies mount. Fix: a profile that allows mount, or --security-opt apparmor=unconfined for this container only")
-	case masked(f.Mounts):
+	case container && masked(f.Mounts):
 		return fail("probe.masked-proc", "paths under /proc are overmounted, and the kernel refuses a new procfs while the existing one is partly hidden. Fix: Docker --security-opt systempaths=unconfined, or Podman --security-opt unmask=ALL")
 	case f.Container == "systemd-unit":
 		return fail("probe.systemd-unit", "this runs in a systemd service whose restrictions refuse namespaces or mounts. Fix, for this unit only: relax RestrictNamespaces=, and a SystemCallFilter= that lacks @mount, keeping the rest")
@@ -158,10 +158,14 @@ func firstBlock(f probeFacts) Result {
 	return fail("probe.userns", "bubblewrap could not start a sandbox, and no known cause matched: %s", f.TryErr)
 }
 
-// masked reports whether anything is mounted on a path under /proc.
+// masked reports whether anything is mounted on a path under /proc, as a
+// container runtime does to hide parts of it. binfmt_misc is left out:
+// systemd mounts it, with an autofs under it, at /proc/sys/fs/binfmt_misc on
+// every stock host, and a new procfs starts with it there (Debian 13 and
+// Ubuntu 26.04, where sandboxes start).
 func masked(mounts []mount) bool {
 	for _, m := range mounts {
-		if strings.HasPrefix(m.point, "/proc/") {
+		if strings.HasPrefix(m.point, "/proc/") && m.point != "/proc/sys/fs/binfmt_misc" {
 			return true
 		}
 	}

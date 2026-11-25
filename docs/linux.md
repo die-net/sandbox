@@ -162,7 +162,7 @@ When no sandbox can start, `Report.Checks` ends at the first prerequisite that b
 7. A sysctl that turns user namespaces off.
 8. Docker's or Podman's default seccomp profile.
 9. Docker's AppArmor profile.
-10. A masked `/proc`.
+10. A masked `/proc` in a container. systemd mounts `binfmt_misc` at `/proc/sys/fs/binfmt_misc` on every host, and a new procfs starts with it there, so it doesn't count.
 11. A systemd unit's restrictions.
 
 The two AppArmor findings apply only when this program runs unconfined, under its own profile, or under a label `Probe` can't read. Under another program's profile, such as `docker-default`, a profile for this path wouldn't attach, so a later finding explains the failure. They don't apply either when this program already runs under its own profile in enforce mode, since loading it again would change nothing. Under v0.1.0's profile, in unconfined mode, they print the new one to replace it.
