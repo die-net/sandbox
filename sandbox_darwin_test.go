@@ -74,6 +74,7 @@ func TestMain(m *testing.M) {
 	registerProbeMode()
 	registerSleepForever()
 	registerEscMode()
+	var opts stageOptions
 	var hooks []func(*prober)
 	if os.Getenv(stageOrphanZombiesEnv) != "" {
 		hooks = append(hooks, func(p *prober) {
@@ -91,7 +92,7 @@ func TestMain(m *testing.M) {
 		hooks = append(hooks, func(p *prober) { p.kill = func(int) {} })
 	}
 	if os.Getenv(stageUnprovableEnv) != "" {
-		teardownBudget = 200 * time.Millisecond
+		opts.budget = 200 * time.Millisecond
 		hooks = append(hooks, func(p *prober) {
 			list := p.list
 			p.list = func() ([]int, error) {
@@ -101,19 +102,19 @@ func TestMain(m *testing.M) {
 		})
 	}
 	if os.Getenv(stageKillBeforeReplyEnv) != "" {
-		testBeforeReply = func() {
+		opts.beforeReply = func() {
 			time.Sleep(300 * time.Millisecond)
 			_ = syscall.Kill(os.Getpid(), syscall.SIGKILL)
 		}
 	}
 	if len(hooks) > 0 {
-		testProberHook = func(p *prober) {
+		opts.proberHook = func(p *prober) {
 			for _, h := range hooks {
 				h(p)
 			}
 		}
 	}
-	if code, ok := Stage(); ok {
+	if code, ok := runStage(opts); ok {
 		os.Exit(code)
 	}
 	if len(os.Args) >= 2 {

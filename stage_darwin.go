@@ -125,6 +125,45 @@ type stageDone struct {
 // reports false otherwise. A program that uses this package calls it first in
 // main, before it reads its arguments.
 func Stage() (int, bool) {
+	return runStage(stageOptions{})
+}
+
+// stageOptions changes what a stage does, for a test binary. A test binary is
+// its own stage, so only its TestMain can configure the stage, and it calls
+// runStage with the options. Stage passes the zero value, which is what a
+// program runs, and nothing a caller sends the stage can set these.
+type stageOptions struct {
+	// beforeReply, if set, is called once sandbox-exec has started and before the
+	// stage replies, so that a test can end the stage there.
+	beforeReply func()
+	// proberHook, if set, changes the prober of the stage's teardowns, to make one
+	// that cannot prove the sandbox empty without a process that keeps ahead of
+	// it. The stage has no Cmd to carry a hook (see run.proberHook).
+	proberHook func(*prober)
+	// budget is how long the stage's teardowns keep scanning. Zero is
+	// teardownBudget.
+	budget time.Duration
+}
+
+// killAll ends the command's group and every other process under the
+// sandbox's profile, whatever its group or parent. The group goes first, which
+// is quick and holds what never left it, and the marker finds the rest. It
+// returns how many scans that took, and how the teardown ended.
+func (o stageOptions) killAll(group int, m marker) (scans int, end endKind) {
+	killGroup(group)
+	p := m.prober(group)
+	if o.proberHook != nil {
+		o.proberHook(&p)
+	}
+	budget := o.budget
+	if budget == 0 {
+		budget = teardownBudget
+	}
+	return p.run(budget)
+}
+
+// runStage is Stage with options.
+func runStage(opts stageOptions) (int, bool) {
 	// The check child is started with checkArg, and runs the checks and
 	// nothing else.
 	if len(os.Args) > 1 && os.Args[1] == checkArg {
@@ -133,7 +172,7 @@ func Stage() (int, bool) {
 	if len(os.Args) < 4 || os.Args[1] != stageArg || os.Args[2] != "--" {
 		return 0, false
 	}
-	code, err := supervise(os.Args[3:])
+	code, err := supervise(os.Args[3:], opts)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "sandbox: %v\n", err)
 		return failed, true
@@ -152,7 +191,7 @@ func Stage() (int, bool) {
 // went. Those are found by the profile's marker (member_darwin.go), until a
 // scan proves none is left (scan_darwin.go). It then tells the caller whether
 // it did (stageDone), and exits with the command's status.
-func supervise(command []string) (int, error) {
+func supervise(command []string, opts stageOptions) (int, error) {
 	var st stageState
 	// Watch from the first moment, so a caller that died during setup leaves
 	// no command running. The lock is held from before the command starts
@@ -165,7 +204,7 @@ func supervise(command []string) (int, error) {
 				break
 			}
 		}
-		if st.lifelineClosed(killAll) {
+		if st.lifelineClosed(opts.killAll) {
 			os.Exit(128 + int(unix.SIGKILL)) //nolint:revive // deep-exit: the stage must end from this goroutine once the lifeline closes, and nothing above it could take an exit status.
 		}
 	}()
@@ -193,8 +232,8 @@ func supervise(command []string) (int, error) {
 		_ = st.status.Close()
 		return 0, err
 	}
-	if testBeforeReply != nil {
-		testBeforeReply()
+	if opts.beforeReply != nil {
+		opts.beforeReply()
 	}
 	// The pipe stays open for the last message.
 	st.mu.Lock()
@@ -223,7 +262,7 @@ func supervise(command []string) (int, error) {
 	// would go to the number, and the teardown below can take seconds.
 	stop()
 	st.mu.Lock()
-	st.finish(killAll(st.group, st.mark))
+	st.finish(opts.killAll(st.group, st.mark))
 	st.mu.Unlock()
 	giveBackTerminal(st.group)
 	if ws.Signaled() {
@@ -290,11 +329,6 @@ func (s stageSettings) check() error {
 	}
 	return nil
 }
-
-// testBeforeReply is called by the stage once sandbox-exec has started and
-// before the stage replies, so that a test can end the stage there. It is nil
-// in a program, and only a test binary's TestMain sets it, before the tests run.
-var testBeforeReply func()
 
 // startCommand sets the limits and starts sandbox-exec, which applies the
 // profile and runs the command. It holds mu until the command's group is
@@ -392,15 +426,6 @@ func markCloseOnExec() {
 			unix.CloseOnExec(fd)
 		}
 	}
-}
-
-// killAll ends the command's group and every other process under the
-// sandbox's profile, whatever its group or parent. The group goes first, which
-// is quick and holds what never left it, and the marker finds the rest. It
-// returns how many scans that took, and how the teardown ended.
-func killAll(group int, m marker) (scans int, end endKind) {
-	killGroup(group)
-	return m.kill(teardownBudget, group)
 }
 
 // killGroup ends every process in the group, and keeps going until none is
