@@ -78,11 +78,11 @@ The full suite also passes on GitHub's 3-core arm64 runners, macOS 15.8.2 (`maco
 
 ### CI
 
-`.github/workflows/test.yml` runs on every push and pull request. It has not run yet, since this repository has no GitHub remote.
+`.github/workflows/test.yml` runs on every push and pull request. The cgo-off leg of each test job runs every test three times in one process (`-count=3`), so a test that leaves state behind for its next run, such as a package variable, a file or a process, or that assumes it runs first, fails there. The cgo leg runs each test once, and on macOS it adds `-race`.
 
 - **Vet:** `go vet` for linux amd64, arm64 and arm, with `CGO_ENABLED=0`.
-- **Linux:** the tests on `ubuntu-24.04` and `ubuntu-26.04` with apt's bubblewrap, with cgo off and on. The runner keeps `kernel.apparmor_restrict_unprivileged_userns` at 1 and loads the test binary's profile, so CI exercises the fix users get (`SBX_LOCAL=1 SBX_APPARMOR=1`). Then it runs the `Probe` tests without the profile, where `TestProbeVM` checks that `Probe` fails, since no sandbox starts there. There `TestProbeTrialStartsTheFirstStage` wants bubblewrap's own refusal on 24.04, where the sysctl's restriction stops bubblewrap, and the first stage's on 26.04, where Ubuntu's `bwrap` profile stops the stage.
-- **macOS:** `go build`, `go vet` for arm64 and amd64, and `go test` on `macos-15` and `macos-26`, with cgo off and on, and `go test -race` on the cgo leg.
+- **Linux:** the tests on `ubuntu-24.04` and `ubuntu-26.04` with apt's bubblewrap, with cgo off (three runs of each test) and on. The runner keeps `kernel.apparmor_restrict_unprivileged_userns` at 1 and loads the test binary's profile, so CI exercises the fix users get (`SBX_LOCAL=1 SBX_APPARMOR=1`). Then it runs the `Probe` tests without the profile, where `TestProbeVM` checks that `Probe` fails, since no sandbox starts there. There `TestProbeTrialStartsTheFirstStage` wants bubblewrap's own refusal on 24.04, where the sysctl's restriction stops bubblewrap, and the first stage's on 26.04, where Ubuntu's `bwrap` profile stops the stage.
+- **macOS:** `go build`, `go vet` for arm64 and amd64, and `go test` on `macos-15` and `macos-26`, with cgo off (three runs of each test) and on, and `go test -race` on the cgo leg.
 - **Go toolchain:** CI takes its Go from the `toolchain` line of `go.mod`, which is 1.26.5. Go 1.26.0 to 1.26.4 with `-race` on darwin can crash the child of a fork before it execs, with `signal: segmentation fault` from `Wait` for a program that never ran (golang/go#79804, fixed in 1.26.5 by #79806). It hit `TestProfileCutShortDoesNotRun` on `macos-26` in PR 2: the shell that runs `sandbox-exec` died before it wrote anything, so `sandbox-exec` never ran and the profile was not at fault. `TestRaceDetectorToolchainCanForkOnDarwin` fails under a `-race` build with an older Go.
 
 ### What the tests can't cover

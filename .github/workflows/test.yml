@@ -71,9 +71,11 @@ jobs:
             exit 1
           fi
       # SBX_LOCAL runs the tests on this machine, as the runner's own user, in
-      # a directory of their own under /tmp, as the script explains.
+      # a directory of their own under /tmp, as the script explains. The cgo=0
+      # leg runs every test three times in one process, so a test that leaves
+      # state behind, or assumes it runs first, fails here.
       - name: Test
-        run: scripts/linux-test.sh -test.v -test.timeout=15m
+        run: scripts/linux-test.sh -test.v -test.count=${{ matrix.cgo == '0' && '3' || '1' }} -test.timeout=15m
         env:
           SBX_LOCAL: "1"
           SBX_APPARMOR: "1"
@@ -116,8 +118,11 @@ jobs:
       - run: go vet ./...
         env:
           GOARCH: amd64
+      # The cgo=0 leg, which has no race run, runs every test three times in
+      # one process, so a test that leaves state behind, or assumes it runs
+      # first, fails here.
       - name: Test
-        run: go test -v -count=1 -timeout 15m ./...
+        run: go test -v -count=${{ matrix.cgo == '0' && '3' || '1' }} -timeout 15m ./...
       - name: Test with the race detector
         if: matrix.cgo == '1'
         run: go test -race -count=1 -timeout 25m ./...
