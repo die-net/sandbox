@@ -689,6 +689,22 @@ func nestedMounts() int {
 	return code
 }
 
+// hostHasIPTables returns an error unless the kernel has ip_tables, whose
+// /proc/net/ip_tables_names exists in every network namespace once it is
+// loaded or built in. At the open level no filter answers the iptables
+// attempt, so it reaches the kernel, which refuses it for want of
+// CAP_NET_ADMIN (do_ipt_set_ctl in net/ipv4/netfilter/ip_tables.c). Without
+// ip_tables, nf_sockopt_find (net/netfilter/nf_sockopt.c) answers
+// ENOPROTOOPT before any capability check, as GitHub's Ubuntu 26.04 runner
+// showed, so the attempt would show nothing about the sandbox. setsockopt
+// doesn't load the module, and the test can't, so it fails plainly.
+func hostHasIPTables() error {
+	if _, err := os.Stat("/proc/net/ip_tables_names"); err != nil {
+		return fmt.Errorf("this host has no ip_tables (%w), so a sandbox's attempt to replace an iptables table at the open level can't reach the kernel's capability check. Load it first: sudo modprobe ip_tables", err)
+	}
+	return nil
+}
+
 // replaceIPTable tries to replace an iptables table with an empty one.
 func replaceIPTable() error {
 	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
@@ -843,6 +859,7 @@ func TestKernelLevels(t *testing.T) {
 // the filter in front of them.
 func TestIsolation(t *testing.T) {
 	t.Parallel()
+	ipTables := hostHasIPTables()
 	for _, tc := range []struct {
 		level   Kernel
 		network Network
@@ -855,6 +872,9 @@ func TestIsolation(t *testing.T) {
 		level := tc.level
 		t.Run(string(level)+"/"+tc.network.String(), func(t *testing.T) {
 			t.Parallel()
+			if level == KernelOpen && ipTables != nil {
+				t.Fatal(ipTables)
+			}
 			other := filepath.Join(t.TempDir(), "f")
 			if err := os.WriteFile(other, []byte("other"), 0o600); err != nil {
 				t.Fatal(err)

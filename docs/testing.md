@@ -44,6 +44,8 @@ Each was run with `CGO_ENABLED=0` and with cgo on (`CGO=1`, which builds on the 
 
 Without `SBX_APPARMOR=1`, the same Ubuntu run fails 159 of the tests that start a sandbox, in 11 seconds and with no hang, and `TestProbeVM` shows the diagnostic. On Ubuntu 26.04 every test that starts a sandbox fails without the profile, whether the sysctl is 1 or 0, as it did with the profile before it was rewritten ([linux.md](linux.md#probe-and-check)), and `TestProbeVM` passes, since `Probe` fails too and names `probe.apparmor-bwrap`. On Ubuntu 24.04 the tests run as the account's uid under a profile for the test binary. The suite passes on apt's bubblewrap 0.9.0, and the symlink flaw fixed in 0.12.0 stays open there as [security-model.md](security-model.md#open-issues) notes.
 
+`TestIsolation`'s open level needs the kernel's `ip_tables`, loaded or built in. With no filter at that level, its attempt to replace an iptables table reaches the kernel, which refuses it for want of `CAP_NET_ADMIN` only when `ip_tables` is there. Without it the kernel answers `ENOPROTOOPT` before any capability check, so the test fails and says to run `sudo modprobe ip_tables`. The Lima VMs have it loaded. GitHub's Ubuntu 26.04 runner doesn't, so CI loads it.
+
 **The skips** are the same on every target except where noted:
 
 - `TestWriteApparmorProfile` is the helper that `scripts/apparmor.sh` calls, and skips unless asked.
