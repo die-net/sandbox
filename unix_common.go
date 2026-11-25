@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"os/exec"
+	"strconv"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -110,4 +111,48 @@ func (s Spec) checkRequest() error {
 		}
 	}
 	return nil
+}
+
+// markListedCloseOnExec sets close-on-exec on every descriptor from 3 up that
+// dir lists, as /dev/fd and /proc/self/fd do. It fails only if it can't read
+// the list, since it can't tell then which descriptors it missed.
+func markListedCloseOnExec(dir string) error {
+	d, err := os.Open(dir) //nolint:gosec // G304: /dev/fd or /proc/self/fd, or a test's stageOptions.fdDir.
+	if err != nil {
+		return fmt.Errorf("mark descriptors close-on-exec: %w", err)
+	}
+	defer d.Close()
+	fds, err := listedFds(d)
+	if err != nil {
+		return fmt.Errorf("mark descriptors close-on-exec: %w", err)
+	}
+	for _, fd := range fds {
+		// A descriptor that has closed since makes fcntl fail with EBADF,
+		// which CloseOnExec ignores, and there is nothing left to mark.
+		unix.CloseOnExec(fd)
+	}
+	return nil
+}
+
+// listedFds returns the descriptors from 3 up that d, a directory such as
+// /dev/fd, lists from where its reading stands. It reads names alone.
+// os.ReadDir also stats an entry whose type the directory doesn't give, which
+// on macOS is every entry of /dev/fd, and that stat fails with EBADF for a
+// descriptor that closed after the directory was read, and on macOS 15 and
+// 26 for an open kqueue (go.dev/issue/80143). Go 1.26 returns that as
+// ReadDir's error, and Go 1.27 drops the entry, which would leave an open
+// descriptor unmarked. TestListedFdsKeepsADescriptorThatClosed arranges the
+// first.
+func listedFds(d *os.File) ([]int, error) {
+	names, err := d.Readdirnames(-1)
+	if err != nil {
+		return nil, err
+	}
+	fds := make([]int, 0, len(names))
+	for _, n := range names {
+		if fd, err := strconv.Atoi(n); err == nil && fd >= 3 {
+			fds = append(fds, fd)
+		}
+	}
+	return fds, nil
 }

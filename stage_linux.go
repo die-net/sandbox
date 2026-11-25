@@ -358,16 +358,7 @@ func (o stageOptions) markCloseOnExec() error {
 	if dir == "" {
 		dir = "/proc/self/fd"
 	}
-	ents, err := os.ReadDir(dir)
-	if err != nil {
-		return fmt.Errorf("mark descriptors close-on-exec: %w", err)
-	}
-	for _, e := range ents {
-		if fd, err := strconv.Atoi(e.Name()); err == nil && fd >= 3 {
-			unix.CloseOnExec(fd)
-		}
-	}
-	return nil
+	return markListedCloseOnExec(dir)
 }
 
 // send sends the parent the one message the control socket carries back,

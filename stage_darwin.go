@@ -429,16 +429,7 @@ func (o stageOptions) markCloseOnExec() error {
 	if dir == "" {
 		dir = "/dev/fd"
 	}
-	ents, err := os.ReadDir(dir)
-	if err != nil {
-		return fmt.Errorf("mark descriptors close-on-exec: %w", err)
-	}
-	for _, e := range ents {
-		if fd, err := strconv.Atoi(e.Name()); err == nil && fd >= 3 {
-			unix.CloseOnExec(fd)
-		}
-	}
-	return nil
+	return markListedCloseOnExec(dir)
 }
 
 // killGroup ends every process in the group, and keeps going until none is

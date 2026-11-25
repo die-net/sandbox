@@ -84,6 +84,7 @@ func TestMain(m *testing.M) {
 	registerSleepForever()
 	registerEscMode()
 	registerOwnSession()
+	registerFdsListed()
 	var opts stageOptions
 	var hooks []func(*prober)
 	if v := os.Getenv(stageOrphanZombieEnv); v != "" {
