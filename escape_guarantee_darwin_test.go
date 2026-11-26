@@ -25,6 +25,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -2154,8 +2155,9 @@ func TestEscapeAdminGroupWrites(t *testing.T) {
 var _ = sync.Mutex{}
 
 // serviceNames are the Mach services each Service lets a sandbox look up.
-// TestEscapeServiceLookups fails unless its keys are serviceRules' keys, so a
-// new group is tried there.
+// TestEscapeServiceLookups fails unless its keys are serviceRules' keys, and
+// each group's names are the names of the group's mach-lookup rules, so every
+// lookup a group allows is tried there.
 var serviceNames = map[Service][]string{
 	ServiceSystemConfiguration: {"com.apple.SystemConfiguration.configd"},
 	ServiceLaunchServices:      {"com.apple.coreservices.launchservicesd"},
@@ -2179,6 +2181,28 @@ func TestEscapeServiceLookups(t *testing.T) {
 	t.Parallel()
 	if named := slices.Sorted(maps.Keys(serviceNames)); !slices.Equal(named, allServices) {
 		t.Fatalf("serviceNames has the groups %q, and serviceRules %q", named, allServices)
+	}
+	// Every rule that names mach-lookup must be a lookup of one global name,
+	// the one form this test tries by name. A group's other kinds of rule are
+	// left to TestEscapeProfileNeverAllows.
+	lookup := regexp.MustCompile(`^\(allow mach-lookup \(global-name "([^"]+)"\)\)$`)
+	for s, rules := range serviceRules {
+		var names []string
+		for _, rule := range rules {
+			if !strings.Contains(rule, "mach-lookup") {
+				continue
+			}
+			m := lookup.FindStringSubmatch(rule)
+			if m == nil {
+				t.Errorf("the group %s has a lookup rule this test can't try by name: %s", s, rule)
+				continue
+			}
+			names = append(names, m[1])
+		}
+		slices.Sort(names)
+		if want := slices.Sorted(slices.Values(serviceNames[s])); !slices.Equal(names, want) {
+			t.Errorf("the group %s allows the lookups %q, and serviceNames lists %q", s, names, want)
+		}
 	}
 	for _, s := range allServices {
 		t.Run("lookups "+string(s), func(t *testing.T) {
