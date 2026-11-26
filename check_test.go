@@ -75,12 +75,7 @@ func TestCheckNil(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer listener.Close()
-	closed, err := listenLocal()
-	if err != nil {
-		t.Fatal(err)
-	}
-	closedAddr := closed.Addr().String()
-	closed.Close() //nolint:gosec // G104: nothing can be done about a failed close here, and the test is over or has what it needs.
+	closedAddr := heldLocalAddr(t)
 
 	want := Expect{
 		Unreadable:  []string{secret, filepath.Join(dir, "absent")},
