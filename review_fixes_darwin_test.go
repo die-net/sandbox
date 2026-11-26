@@ -201,6 +201,12 @@ const lingerTicks = 200
 // at the start of exit, until the peer reads or resets the connection.
 func registerLingerer() {
 	childModes["lingerer"] = func(args []string) int {
+		// A session of its own, so the stage's signal to the command's group,
+		// which would cut its linger short, misses it.
+		if _, err := syscall.Setsid(); err != nil {
+			fmt.Fprintln(os.Stderr, "setsid:", err)
+			return 1
+		}
 		c, err := dialTimeout("tcp", args[0], 3*time.Second)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
@@ -237,6 +243,19 @@ func registerLingerer() {
 			return 1
 		}
 		_, _ = os.Stdout.WriteString("ready\n")
+		// Give up the command's output, so that the caller's Wait, which waits
+		// for it to close, waits only for the teardown.
+		null, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		for _, fd := range []int{1, 2} {
+			if err := syscall.Dup2(int(null.Fd()), fd); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				return 1
+			}
+		}
 		_, _ = f.Read(buf[:1])
 		return 0
 	}
@@ -249,11 +268,14 @@ func registerLingerer() {
 // a chain that re-forks has, is held in exit by a lingering socket, and the
 // scans run while it is there. The shell that keeps the stage from tearing
 // down is left out of the membership, and a scan's kill is a count, so the
-// member stays.
+// member stays. Then the shell ends, and the stage's own teardown runs while
+// the member is still exiting: Wait must not return then, and must return nil
+// once the member has gone.
 func TestRealScanIsNeverCleanWhileAMemberExits(t *testing.T) {
 	t.Parallel()
-	// The subshell starts the lingerer and exits, so its parent is gone.
-	c, err := Command(t.Context(), Spec{Home: realTemp(t), Listen: 1, Command: []string{"/bin/sh", "-c", `( "$0" lingerer "$1" & ); read x`, self(t)}})
+	// The subshell starts the lingerer and exits, so its parent is gone. The
+	// shell exits 0 when its input ends, so that Wait's error is the teardown's.
+	c, err := Command(t.Context(), Spec{Home: realTemp(t), Listen: 1, Command: []string{"/bin/sh", "-c", `( "$0" lingerer "$1" & ); read x; exit 0`, self(t)}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -265,17 +287,26 @@ func TestRealScanIsNeverCleanWhileAMemberExits(t *testing.T) {
 	defer stdin.Close()
 	defer w.Close() // the shell's read ends
 	c.Stdin = stdin
-	out := &syncBuffer{}
-	c.Stdout = out
-	c.Env = []string{shellPath}
+	out, errOut := &syncBuffer{}, &syncBuffer{}
+	c.Stdout, c.Stderr = out, errOut
+	// The stage and the lingerer are this test binary, and one built with -race
+	// sleeps a second as it exits (GORACE's atexit_sleep_ms), which the bound
+	// on Wait below would count as the teardown's.
+	c.Env = []string{shellPath, "GORACE=atexit_sleep_ms=0"}
 	if err := c.Start(); err != nil {
 		t.Fatal(err)
 	}
 	endAtCleanup(t, c)
+	// The lingerer connects within a few milliseconds of its start. A deadline
+	// turns one that never does, such as one that cannot start or dial, into
+	// this test's failure, with what it said, instead of a hang.
 	l := c.Listeners()[0]
+	if err := l.(*net.TCPListener).SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
 	conn, err := l.Accept()
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("the lingerer never connected: %v\n%s", err, errOut.String())
 	}
 	defer conn.Close() // resets the connection, which ends the linger
 	// A receive buffer the test sets stops the kernel growing it as data comes
@@ -329,6 +360,34 @@ func TestRealScanIsNeverCleanWhileAMemberExits(t *testing.T) {
 	}
 	if !exiting() {
 		t.Fatal("the lingerer finished exiting during the scans, so they did not all see it exiting")
+	}
+	// The shell ends, the stage reaps it and tears down, with the member still
+	// exiting. Its first scan is at once, and in 200 ms it has made a dozen at
+	// the backoff's pace, any of which would end the teardown if it counted the
+	// sandbox empty. None may: Wait returns only once the member has gone.
+	waited := make(chan error, 1)
+	go func() { waited <- c.Wait() }()
+	_ = w.Close()
+	select {
+	case err := <-waited:
+		t.Fatalf("Wait returned while a member of the sandbox was still exiting: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	if !exiting() {
+		t.Fatal("the lingerer finished exiting before the teardown's scans, so they did not all see it exiting")
+	}
+	// The reset ends the linger, the member's exit finishes and launchd reaps
+	// it, and the stage's next scan, at most backoffMax (25 ms) later, proves
+	// the sandbox empty. A second is forty of those, for a loaded runner, and
+	// well under the 5 s budget that a teardown that never proves it runs out.
+	_ = conn.Close()
+	select {
+	case err := <-waited:
+		if err != nil {
+			t.Errorf("Wait after the member exited: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Wait did not return within 1 s of the member's exit")
 	}
 }
 
