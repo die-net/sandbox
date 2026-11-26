@@ -1056,11 +1056,17 @@ func escNoNewPrivs(e *escT, _ []string) {
 		}
 	}
 	// A real setuid-root program stays an ordinary one: its effective uid
-	// after the exec is the account's own. passwd, su and mount are setuid
-	// root on every Debian and Ubuntu install, the minimal ones too, since
-	// their packages are required. The status is read before Wait, so a
-	// program that has already exited is a zombie, whose status still shows
-	// its uids.
+	// after the exec is the account's own. This checks the outcome, not
+	// which mechanism gives it. The kernel ignores the setuid bit on a nosuid
+	// mount, under no_new_privs, and when the file's owner has no mapping in
+	// the user namespace (bprm_fill_uid in Linux's fs/exec.c). bubblewrap's
+	// binds are nosuid (bind_mount in its bind-mount.c), and the host's uid 0
+	// is not mapped, so the loop would pass without no_new_privs. The
+	// NoNewPrivs line above is the check of that. passwd, su and mount are
+	// setuid root on every Debian and Ubuntu install, the minimal ones too,
+	// since their packages are required. The status is read before Wait, so
+	// a program that has already exited is a zombie, whose status still
+	// shows its uids.
 	checked := 0
 	for _, p := range []string{"/usr/bin/passwd", "/usr/bin/su", "/usr/bin/mount"} {
 		fi, err := os.Stat(p)
