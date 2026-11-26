@@ -1610,9 +1610,12 @@ func TestEscapeCommandForksAndExitsAfterTheList(t *testing.T) {
 		if _, err := pw.WriteString("go\n"); err != nil {
 			t.Error(err)
 		}
+		// The stopped stage reaps the command only if its thread was already
+		// asleep in wait4, which finishes the wait before the thread stops. So
+		// the command may be gone or a zombie, and either has exited.
 		eventually(t, 5*time.Second, "the command did not exit", func() bool {
-			_, err := statPid(command)
-			return errors.Is(err, unix.ESRCH)
+			st, err := statPid(command)
+			return errors.Is(err, unix.ESRCH) || err == nil && st.Zombie
 		})
 		eventually(t, 5*time.Second, "the command's child is not under the profile", func() bool {
 			got, err := mark.processes()
