@@ -189,35 +189,6 @@ func udpResponder(t testing.TB) string {
 	return c.LocalAddr().String()
 }
 
-// mdnsName returns the host's own name in .local, which mDNSResponder answers
-// with no network, and which nothing else resolves: /etc/hosts doesn't list
-// it, and a name that /etc/hosts lists resolves in a sandbox without
-// mDNSResponder. It fails the test if the host can't resolve the name itself.
-// port is a port that a listener of the test's holds.
-func mdnsName(t testing.TB, port int) string {
-	t.Helper()
-	out, err := exec.CommandContext(t.Context(), "/usr/sbin/scutil", "--get", "LocalHostName").Output()
-	name := strings.TrimSpace(string(out))
-	if err != nil || name == "" {
-		t.Fatalf("scutil --get LocalHostName: %q, %v", out, err)
-	}
-	name += ".local"
-	cmd := exec.CommandContext(t.Context(), "/bin/sh", "-c", curlResolve, "sh", name, strconv.Itoa(port)) //nolint:gosec // G204: the test binary or a tool the test names, run as the test's own child.
-	out, err = cmd.Output()
-	if err != nil || strings.TrimSpace(string(out)) == curlCannotResolve {
-		t.Fatalf("this host can't resolve its own name %s, which the test needs as a name that only mDNSResponder answers: %q, %v", name, out, err)
-	}
-	return name
-}
-
-// curlResolve is a script that connects with curl to http://$1:$2/ and prints
-// curl's exit status, which is curlCannotResolve when the name did not
-// resolve.
-const curlResolve = `/usr/bin/curl -s -m 5 -o /dev/null "http://$1:$2/"; echo $?`
-
-// curlCannotResolve is curl's exit status for a name it could not resolve.
-const curlCannotResolve = "6"
-
 // listenAny starts a TCP listener on all addresses of the host, which a
 // connection to 127.0.0.1, ::1 and the LAN address each reach, that accepts
 // and closes. It returns the port.
@@ -1380,9 +1351,9 @@ func TestEscapeStageKilled(t *testing.T) {
 // Row: "Network namespace, proxy listener handed out": with NetworkNone the
 // sandbox reaches no address: one off the host, a listener on 127.0.0.1, ::1
 // or the host's LAN address, a UDP server on the LAN address, the metadata
-// address. It cannot resolve names, look up the services that NetworkHost
-// allows, or connect to the sockets of system services. None of it needs the
-// internet.
+// address. It cannot connect to mDNSResponder's socket, look up the services
+// that NetworkHost allows, or connect to the sockets of other system services.
+// None of it needs the internet.
 func TestEscapeNetworkNone(t *testing.T) {
 	t.Parallel()
 	port := listenAny(t)
@@ -1390,14 +1361,9 @@ func TestEscapeNetworkNone(t *testing.T) {
 	escRun(t, Spec{}, "dial-denied",
 		"tcp:"+lanAddr(t)+":"+p, "tcp:127.0.0.1:"+p, "tcp:[::1]:"+p, "tcp:"+offHost+":443",
 		"udp:"+udpResponder(t), "udp:"+offHost+":53", "tcp:169.254.169.254:80")
-	// Names do not resolve: the host's own .local name, which mDNSResponder
-	// answers, does with NetworkHost (TestEscapeNetworkHost).
-	if r := sh(t, Spec{}, curlResolve, mdnsName(t, port), p); strings.TrimSpace(r.stdout) != curlCannotResolve {
-		t.Errorf("curl resolved the host's name with NetworkNone: %s", r)
-	}
 	escRun(t, Spec{}, "lookup-denied", networkHostServices...)
-	// The sockets of system services, which are covered paths, and the ones
-	// that are not.
+	// The sockets of system services: mDNSResponder's under both its names,
+	// which NetworkHost allows (TestEscapeNetworkHost), and syslog's.
 	escRun(t, Spec{}, "unix-connect", "no:/private/var/run/mDNSResponder", "no:/var/run/mDNSResponder", "no:/var/run/syslog")
 }
 
@@ -1501,24 +1467,20 @@ func TestGapBroadLoopback(t *testing.T) {
 }
 
 // Row: "Network: NetworkHost (asked for explicitly): allow outbound, deny
-// localhost": the sandbox's connections off the host go out, TCP and UDP, its
-// names resolve, and it can look up the services that name lookups and
-// certificate checks need. It reaches no local listener, over 127.0.0.1, ::1
-// and the LAN address, and for every one of a run of ports, since a per-port
-// rule after a broad allow is what failed in M1. None of it needs the internet:
-// the address off the host answers nothing, and the profile's refusal is told
-// from a timeout.
+// localhost": the sandbox's connections off the host go out, TCP and UDP, it
+// can connect to mDNSResponder's socket, and it can look up the services that
+// name lookups and certificate checks need. It reaches no local listener, over
+// 127.0.0.1, ::1 and the LAN address, and for every one of a run of ports,
+// since a per-port rule after a broad allow is what failed in M1. None of it
+// needs the internet: the address off the host answers nothing, and the
+// profile's refusal is told from a timeout.
 func TestEscapeNetworkHost(t *testing.T) {
 	t.Parallel()
 	spec := Spec{Network: NetworkHost}
 	escRun(t, spec, "dial-allowed", "tcp:"+offHost+":443", "udp:"+offHost+":53")
-	// The host's own .local name resolves, through mDNSResponder, which
-	// NetworkNone refuses. The connection that follows is to the host's own
-	// address, which is refused.
-	port := listenAny(t)
-	if r := sh(t, spec, curlResolve, mdnsName(t, port), strconv.Itoa(port)); strings.TrimSpace(r.stdout) == curlCannotResolve || r.code != 0 {
-		t.Errorf("curl could not resolve the host's name with NetworkHost: %s", r)
-	}
+	// mDNSResponder's socket, by its real name and through the /var link, and
+	// the Mach services, all of which NetworkNone refuses.
+	escRun(t, spec, "unix-connect", "ok:/private/var/run/mDNSResponder", "ok:/var/run/mDNSResponder")
 	escRun(t, spec, "lookup-allowed", networkHostServices...)
 	const ports = 40
 	targets := make([]string, 0, 3*ports)
