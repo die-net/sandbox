@@ -15,6 +15,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -2196,6 +2197,32 @@ func TestEscapeServiceLookups(t *testing.T) {
 		}
 		if r := sh(t, Spec{}, show); strings.TrimSpace(r.stdout) == "0" {
 			t.Errorf("scutil reached configd with no Services: %s", r)
+		}
+	})
+	t.Run("configd-write", func(t *testing.T) {
+		t.Parallel()
+		// A key of the test's own, which nothing else uses. The first write is
+		// temporary, so configd would drop it when scutil's session ends, and
+		// the session removes the key itself, so a write that got through leaves
+		// nothing behind. The show between them is a read in the same session,
+		// whose answer shows that configd took the session, so the refusals are
+		// configd's (checkWriteAccess, docs/macos.md).
+		key := "State:/sandbox-test-" + rand.Text()
+		const write = `printf 'd.init\nd.add Probe yes\nadd %s temporary\nset %s\nshow %s\nremove %s\nquit\n' "$1" "$1" "$1" "$1" | /usr/sbin/scutil 2>&1`
+		r := sh(t, Spec{Services: []Service{ServiceSystemConfiguration}}, write, key)
+		var got []string
+		for l := range strings.Lines(strings.TrimSpace(r.stdout)) {
+			got = append(got, strings.TrimSpace(l))
+		}
+		if want := []string{"Permission denied", "Permission denied", "No such key", "Permission denied"}; !slices.Equal(got, want) {
+			t.Errorf("scutil's add, set, show and remove of %s: %q, want %q\n%s", key, got, want, r)
+		}
+		// The key is not in the store, by a read from outside, which changes
+		// nothing.
+		cmd := exec.CommandContext(t.Context(), "/usr/sbin/scutil")
+		cmd.Stdin = strings.NewReader("show " + key + "\n")
+		if out, err := cmd.CombinedOutput(); err != nil || strings.TrimSpace(string(out)) != "No such key" {
+			t.Errorf("show %s from outside: %q, %v, want No such key", key, out, err)
 		}
 	})
 }
