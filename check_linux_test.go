@@ -3,10 +3,13 @@ package sandbox
 import (
 	"context"
 	"fmt"
+	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -64,18 +67,25 @@ eth0	0000A8C0	00000000	0001	0	0	100	00FFFFFF	0	0	0
 	}
 }
 
-func TestParseStatPPID(t *testing.T) {
+func TestParseStat(t *testing.T) {
 	t.Parallel()
-	for in, want := range map[string]int{
-		"12 (bash) S 7 12 12 0": 7,
-		"12 (a b) c) S 9 1":     9,
+	for _, tc := range []struct {
+		in    string
+		state byte
+		ppid  int
+	}{
+		{"12 (bash) S 7 12 12 0", 'S', 7},
+		{"12 (a b) c) R 9 1", 'R', 9},
+		{"21 (sandbox-stage) X 0 -1 -1 0", 'X', 0},
 	} {
-		if got, ok := parseStatPPID(in); !ok || got != want {
-			t.Errorf("parseStatPPID(%q) = %d, %v", in, got, ok)
+		if state, ppid, ok := parseStat(tc.in); !ok || state != tc.state || ppid != tc.ppid {
+			t.Errorf("parseStat(%q) = %c, %d, %v", tc.in, state, ppid, ok)
 		}
 	}
-	if _, ok := parseStatPPID("junk"); ok {
-		t.Error("junk parsed")
+	for _, in := range []string{"junk", "12 (x) S", "12 (x) SS 7", "12 (x) S x"} {
+		if _, _, ok := parseStat(in); ok {
+			t.Errorf("%q parsed", in)
+		}
 	}
 }
 
@@ -196,6 +206,45 @@ func osNeutralNames() []string {
 		"nested.umount-cover", "nested.remount-rw", "nested.mount-outside",
 		"sockets.abstract", "cgroup.delegate", "limits.memory", "limits.tasks",
 		"proc.visible", "proc.signal", "proc.trace", "proc.environ", "snapshots",
+	}
+}
+
+// TestProcParents checks that a process reaped between the listing of /proc
+// and the read of its stat is left out, and that every other failed read
+// counts as outside the tree. The other checks reap children while
+// proc.visible walks /proc, and a child taken as outside failed
+// TestCheckSandbox about once in 300 runs, in state X with parent 0.
+func TestProcParents(t *testing.T) {
+	t.Parallel()
+	pathErr := func(op string, errno syscall.Errno) error {
+		return &fs.PathError{Op: op, Path: "/proc/x/stat", Err: errno}
+	}
+	stats := map[int]struct {
+		b   string
+		err error
+	}{
+		1:  {b: "1 (stage) S 0 1 1 0"},
+		7:  {b: "7 (check) S 1 7 7 0"},
+		20: {err: pathErr("open", syscall.ENOENT)},
+		21: {err: pathErr("read", syscall.ESRCH)},
+		22: {b: "22 (sandbox-stage) X 0 -1 -1 0"},
+		23: {b: "23 (sandbox-stage) X 7 23 23 0"},
+		24: {b: "24 (sh) Z 7 24 24 0"},
+		25: {b: "25 (outside) S 0 25 25 0"},
+		26: {err: pathErr("open", syscall.EACCES)},
+		27: {b: "junk"},
+	}
+	names := []string{"self", "1", "7", "20", "21", "22", "23", "24", "25", "26", "27", "sys"}
+	got := procParents(names, func(pid int) ([]byte, error) {
+		st, ok := stats[pid]
+		if !ok {
+			t.Errorf("read the stat of pid %d, which isn't listed", pid)
+		}
+		return []byte(st.b), st.err
+	})
+	want := map[int]int{1: 0, 7: 1, 24: 7, 25: 0, 26: -1, 27: -1}
+	if !maps.Equal(got, want) {
+		t.Errorf("procParents = %v, want %v", got, want)
 	}
 }
 

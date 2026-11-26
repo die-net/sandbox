@@ -347,20 +347,13 @@ func foreignPIDs() ([]int, error) {
 	if err != nil {
 		return nil, err
 	}
-	ppid := map[int]int{}
-	for _, d := range ents {
-		pid, err := strconv.Atoi(d.Name())
-		if err != nil {
-			continue
-		}
-		if b, err := os.ReadFile("/proc/" + d.Name() + "/stat"); err == nil {
-			if pp, ok := parseStatPPID(string(b)); ok {
-				ppid[pid] = pp
-			}
-		} else {
-			ppid[pid] = -1
-		}
+	names := make([]string, len(ents))
+	for i, d := range ents {
+		names[i] = d.Name()
 	}
+	ppid := procParents(names, func(pid int) ([]byte, error) {
+		return os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+	})
 	self := os.Getpid()
 	inTree := func(pid int) bool {
 		for range 4096 {
@@ -388,19 +381,61 @@ func foreignPIDs() ([]int, error) {
 	return out, nil
 }
 
-// parseStatPPID returns the parent pid from a /proc/<pid>/stat line. The
-// command name may hold spaces and parentheses, so it reads after the last ")".
-func parseStatPPID(s string) (int, bool) {
+// procParents maps each pid among the names in /proc to its parent, from the
+// stat that readStat returns for it. The other checks start and reap
+// children while this one walks /proc, so a pid listed may be gone, or going,
+// by the time its stat is read. Once a child is reaped, the open gives ENOENT
+// (proc_pid_lookup in fs/proc/base.c) and a read of a file already open gives
+// ESRCH (proc_single_show). While it is being reaped the read works and shows
+// state X, the EXIT_DEAD that wait_task_zombie in kernel/exit.c sets before
+// release_task. Once __exit_signal has cleared its signal handlers, its parent
+// reads as 0, since do_task_stat in fs/proc/array.c fills the parent in only
+// under lock_task_sighand. A process that is gone or in state X isn't listed
+// any more, so it is left out. Any other failure, such as EACCES under
+// hidepid, or a stat that doesn't parse, maps the pid to -1, so it counts as
+// outside the tree and the check fails closed.
+func procParents(names []string, readStat func(pid int) ([]byte, error)) map[int]int {
+	ppid := make(map[int]int, len(names))
+	for _, name := range names {
+		pid, err := strconv.Atoi(name)
+		if err != nil {
+			continue
+		}
+		b, err := readStat(pid)
+		if errors.Is(err, syscall.ENOENT) || errors.Is(err, syscall.ESRCH) {
+			continue
+		}
+		pp := -1
+		if err == nil {
+			if state, p, ok := parseStat(string(b)); ok {
+				if state == 'X' {
+					continue
+				}
+				pp = p
+			}
+		}
+		ppid[pid] = pp
+	}
+	return ppid
+}
+
+// parseStat returns the state and the parent pid from a /proc/<pid>/stat
+// line. The command name may hold spaces and parentheses, so it reads after
+// the last ")".
+func parseStat(s string) (state byte, ppid int, ok bool) {
 	i := strings.LastIndexByte(s, ')')
 	if i < 0 {
-		return 0, false
+		return 0, 0, false
 	}
 	f := strings.Fields(s[i+1:])
-	if len(f) < 2 {
-		return 0, false
+	if len(f) < 2 || len(f[0]) != 1 {
+		return 0, 0, false
 	}
 	pp, err := strconv.Atoi(f[1])
-	return pp, err == nil
+	if err != nil {
+		return 0, 0, false
+	}
+	return f[0][0], pp, true
 }
 
 // probeLimit bounds how many outside processes each attempt tries.

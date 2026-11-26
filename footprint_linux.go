@@ -32,7 +32,7 @@ func (c *Cmd) Footprint() (int64, error) {
 			continue
 		}
 		if b, err := os.ReadFile("/proc/" + d.Name() + "/stat"); err == nil {
-			if pp, ok := parseStatPPID(string(b)); ok {
+			if _, pp, ok := parseStat(string(b)); ok {
 				ppid[pid] = pp
 			}
 		}
