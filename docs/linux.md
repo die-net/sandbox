@@ -169,7 +169,7 @@ The two AppArmor findings apply only when this program runs unconfined, under it
 
 [usage.md](usage.md#probe-and-check) says how a program uses them.
 
-The AppArmor fix is a profile for this one binary's path, which the package generates and `Probe` prints. Ubuntu 24.04 and 26.04 need it, and Debian doesn't.
+The AppArmor fix is a profile for this one binary's path, which `AppArmorProfile` returns and `Probe` prints. Ubuntu 24.04 and 26.04 need it, and Debian doesn't.
 
 - **Ubuntu 24.04** sets `kernel.apparmor_restrict_unprivileged_userns=1`. The kernel then lets an unconfined program make a user namespace and takes its capabilities away, so `Start` fails with bubblewrap's own message, such as `loopback: Failed RTM_NEWADDR: Operation not permitted`.
 - **Ubuntu 26.04** also attaches a profile to `/usr/bin/bwrap`, from `bwrap-userns-restrict` in the `apparmor` package. It lets bubblewrap make namespaces, and runs whatever bubblewrap starts as `bwrap//&unpriv_bwrap`, a stack whose `unpriv_bwrap` denies every capability. The first stage then can't make its mount namespace, and `Start` fails with `copy the view into a mount namespace of its own: operation not permitted`, whatever the sysctl says. The audit log shows `apparmor="DENIED" operation="capable" profile="unpriv_bwrap" comm="sandbox-stage" capname="sys_admin"`.

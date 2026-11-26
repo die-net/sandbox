@@ -222,9 +222,9 @@ func TestMasked(t *testing.T) {
 	}
 }
 
-func TestApparmorProfile(t *testing.T) {
+func TestAppArmorProfile(t *testing.T) {
 	t.Parallel()
-	p, name, err := apparmorProfile("/opt/app/server")
+	p, name, err := AppArmorProfile("/opt/app/server")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -246,7 +246,7 @@ func TestApparmorProfile(t *testing.T) {
 		t.Errorf("want one profile, for this binary, in enforce mode:\n%s", p)
 	}
 	for _, bad := range []string{"", "relative", "/opt/my app/x", "/bad\"path", "/bad\nname"} {
-		if _, _, err := apparmorProfile(bad); err == nil {
+		if _, _, err := AppArmorProfile(bad); err == nil {
 			t.Errorf("accepted %q", bad)
 		}
 	}
@@ -278,11 +278,11 @@ func TestDetectContainer(t *testing.T) {
 	}
 }
 
-// TestWriteApparmorProfile writes this test binary's AppArmor profile into
+// TestWriteAppArmorProfile writes this test binary's AppArmor profile into
 // the directory named by SBX_APPARMOR_OUT, under the name to load it by.
 // scripts/apparmor.sh uses it, so the profile the suite runs under is the
 // one the library prints.
-func TestWriteApparmorProfile(t *testing.T) {
+func TestWriteAppArmorProfile(t *testing.T) {
 	t.Parallel()
 	dir := os.Getenv("SBX_APPARMOR_OUT")
 	if dir == "" {
@@ -295,7 +295,7 @@ func TestWriteApparmorProfile(t *testing.T) {
 	if exe, err = filepath.EvalSymlinks(exe); err != nil {
 		t.Fatal(err)
 	}
-	p, name, err := apparmorProfile(exe)
+	p, name, err := AppArmorProfile(exe)
 	if err != nil {
 		t.Fatal(err)
 	}
