@@ -38,7 +38,7 @@ func TestTeardownOneScanInTheStageAndNoneInTheCaller(t *testing.T) {
 		// The stage is this test binary, and one built with -race sleeps a second
 		// as it exits, for races to be reported, which over 50 runs or more is most
 		// of a minute. Other tests' stages keep the sleep.
-		c.Env = []string{"GORACE=atexit_sleep_ms=0"}
+		c.Env = []string{noRaceExitSleep}
 		if err := c.Start(); err != nil {
 			t.Fatal(err)
 		}

@@ -292,7 +292,7 @@ func TestRealScanIsNeverCleanWhileAMemberExits(t *testing.T) {
 	// The stage and the lingerer are this test binary, and one built with -race
 	// sleeps a second as it exits (GORACE's atexit_sleep_ms), which the bound
 	// on Wait below would count as the teardown's.
-	c.Env = []string{shellPath, "GORACE=atexit_sleep_ms=0"}
+	c.Env = []string{shellPath, noRaceExitSleep}
 	if err := c.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -1159,7 +1159,7 @@ func TestWatchStageDoesNotScanAfterTheStageReported(t *testing.T) {
 		timeout time.Duration
 	}{
 		{"empty", []string{"/bin/sh", "-c", "echo x"}, []string{shellPath}, false, 10 * time.Second},
-		{"members", []string{self(t), "leaver", "close"}, []string{shellPath, stageNoKillEnv + "=1"}, true, 30 * time.Second},
+		{"members", []string{self(t), "leaver", "close"}, []string{shellPath, stageNoKillEnv + "=1", noRaceExitSleep}, true, 30 * time.Second},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -1235,7 +1235,7 @@ func TestWaitReturnsAfterAGiveUpWhileAMemberHoldsTheOutput(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c.Env = []string{shellPath, stageNoKillEnv + "=1"}
+	c.Env = []string{shellPath, stageNoKillEnv + "=1", noRaceExitSleep}
 	c.Stdout = &syncBuffer{}
 	if err := c.Start(); err != nil {
 		t.Fatal(err)

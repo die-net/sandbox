@@ -293,7 +293,7 @@ func TestTeardownGivesUpOnMembersItCannotEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c.Env = []string{shellPath, stageNoKillEnv + "=1"}
+	c.Env = []string{shellPath, stageNoKillEnv + "=1", noRaceExitSleep}
 	if err := c.Start(); err != nil {
 		t.Fatal(err)
 	}
