@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"os"
 	"os/exec"
@@ -1976,11 +1977,25 @@ func TestEscapeKernelLevels(t *testing.T) {
 	}
 }
 
+// neverAllowed are the strings that no profile and no Services group holds.
+var neverAllowed = []string{"lsopen", "iokit", "mach-register", "(allow default)", "(allow mach-lookup)", "(allow signal)", "(allow process-info*)", "(allow network*)", "(allow file-write*)\n", "mach-priv", "system-fsctl"}
+
 // Row: "Seatbelt profile ... never lsopen": whatever Spec made it, a profile
-// does not name lsopen, iokit, or a Mach service outside its groups, and it
-// confines signals and process info to the sandbox.
+// does not name lsopen, iokit, mach-register, or a Mach service outside its
+// groups, and it confines signals and process info to the sandbox. Every rule
+// of every Services group is checked too, whether a test names the group or
+// not.
 func TestEscapeProfileNeverAllows(t *testing.T) {
 	t.Parallel()
+	for s, rules := range serviceRules {
+		for _, rule := range rules {
+			for _, bad := range neverAllowed {
+				if strings.Contains(rule+"\n", bad) {
+					t.Errorf("the group %s has a rule with %q: %s", s, bad, rule)
+				}
+			}
+		}
+	}
 	for _, in := range []profileInput{
 		{Home: "/h"},
 		{Home: "/h", Network: NetworkHost, Services: allServices},
@@ -1990,7 +2005,7 @@ func TestEscapeProfileNeverAllows(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, bad := range []string{"lsopen", "iokit", "mach-register", "(allow default)", "(allow mach-lookup)", "(allow signal)", "(allow process-info*)", "(allow network*)", "(allow file-write*)\n", "mach-priv", "system-fsctl"} {
+		for _, bad := range neverAllowed {
 			if strings.Contains(p, bad) {
 				t.Errorf("a profile contains %q:\n%s", bad, p)
 			}
@@ -2139,6 +2154,8 @@ func TestEscapeAdminGroupWrites(t *testing.T) {
 var _ = sync.Mutex{}
 
 // serviceNames are the Mach services each Service lets a sandbox look up.
+// TestEscapeServiceLookups fails unless its keys are serviceRules' keys, so a
+// new group is tried there.
 var serviceNames = map[Service][]string{
 	ServiceSystemConfiguration: {"com.apple.SystemConfiguration.configd"},
 	ServiceLaunchServices:      {"com.apple.coreservices.launchservicesd"},
@@ -2146,7 +2163,9 @@ var serviceNames = map[Service][]string{
 }
 
 // allServices is every Service, for the tests that want the widest profile.
-var allServices = []Service{ServiceSystemConfiguration, ServiceLaunchServices, ServiceDirectory}
+// It is serviceRules' keys, sorted, so a new group is in every profile that
+// these tests check without a change here.
+var allServices = slices.Sorted(maps.Keys(serviceRules))
 
 // Row: "Launching apps and URLs", and the Services groups it rests on: each
 // Service lets a sandbox look up its own services and no other, and a real
@@ -2158,6 +2177,9 @@ var allServices = []Service{ServiceSystemConfiguration, ServiceLaunchServices, S
 // only, and prints nothing of the user's session.
 func TestEscapeServiceLookups(t *testing.T) {
 	t.Parallel()
+	if named := slices.Sorted(maps.Keys(serviceNames)); !slices.Equal(named, allServices) {
+		t.Fatalf("serviceNames has the groups %q, and serviceRules %q", named, allServices)
+	}
 	for _, s := range allServices {
 		t.Run("lookups "+string(s), func(t *testing.T) {
 			t.Parallel()

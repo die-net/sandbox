@@ -293,7 +293,7 @@ A review of the finished backend by Fable 5.2 found four issues and no full esca
   - A sandbox that checked a name in first kept it: the outside process's own check-in of the same name was refused with 1100 (`BOOTSTRAP_NOT_PRIVILEGED`). So a sandbox could take the name that the user's own browser, or any program using the prefix, would register, and receive what that program's clients send it.
   - Without the group, or for a name outside the prefix, both `bootstrap_check_in` and `bootstrap_register` were refused with 1100.
 - **What stops it.** No `Service` allows `mach-register`. The group was removed, and its two lookups became `ServiceSystemConfiguration` and `ServiceLaunchServices`. A program whose processes find each other by registered names doesn't run.
-- **Test.** `TestEscapeProfileNeverAllows` fails if any profile holds `mach-register`, and `TestEscapeServiceLookups` that each group allows its own lookups and no other.
+- **Test.** `TestEscapeProfileNeverAllows` fails if any rule of any `Services` group holds `mach-register`, or any profile it builds does, and it builds one with every group in `serviceRules`. `TestEscapeServiceLookups` checks that each group allows its own lookups and no other, and fails if a group in `serviceRules` has no entry in its list of each group's services.
 
 ## Found by the review of the macOS teardown proof
 
