@@ -4,14 +4,14 @@
 #   scripts/apparmor.sh load   /path/to/sandbox.test
 #   scripts/apparmor.sh remove /path/to/sandbox.test
 # It runs where the binary runs, as the test account, and uses sudo. The
-# profile comes from the binary itself (TestWriteApparmorProfile), so it is
-# the one Probe prints. It is for the binary's exact path.
+# profile comes from the binary itself (TestWriteAppArmorProfile calls
+# AppArmorProfile), so it is the one Probe prints. It is for the binary's exact path.
 set -eu
 op=$1
 bin=$2
 dir=$(mktemp -d)
 trap 'rm -rf "$dir"' EXIT
-SBX_APPARMOR_OUT=$dir "$bin" -test.run '^TestWriteApparmorProfile$' >/dev/null
+SBX_APPARMOR_OUT=$dir "$bin" -test.run '^TestWriteAppArmorProfile$' >/dev/null
 for f in "$dir"/*; do
 	name=$(basename "$f")
 	case $op in

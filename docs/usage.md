@@ -158,7 +158,51 @@ In a container, the fix relaxes the outer layer just enough for the inner one, w
 
 Container detection is best effort: `/.dockerenv`, `/run/.containerenv`, `KUBERNETES_SERVICE_HOST`, cgroup path patterns, and `systemd-detect-virt -c` when it exists.
 
-`scripts/apparmor.sh` loads the profile for this package's own test binary. A program that adopts the library uses the profile `Probe` prints for its own path.
+### The AppArmor profile on Ubuntu
+
+`AppArmorProfile(path)` returns the profile that `Probe` prints, and the name to save it under in `/etc/apparmor.d`. `Probe` prints it only while the sandbox fails, so an install script or a test gets it from `AppArmorProfile`. The path is the binary's absolute path with symbolic links resolved, since AppArmor attaches a profile by the path the kernel execs. A profile for one path doesn't cover a copy of the binary somewhere else. A path that is relative or holds a space, a quote or another character the profile would need escaped gets an error.
+
+A program's own tests need the profile for the test binary. Build the binary at a fixed path, have it write its profile, load that, and run it. A test like this one writes the profile when asked:
+
+```go
+// TestWriteAppArmorProfile writes the AppArmor profile for this test binary
+// into the directory APPARMOR_OUT names, and skips unless it is set.
+func TestWriteAppArmorProfile(t *testing.T) {
+	dir := os.Getenv("APPARMOR_OUT")
+	if dir == "" {
+		t.Skip("APPARMOR_OUT is not set")
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exe, err = filepath.EvalSymlinks(exe); err != nil {
+		t.Fatal(err)
+	}
+	profile, name, err := sandbox.AppArmorProfile(exe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(profile), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+```
+
+Then, on Ubuntu, for one package:
+
+```sh
+go test -c -o "$PWD/app.test" .
+out=$(mktemp -d)
+APPARMOR_OUT=$out ./app.test -test.run '^TestWriteAppArmorProfile$'
+for f in "$out"/*; do
+	sudo install -m 644 "$f" "/etc/apparmor.d/$(basename "$f")"
+	sudo apparmor_parser -r "/etc/apparmor.d/$(basename "$f")"
+done
+./app.test
+```
+
+The profile allows everything to the test binary and every process it starts, so remove it after the run with `apparmor_parser -R` and the file. `scripts/apparmor.sh` does all of this for this package's own test binary.
 
 ## Tools installed under covered paths
 

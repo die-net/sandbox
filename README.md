@@ -102,7 +102,7 @@ On both: a file descriptor you hand in grants whatever its object allows, whatev
 
 - **Go** 1.26 or later.
 - **Linux:** bubblewrap 0.8 or later from your distribution, not setuid. The suite passes on 0.12.0, 0.11.1, 0.9.0 and 0.8.0.
-- **Ubuntu 24.04 and later** restrict unprivileged user namespaces, and 26.04 also confines bubblewrap whatever that setting says, so the binary needs an AppArmor profile. `Probe` prints one for the binary's own path, and the commands to load it. Every program the binary starts stays in that profile, which allows everything ([docs/linux.md](docs/linux.md#probe-and-check)). [scripts/apparmor.sh](scripts/apparmor.sh) does the same for this package's test binary.
+- **Ubuntu 24.04 and later** restrict unprivileged user namespaces, and 26.04 also confines bubblewrap whatever that setting says, so the binary needs an AppArmor profile. `Probe` prints one for the binary's own path, and the commands to load it, and `AppArmorProfile` returns it for an install script or a test. Every program the binary starts stays in that profile, which allows everything ([docs/linux.md](docs/linux.md#probe-and-check)). [scripts/apparmor.sh](scripts/apparmor.sh) does the same for this package's test binary.
 - **macOS:** `/usr/bin/sandbox-exec`, which ships with the system. It must not already be inside a Seatbelt profile.
 - **Elsewhere:** `Command` and `Run` return `errors.ErrUnsupported`.
 

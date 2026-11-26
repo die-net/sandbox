@@ -121,7 +121,7 @@ func firstBlock(f probeFacts) Result {
 	container := f.Container != "" && f.Container != "systemd-unit"
 	switch {
 	case apparmorApplies(f) && !apparmorInForce(f) && ubuntuBwrap(f.BwrapLabel) && f.BwrapLabel != f.AppArmor:
-		profile, name, err := apparmorProfile(f.Self)
+		profile, name, err := AppArmorProfile(f.Self)
 		if err != nil {
 			return fail("probe.apparmor-bwrap", "bubblewrap gets the AppArmor label %q when this program runs it, not this program's own %q, and the sandbox failed: %s\n"+
 				"No profile can be generated: %v", f.BwrapLabel, f.AppArmor, f.TryErr, err)
@@ -132,7 +132,7 @@ func firstBlock(f probeFacts) Result {
 			"%s\n\n%s",
 			f.BwrapLabel, f.AppArmor, f.TryErr, name, name, profileGrant(f.Self), profile)
 	case apparmorApplies(f) && !apparmorInForce(f) && f.Sysctl["kernel.apparmor_restrict_unprivileged_userns"] == "1":
-		profile, name, err := apparmorProfile(f.Self)
+		profile, name, err := AppArmorProfile(f.Self)
 		if err != nil {
 			return fail("probe.apparmor-userns", "AppArmor restricts unprivileged user namespaces (kernel.apparmor_restrict_unprivileged_userns=1), and bubblewrap failed: %s\n"+
 				"No profile can be generated: %v", f.TryErr, err)
@@ -184,9 +184,9 @@ func masked(mounts []mount) bool {
 }
 
 // apparmorOwn reports whether this process runs under the profile
-// apparmorProfile names for it, in whatever mode.
+// AppArmorProfile names for it, in whatever mode.
 func apparmorOwn(f probeFacts) bool {
-	_, name, err := apparmorProfile(f.Self)
+	_, name, err := AppArmorProfile(f.Self)
 	return err == nil && strings.HasPrefix(f.AppArmor, name+" (")
 }
 
@@ -201,7 +201,7 @@ func apparmorApplies(f probeFacts) bool {
 }
 
 // apparmorInForce reports whether this process already runs under the
-// profile apparmorProfile writes, which is in enforce mode, so loading it
+// profile AppArmorProfile returns, which is in enforce mode, so loading it
 // again would change nothing and the trial failed for another reason. Under
 // the unconfined-mode profile of v0.1.0 it is not, and the fix is to replace
 // it.
@@ -209,12 +209,20 @@ func apparmorInForce(f probeFacts) bool {
 	return apparmorOwn(f) && strings.HasSuffix(f.AppArmor, " (enforce)")
 }
 
-// apparmorProfile writes an AppArmor profile for the binary at self, and
-// returns it with the name to save it under. Ubuntu 24.04 and later need it.
-// It applies to this binary and to every process it starts, bubblewrap and
-// the sandbox included, and to no other program. A profile on bubblewrap's
-// own path would give user namespaces to every process on the host that runs
-// it.
+// AppArmorProfile returns the AppArmor profile that Ubuntu 24.04 and later
+// need before a sandbox can start from the binary at path, with the name to
+// save it under in /etc/apparmor.d. It is the profile Probe prints in its fix.
+// path must be the binary's absolute path with symbolic links resolved, since
+// AppArmor attaches a profile by the path the kernel execs. A program loads the
+// profile at install time, and a test loads it for its own test binary before
+// running it. The error says why a path can't have a profile: it is empty or
+// relative, or holds a character the profile would need escaped. The profile is plain
+// text, so it is the same on every platform.
+//
+// The profile applies to that binary and to every process it starts,
+// bubblewrap and the sandbox included, and to no other program. A profile on
+// bubblewrap's own path would give user namespaces to every process on the
+// host that runs it.
 //
 // The profile allows everything, user namespaces and capabilities in them
 // included. It is in enforce mode, with an all rule, so that exec inherits
@@ -235,16 +243,16 @@ func apparmorInForce(f probeFacts) bool {
 // mount sets, and the creation of sockets (tried on Ubuntu 24.04, kernel
 // 6.8). Loaded with apparmor_parser -r and exercised by the full test suite
 // on both systems.
-func apparmorProfile(self string) (profile, name string, err error) {
-	if !filepath.IsAbs(self) || strings.ContainsAny(self, "\"\\\n{}[]?*^,;@$ ") {
-		return "", "", fmt.Errorf("the path %q is empty, relative, or has a character a profile would need escaped", self)
+func AppArmorProfile(path string) (profile, name string, err error) {
+	if !filepath.IsAbs(path) || strings.ContainsAny(path, "\"\\\n{}[]?*^,;@$ ") {
+		return "", "", fmt.Errorf("the path %q is empty, relative, or has a character a profile would need escaped", path)
 	}
 	name = "sandbox-" + strings.Map(func(r rune) rune {
 		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' {
 			return r
 		}
 		return '-'
-	}, strings.Trim(self, "/"))
+	}, strings.Trim(path, "/"))
 	return fmt.Sprintf(`abi <abi/4.0>,
 include <tunables/global>
 
@@ -256,10 +264,10 @@ profile %[1]s %[2]s flags=(attach_disconnected,mediate_deleted) {
   allow network,
   allow unix,
 }
-`, name, self), name, nil
+`, name, path), name, nil
 }
 
-// profileGrant says what apparmorProfile's profile grants, for the fix.
+// profileGrant says what AppArmorProfile's profile grants, for the fix.
 func profileGrant(self string) string {
 	return fmt.Sprintf("It lets %s and every process it starts, bubblewrap and the sandbox included, make user namespaces and use capabilities in them, and it grants nothing to any other program. "+
 		"Those processes stay in this profile, so none of them moves into a stricter profile of its own.", self)

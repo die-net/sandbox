@@ -47,7 +47,7 @@ Without `SBX_APPARMOR=1`, the same Ubuntu run fails 159 of the tests that start 
 
 **The skips** are the same on every target except where noted:
 
-- `TestWriteApparmorProfile` is the helper that `scripts/apparmor.sh` calls, and skips unless asked.
+- `TestWriteAppArmorProfile` is the helper that `scripts/apparmor.sh` calls, and skips unless asked.
 - `TestAPIRlimits` skips where the host's hard core limit is unlimited, so no higher one can be asked for.
 - `TestAPICgroupFD` skips where the login session has no delegated cgroup to start in.
 - The `.zfs` case of `TestEscapeMountTableCovers` skips where there's no ZFS dataset (`TestMountCovers` checks the rule on a fake mount table).
@@ -69,7 +69,7 @@ Without `SBX_APPARMOR=1`, the same Ubuntu run fails 159 of the tests that start 
 | macOS 27.2.1, amd64 under Rosetta 2 on the same Mac, Go 1.27, cross-built with `GOARCH=amd64` | `go test` (`CGO_ENABLED=0`, about 1 minute) | 130 | 91 | 2 | 0 |
 | the same | `go test -race` (`CGO_ENABLED=1`, about 6.5 minutes) | 130 | 91 | 2 | 0 |
 
-The counts are top-level tests and their subtests. The arm64 skips are `TestWriteApparmorProfile`, the Linux AppArmor helper, and the measurements that run only when asked (`TestChurnCleanScanRate`, `TestChurnNormalTeardownLatency`, `TestOverheadTrue`). The Rosetta rows are from before the `Services` groups were renamed by mechanism and their tests replaced.
+The counts are top-level tests and their subtests. The arm64 skips are `TestWriteAppArmorProfile`, the Linux AppArmor helper, and the measurements that run only when asked (`TestChurnCleanScanRate`, `TestChurnNormalTeardownLatency`, `TestOverheadTrue`). The Rosetta rows are from before the `Services` groups were renamed by mechanism and their tests replaced.
 
 The suite found that macOS 27.0.1 and 27.2.0 differ: curl needed one more Mach service on 27.2.0 ([findings.md](findings.md#tls-needed-a-mach-service-from-272)).
 
