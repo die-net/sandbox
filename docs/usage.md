@@ -46,7 +46,7 @@ Every field is honored or harmlessly ignored on both backends. `Probe` lists the
 | Environment | `HOME`, `TMPDIR` and `XDG_*` set by `Start`. | The same, plus `CFFIXED_USER_HOME`. |
 | `Services` | Ignored. | Extra `mach-lookup` groups. |
 | `Network: NetworkNone` | A network namespace with only a private loopback. | Deny network, except the `Listen` and `Loopback` ports and the unix sockets the `Spec` names. |
-| `Network: NetworkHost` | The host's network. | Allow TCP and UDP out and name lookups, deny `localhost:*`. |
+| `Network: NetworkHost` | The host's network. | Allow TCP and UDP out, mDNSResponder's socket and the Mach services that name lookups use, deny `localhost:*`. |
 | `BroadLoopback` | Ignored, since loopback is private. | Opt-in: allow `localhost:*` to bind, accept and dial, TCP and UDP. |
 | `Listen` | Bound inside the namespace by the stage, handed to the caller. | Bound by the caller on `127.0.0.1:0`, and the profile allows that port. |
 | `Loopback` | Fixed ports in a private loopback. | Free ports chosen by the caller. Not private. |
