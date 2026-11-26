@@ -163,9 +163,12 @@ const (
 	// (com.apple.SystemConfiguration.configd), where the SystemConfiguration
 	// framework and CFNetwork read the network's state and the proxy
 	// settings. It lets the command read them: the interfaces and their
-	// addresses, the primary service, DNS and proxies. It changes nothing,
-	// since configd takes changes only from root. NetworkHost allows the same
-	// lookup.
+	// addresses, the primary service, DNS and proxies. configd refuses a
+	// change from a process that is not root and lacks configd's write
+	// entitlement (checkWriteAccess in configd's configd.tproj/session.c), and
+	// TestEscapeServiceLookups/configd-write shows scutil refused. A few
+	// system programs that any account can run have that entitlement
+	// (docs/macos.md, Services). NetworkHost allows the same lookup.
 	ServiceSystemConfiguration Service = "systemconfiguration"
 	// ServiceLaunchServices lets the command look up launchservicesd
 	// (com.apple.coreservices.launchservicesd), which Cocoa programs ask about
@@ -176,8 +179,8 @@ const (
 	ServiceLaunchServices Service = "launchservices"
 	// ServiceDirectory lets the command look accounts up through Directory
 	// Services (getpwuid, getpwnam). Without it those find nothing, since the
-	// sandbox has no passwd entry of its own on macOS. It also lets the command list every
-	// account on the host.
+	// sandbox has no passwd entry of its own on macOS. It also lets the
+	// command list every account on the host.
 	ServiceDirectory Service = "directory"
 )
 
