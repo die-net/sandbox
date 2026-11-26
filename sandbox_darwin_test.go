@@ -61,9 +61,21 @@ const stageKillBeforeReplyEnv = "SANDBOX_TEST_STAGE_KILL_BEFORE_REPLY"
 // waits a fraction of a second.
 const stageNoKillEnv = "SANDBOX_TEST_STAGE_NO_KILL"
 
-// stageNoKillGiveUp is the stage's giveUpAfter under stageNoKillEnv: long
-// enough for more than ten scans at the backoff's pace.
-const stageNoKillGiveUp = 300 * time.Millisecond
+// stageNoKillGiveUp is the stage's giveUpAfter under stageNoKillEnv, which a
+// test that wants ten scans or more needs room for. The give-up is measured in
+// time, so every scan's own cost counts against it. Ten scans sleep 131 ms
+// between them (backoffStart doubling to backoffMax: 1, 2, 4, 8, 16, then 25
+// ms), which leaves 41 ms a scan for the scan itself and its sleep's
+// overshoot. A stage built with -race, with all ten cores of the Mac it was
+// measured on busy twice over and eight fork loops running, took about 1 ms a
+// scan (16 scans in 300 ms, 10 runs of 10).
+const stageNoKillGiveUp = 500 * time.Millisecond
+
+// noRaceExitSleep, in a sandbox's environment, stops a stage or command built
+// with -race from sleeping a second as it exits (GORACE's atexit_sleep_ms),
+// which the tests that bound how long Wait takes would count as the
+// teardown's.
+const noRaceExitSleep = "GORACE=atexit_sleep_ms=0"
 
 // stageFdDirEnv, in the same place, holds the directory the stage lists its
 // descriptors from in place of /dev/fd, so that a test can make the listing
