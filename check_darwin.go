@@ -3,6 +3,7 @@ package sandbox
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -96,6 +97,24 @@ func procEnvironment(pid int) bool {
 	return len(bytes.TrimLeft(rest, "\x00")) > 0
 }
 
+// signalReaches reports whether kill(pid, 0) shows that a signal from this
+// process would reach pid. kill in bsd/kern/kern_sig.c returns 0 for a zombie
+// before it calls cansignal, and so before the profile is asked: proc_find
+// doesn't find a zombie, and pzfind does. So a kill that works counts only if
+// pid is not a zombie after it. A process that was a zombie at the kill is
+// still one, or it has been reaped and kill now gives ESRCH. A pid whose state
+// can't be read and that kill still finds counts, so the check fails closed.
+func signalReaches(pid int) bool {
+	if syscall.Kill(pid, 0) != nil {
+		return false
+	}
+	p, err := unix.SysctlKinfoProc("kern.proc.pid", pid)
+	if err != nil {
+		return !errors.Is(syscall.Kill(pid, 0), syscall.ESRCH)
+	}
+	return p.Proc.P_stat != stateZombie
+}
+
 // checkProcesses tries what a process of the same uid can do to the ones
 // outside this tree. macOS has no pid namespace, so the processes are listed
 // and, but for a profile that denies signals, signalable. A profile cannot
@@ -124,7 +143,7 @@ func checkProcesses(*checkEnv) []Result {
 		name string
 		fn   func(pid int) bool
 	}{
-		{"proc.signal", func(pid int) bool { return syscall.Kill(pid, 0) == nil }},
+		{"proc.signal", signalReaches},
 		{"proc.environ", procEnvironment},
 	} {
 		var worked []string

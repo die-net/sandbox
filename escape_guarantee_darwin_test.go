@@ -47,6 +47,7 @@ func registerEscapeChecks() {
 	escChecks["writes-allowed"] = escWritesAllowed
 	escChecks["exec-denied"] = escExecDenied
 	escChecks["signals"] = escSignals
+	escChecks["signal-reaches"] = escSignalReaches
 	escChecks["procinfo"] = escProcInfo
 	escChecks["dial-denied"] = escDialDenied
 	escChecks["dial-ok"] = escDialOK
