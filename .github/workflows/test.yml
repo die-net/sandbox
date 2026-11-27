@@ -1,29 +1,40 @@
 name: test
 
 on:
-  push:
   pull_request:
+  # Only main runs on push. A branch with a pull request is tested by
+  # pull_request, and a push there too would run every job twice. Main's
+  # runs check what merged and save the caches that pull requests restore.
+  push:
+    branches: [main]
 
 permissions:
   contents: read
 
 jobs:
+  # One job vets every target the library builds for. Each vet takes a few
+  # seconds, and a job of its own spent most of its time setting up Go. A
+  # target that fails doesn't stop the others.
   vet:
-    name: vet linux/${{ matrix.goarch }}
+    name: vet
     runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        goarch: [amd64, arm64, arm]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: go.mod
-      - run: go vet ./...
+      - run: |
+          status=0
+          for target in linux/amd64 linux/arm64 linux/arm darwin/arm64 darwin/amd64 windows/amd64; do
+            echo "::group::go vet $target"
+            if ! GOOS=${target%/*} GOARCH=${target#*/} go vet ./...; then
+              echo "::error::go vet failed for $target"
+              status=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $status
         env:
-          GOOS: linux
-          GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: "0"
 
   # Ubuntu 26.04 also attaches an AppArmor profile to /usr/bin/bwrap that
