@@ -211,8 +211,11 @@ func apparmorInForce(f probeFacts) bool {
 // AppArmorProfile returns the AppArmor profile that Ubuntu 24.04 and later
 // need before a sandbox can start from the binary at path, with the name to
 // save it under in /etc/apparmor.d. It is the profile Probe prints in its fix.
-// path must be the binary's absolute path with symbolic links resolved, since
-// AppArmor attaches a profile by the path the kernel execs. A program loads the
+// path must be the binary's absolute path with symbolic links resolved. The
+// kernel follows symbolic links when it opens the file it execs
+// (do_open_execat in Linux's fs/exec.c), and AppArmor attaches a profile by
+// that file's path, not the name exec was given (profile_transition in
+// security/apparmor/domain.c). A program loads the
 // profile at install time, and a test loads it for its own test binary before
 // running it. The error says why a path can't have a profile: it is empty or
 // relative, or holds a character other than an ASCII letter, a digit, or one
