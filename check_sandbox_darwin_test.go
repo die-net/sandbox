@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -351,4 +353,51 @@ func TestProcEnvironment(t *testing.T) {
 	if procEnvironment(-5) {
 		t.Error("a bad pid gave an environment")
 	}
+}
+
+// escSignalReaches fails if signalReaches, the probe of proc.signal, reaches any
+// of the pids in args.
+func escSignalReaches(e *escT, args []string) {
+	for _, a := range args {
+		pid, _ := strconv.Atoi(a)
+		if signalReaches(pid) {
+			e.failf("proc.signal's probe reached %d", pid)
+		}
+	}
+}
+
+// TestCheckSignalSkipsZombies checks that proc.signal doesn't count a zombie
+// outside the sandbox as a process it could signal. kill(pid, 0) returns 0 for
+// a zombie whatever the profile says, so a zombie of another test among the
+// pids the check tried made it fail.
+func TestCheckSignalSkipsZombies(t *testing.T) {
+	t.Parallel()
+	zombie := exec.CommandContext(t.Context(), "/usr/bin/true")
+	if err := zombie.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = zombie.Wait() })
+	eventually(t, 10*time.Second, "the child did not become a zombie", func() bool {
+		p, err := unix.SysctlKinfoProc("kern.proc.pid", zombie.Process.Pid)
+		return err == nil && p.Proc.P_stat == stateZombie
+	})
+	live := exec.CommandContext(t.Context(), "/bin/sleep", "60")
+	if err := live.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = live.Process.Kill(); _ = live.Wait() })
+	z, l := zombie.Process.Pid, live.Process.Pid
+	// The kernel's answer, which the check has to see past.
+	if err := syscall.Kill(z, 0); err != nil {
+		t.Fatalf("kill(%d, 0) of a zombie: %v, want 0", z, err)
+	}
+	// Outside a sandbox the probe reaches a live process and not a zombie.
+	if !signalReaches(l) {
+		t.Errorf("the probe did not reach the live child %d", l)
+	}
+	if signalReaches(z) {
+		t.Errorf("the probe reached the zombie %d", z)
+	}
+	// Inside, it reaches neither.
+	escRun(t, Spec{}, "signal-reaches", strconv.Itoa(z), strconv.Itoa(l))
 }
