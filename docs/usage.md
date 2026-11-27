@@ -160,7 +160,7 @@ Container detection is best effort: `/.dockerenv`, `/run/.containerenv`, `KUBERN
 
 ### The AppArmor profile on Ubuntu
 
-`AppArmorProfile(path)` returns the profile that `Probe` prints, and the name to save it under in `/etc/apparmor.d`. `Probe` prints it only while the sandbox fails, so an install script or a test gets it from `AppArmorProfile`. The path is the binary's absolute path with symbolic links resolved, since AppArmor attaches a profile by the path the kernel execs. A profile for one path doesn't cover a copy of the binary somewhere else. A path that is relative or holds a space, a quote or another character the profile would need escaped gets an error.
+`AppArmorProfile(path)` returns the profile that `Probe` prints, and the name to save it under in `/etc/apparmor.d`. `Probe` prints it only while the sandbox fails, so an install script or a test gets it from `AppArmorProfile`. The path is the binary's absolute path with symbolic links resolved, since AppArmor attaches a profile by the path the kernel execs. A profile for one path doesn't cover a copy of the binary somewhere else. A path that is relative, or holds anything but ASCII letters, digits and `/._+-`, gets an error, since the path goes into the profile unquoted.
 
 A program's own tests need the profile for the test binary. Build the binary at a fixed path, have it write its profile, load that, and run it. A test like this one writes the profile when asked:
 
@@ -192,6 +192,7 @@ func TestWriteAppArmorProfile(t *testing.T) {
 Then, on Ubuntu, for one package:
 
 ```sh
+set -eu
 go test -c -o "$PWD/app.test" .
 out=$(mktemp -d)
 cleanup() {
@@ -203,7 +204,7 @@ cleanup() {
 	rm -rf "$out"
 }
 trap cleanup EXIT
-trap 'exit 1' INT TERM
+trap 'exit 1' HUP INT QUIT TERM
 APPARMOR_OUT=$out ./app.test -test.run '^TestWriteAppArmorProfile$'
 for f in "$out"/*; do
 	sudo install -m 644 "$f" "/etc/apparmor.d/$(basename "$f")"
@@ -212,7 +213,7 @@ done
 ./app.test
 ```
 
-The profile allows everything to whatever binary is at that path and every process it starts. It stays loaded, and comes back at boot from `/etc/apparmor.d`, until it is removed. So a profile left on a path the account can write grants that to any binary put there later. The traps remove the profile and its file when the run ends, pass, fail or interrupted. `scripts/apparmor.sh` does the same for this package's own test binary, and `scripts/linux-test.sh` always removes it after the tests.
+The profile allows everything to whatever binary is at that path and every process it starts. It stays loaded, and comes back at boot from `/etc/apparmor.d`, until it is removed. So a profile left on a path the account can write grants that to any binary put there later. The traps remove the profile and its file when the run ends, pass, fail or interrupted, a dropped terminal included, and `set -eu` stops the recipe at the first step that fails, so it never runs a stale binary or one with no profile. `scripts/apparmor.sh` does the same for this package's own test binary, and `scripts/linux-test.sh` always removes it after the tests.
 
 ## Tools installed under covered paths
 
