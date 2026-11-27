@@ -83,14 +83,17 @@ jobs:
           fi
       # SBX_LOCAL runs the tests on this machine, as the runner's own user, in
       # a directory of their own under /tmp, as the script explains. The cgo=0
-      # leg runs every test three times in one process, so a test that leaves
-      # state behind, or assumes it runs first, fails here.
+      # leg runs every test twice in one process, so a test that leaves state
+      # behind, or assumes it runs first, fails here. The cgo=1 leg runs every
+      # test once under the race detector, which needs cgo on Linux, so the
+      # suite runs once in each build without a third run of its own.
       - name: Test
-        run: scripts/linux-test.sh -test.v -test.count=${{ matrix.cgo == '0' && '3' || '1' }} -test.timeout=15m
+        run: scripts/linux-test.sh -test.v -test.count=${{ matrix.cgo == '0' && '2' || '1' }} -test.timeout=${{ matrix.cgo == '0' && '15m' || '25m' }}
         env:
           SBX_LOCAL: "1"
           SBX_APPARMOR: "1"
           CGO: ${{ matrix.cgo }}
+          RACE: ${{ matrix.cgo == '1' && '1' || '' }}
       # Without the profile no sandbox starts here. TestProbeVM checks that
       # Probe says so, and names the fix, rather than passing.
       - name: Probe without the profile
@@ -102,7 +105,8 @@ jobs:
   # The tests start real sandboxes with /usr/bin/sandbox-exec, as the runner's
   # own user, so they need no setup. A runner is not inside a Seatbelt profile,
   # which Probe would refuse.
-  # The race detector needs cgo on macOS, so only that leg runs it.
+  # The cgo=0 leg runs every test twice, and the cgo=1 leg runs every test
+  # once under the race detector, as on Linux.
   #
   # Seatbelt's rules differ between releases: macOS 15 and 26 allowed a hard
   # link that 27 refuses (docs/findings.md). So each release a runner offers
@@ -128,11 +132,11 @@ jobs:
       - run: go vet ./...
         env:
           GOARCH: amd64
-      # The cgo=0 leg, which has no race run, runs every test three times in
-      # one process, so a test that leaves state behind, or assumes it runs
-      # first, fails here.
+      # The cgo=0 leg runs every test twice in one process, so a test that
+      # leaves state behind, or assumes it runs first, fails here.
       - name: Test
-        run: go test -v -count=${{ matrix.cgo == '0' && '3' || '1' }} -timeout 15m ./...
+        if: matrix.cgo == '0'
+        run: go test -v -count=2 -timeout 15m ./...
       - name: Test with the race detector
         if: matrix.cgo == '1'
         run: go test -race -count=1 -timeout 25m ./...
