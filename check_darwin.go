@@ -3,7 +3,6 @@ package sandbox
 import (
 	"bytes"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -100,19 +99,16 @@ func procEnvironment(pid int) bool {
 // signalReaches reports whether kill(pid, 0) shows that a signal from this
 // process would reach pid. kill in bsd/kern/kern_sig.c returns 0 for a zombie
 // before it calls cansignal, and so before the profile is asked: proc_find
-// doesn't find a zombie, and pzfind does. So a kill that works counts only if
-// pid is not a zombie after it. A process that was a zombie at the kill is
-// still one, or it has been reaped and kill now gives ESRCH. A pid whose state
-// can't be read and that kill still finds counts, so the check fails closed.
+// doesn't find a zombie, and pzfind does. So a pid that kern.proc.pid shows is
+// a zombie is skipped. The state is read before the kill, so a process the
+// kill reached counts even if it exits right after. One that turns zombie
+// between the read and the kill counts too, and a pid whose state can't be
+// read is tried, so the check fails closed.
 func signalReaches(pid int) bool {
-	if syscall.Kill(pid, 0) != nil {
+	if p, err := unix.SysctlKinfoProc("kern.proc.pid", pid); err == nil && p.Proc.P_stat == stateZombie {
 		return false
 	}
-	p, err := unix.SysctlKinfoProc("kern.proc.pid", pid)
-	if err != nil {
-		return !errors.Is(syscall.Kill(pid, 0), syscall.ESRCH)
-	}
-	return p.Proc.P_stat != stateZombie
+	return syscall.Kill(pid, 0) == nil
 }
 
 // checkProcesses tries what a process of the same uid can do to the ones
