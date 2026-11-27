@@ -3,7 +3,6 @@ package sandbox
 import (
 	"errors"
 	"fmt"
-	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -244,7 +243,7 @@ func apparmorInForce(f probeFacts) bool {
 // 6.8). Loaded with apparmor_parser -r and exercised by the full test suite
 // on both systems.
 func AppArmorProfile(path string) (profile, name string, err error) {
-	if !filepath.IsAbs(path) || strings.ContainsAny(path, "\"\\\n{}[]?*^,;@$ ") {
+	if !strings.HasPrefix(path, "/") || strings.ContainsAny(path, "\"\\\n{}[]?*^,;@$ ") {
 		return "", "", fmt.Errorf("the path %q is empty, relative, or has a character a profile would need escaped", path)
 	}
 	name = "sandbox-" + strings.Map(func(r rune) rune {
