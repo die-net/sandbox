@@ -41,7 +41,7 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ steps.go.outputs.go-version }}-lint-${{ matrix.goos }}-${{ hashFiles('go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ steps.go.outputs.go-version }}-lint-${{ matrix.goos }}-${{ hashFiles('go.mod') }}
       # GOOS is set on this step only, so nothing that installs a tool for
       # the runner picks it up.
       - name: golangci-lint
