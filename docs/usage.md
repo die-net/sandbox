@@ -194,6 +194,16 @@ Then, on Ubuntu, for one package:
 ```sh
 go test -c -o "$PWD/app.test" .
 out=$(mktemp -d)
+cleanup() {
+	for f in "$out"/*; do
+		[ -e "$f" ] || continue
+		sudo apparmor_parser -R "/etc/apparmor.d/$(basename "$f")" || true
+		sudo rm -f "/etc/apparmor.d/$(basename "$f")"
+	done
+	rm -rf "$out"
+}
+trap cleanup EXIT
+trap 'exit 1' INT TERM
 APPARMOR_OUT=$out ./app.test -test.run '^TestWriteAppArmorProfile$'
 for f in "$out"/*; do
 	sudo install -m 644 "$f" "/etc/apparmor.d/$(basename "$f")"
@@ -202,7 +212,7 @@ done
 ./app.test
 ```
 
-The profile allows everything to the test binary and every process it starts, so remove it after the run with `apparmor_parser -R` and the file. `scripts/apparmor.sh` does all of this for this package's own test binary.
+The profile allows everything to whatever binary is at that path and every process it starts. It stays loaded, and comes back at boot from `/etc/apparmor.d`, until it is removed. So a profile left on a path the account can write grants that to any binary put there later. The traps remove the profile and its file when the run ends, pass, fail or interrupted. `scripts/apparmor.sh` does the same for this package's own test binary, and `scripts/linux-test.sh` always removes it after the tests.
 
 ## Tools installed under covered paths
 
