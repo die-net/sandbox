@@ -160,7 +160,7 @@ Container detection is best effort: `/.dockerenv`, `/run/.containerenv`, `KUBERN
 
 ### The AppArmor profile on Ubuntu
 
-`AppArmorProfile(path)` returns the profile that `Probe` prints, and the name to save it under in `/etc/apparmor.d`. `Probe` prints it only while the sandbox fails, so an install script or a test gets it from `AppArmorProfile`. The path is the binary's absolute path with symbolic links resolved, since AppArmor attaches a profile by the path the kernel execs. A profile for one path doesn't cover a copy of the binary somewhere else. A path that is relative, or holds anything but ASCII letters, digits and `/._+-`, gets an error, since the path goes into the profile unquoted.
+`AppArmorProfile(path)` returns the profile that `Probe` prints, and the name to save it under in `/etc/apparmor.d`. `Probe` prints it only while the sandbox fails, so an install script or a test gets it from `AppArmorProfile`. The path is the binary's absolute path with symbolic links resolved. The kernel follows symbolic links when it opens the file it execs (`do_open_execat` in Linux's `fs/exec.c`), and AppArmor attaches a profile by that file's path, not the name exec was given (`profile_transition` in `security/apparmor/domain.c`). A profile for one path doesn't cover a copy of the binary somewhere else. A path that is relative, or holds anything but ASCII letters, digits and `/._+-`, gets an error, since the path goes into the profile unquoted.
 
 A program's own tests need the profile for the test binary. Build the binary, install it at a path only root can write, have it write its profile, load that, and run it. A test like this one writes the profile when asked:
 
@@ -196,6 +196,7 @@ set -eu
 dir=/usr/local/libexec/app-test
 bin=$dir/app.test
 out=$(mktemp -d)
+build=$(mktemp -d)
 cleanup() {
 	set +e
 	for f in "$out"/*; do
@@ -204,13 +205,12 @@ cleanup() {
 		sudo rm -f "/etc/apparmor.d/$(basename "$f")"
 	done
 	sudo rm -rf "$dir"
-	rm -rf "$out"
+	rm -rf "$out" "$build"
 }
 trap cleanup EXIT
 trap 'exit 1' HUP INT QUIT TERM
-go test -c -o "$out/app.test" .
-sudo install -D -m 755 "$out/app.test" "$bin"
-rm "$out/app.test"
+go test -c -o "$build/app.test" .
+sudo install -D -m 755 "$build/app.test" "$bin"
 APPARMOR_OUT=$out "$bin" -test.run '^TestWriteAppArmorProfile$'
 for f in "$out"/*; do
 	sudo install -m 644 "$f" "/etc/apparmor.d/$(basename "$f")"
