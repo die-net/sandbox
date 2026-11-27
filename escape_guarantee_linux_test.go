@@ -167,14 +167,45 @@ func escCmd(ctx context.Context, t *testing.T, spec Spec, mode string, args ...s
 // exit 0, and returns its stdout.
 func escRun(t *testing.T, spec Spec, check string, args ...string) string {
 	t.Helper()
-	c, stdout, stderr := escCmd(t.Context(), t, spec, "esc", append([]string{check}, args...)...)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	c, stdout, stderr := escCmd(ctx, t, spec, "esc", append([]string{check}, args...)...)
 	if err := c.Start(); err != nil {
 		t.Fatalf("%s: start: %v", check, err)
 	}
-	if err := c.Wait(); err != nil {
+	if err := escWait(t, c, cancel, stdout, stderr, escName(spec, check, args)); err != nil {
 		t.Fatalf("%s: %v\n%s", check, err, stderr)
 	}
 	return stdout.String()
+}
+
+// escWithin is how long a check may run before escWait ends it. A check
+// takes about a second or less. The bound only keeps one that hangs from
+// holding the suite until go test's own timeout, which doesn't say which.
+const escWithin = time.Minute
+
+// escWait waits for c, which runs with cancel's context. If c runs past
+// escWithin, it ends the sandbox and fails the test with the check's name,
+// what it wrote, and how it ended.
+func escWait(t *testing.T, c *Cmd, cancel context.CancelFunc, stdout, stderr *syncBuffer, name string) error {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() { done <- c.Wait() }()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(escWithin):
+		cancel()
+		err := <-done
+		t.Fatalf("%s: still running after %v, then ended: %v\nstdout:\n%s\nstderr:\n%s", name, escWithin, err, stdout, stderr)
+		return nil
+	}
+}
+
+// escName names a check run for a failure: the check, its arguments, and
+// the Spec's levels, which tell the runs of one check apart.
+func escName(spec Spec, check string, args []string) string {
+	return fmt.Sprintf("%s %q under Kernel %q and Network %s", check, args, spec.Kernel, &spec.Network)
 }
 
 // jsonArg returns v as the one JSON argument a check takes.
@@ -624,9 +655,45 @@ func sc(nr uintptr, a ...uintptr) error {
 	return errno
 }
 
-// escSeccomp makes the calls the filter at level args[0] refuses.
+// escSeccomp makes the calls the filter at level args[0] refuses. A test runs
+// it under a level that allows some of them, to show the check then fails, so
+// a call that gets through must leave the process as it was. The calls run on
+// a thread of their own, which then takes a signal, as Go's preemption sends
+// one. A thread a call left traced would stop there for good. Its tracer is
+// pid 1, whose wait4 reports the stop under the thread's own id
+// (eligible_child in kernel/exit.c reports a tracee whatever the flags), and
+// pid 1 skips it as an orphan's and never resumes it. The check would hang
+// instead of failing. The thread isn't the process's first, whose stop pid 1
+// would take for the command's exit.
 func escSeccomp(e *escT, args []string) {
-	level := Kernel(args[0])
+	onOtherThread(func() {
+		seccompCalls(e, Kernel(args[0]))
+		e.is("a signal after the calls", unix.Tgkill(unix.Getpid(), unix.Gettid(), unix.SIGURG))
+	})
+}
+
+// onOtherThread runs f on a thread locked to it that isn't the process's
+// first, and waits for it.
+func onOtherThread(f func()) {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		// Never unlocked, so the thread ends with the goroutine, and
+		// whatever f did to it goes with it.
+		runtime.LockOSThread()
+		if unix.Gettid() == unix.Getpid() {
+			// This goroutine holds the first thread, so the next one
+			// gets another.
+			onOtherThread(f)
+			return
+		}
+		f()
+	}()
+	<-done
+}
+
+// seccompCalls makes the calls the filter at level refuses.
+func seccompCalls(e *escT, level Kernel) {
 	// The terminal ioctls are refused at every level, as is another ABI.
 	ptmx, err := os.OpenFile("/dev/ptmx", os.O_RDWR|unix.O_NOCTTY, 0)
 	if err != nil {
@@ -653,31 +720,35 @@ func escSeccomp(e *escT, args []string) {
 		return
 	}
 
-	// Everything not listed answers ENOSYS, so a program falls back.
-	refused := map[string]uintptr{
-		"bpf": unix.SYS_BPF, "io_uring_setup": unix.SYS_IO_URING_SETUP,
-		"io_uring_enter": unix.SYS_IO_URING_ENTER, "io_uring_register": unix.SYS_IO_URING_REGISTER,
-		"perf_event_open": unix.SYS_PERF_EVENT_OPEN, "userfaultfd": unix.SYS_USERFAULTFD,
-		"keyctl": unix.SYS_KEYCTL, "add_key": unix.SYS_ADD_KEY, "request_key": unix.SYS_REQUEST_KEY,
-		"init_module": unix.SYS_INIT_MODULE, "finit_module": unix.SYS_FINIT_MODULE,
-		"delete_module": unix.SYS_DELETE_MODULE, "kexec_load": unix.SYS_KEXEC_LOAD,
-		"ptrace": unix.SYS_PTRACE, "setns": unix.SYS_SETNS, "clone3": unix.SYS_CLONE3,
-		"process_vm_readv": unix.SYS_PROCESS_VM_READV, "process_vm_writev": unix.SYS_PROCESS_VM_WRITEV,
-		"open_by_handle_at": unix.SYS_OPEN_BY_HANDLE_AT, "reboot": unix.SYS_REBOOT,
-		"swapon": unix.SYS_SWAPON, "acct": unix.SYS_ACCT,
+	// Everything not listed answers ENOSYS, so a program falls back. Each is
+	// the call's number and its arguments. They are zeros, except ptrace's:
+	// its request 0 is PTRACE_TRACEME, which needs no target and makes the
+	// parent the calling thread's tracer (ptrace_traceme in kernel/ptrace.c),
+	// so it asks to attach to pid 0, which is no process.
+	refused := map[string][]uintptr{
+		"bpf": {unix.SYS_BPF}, "io_uring_setup": {unix.SYS_IO_URING_SETUP},
+		"io_uring_enter": {unix.SYS_IO_URING_ENTER}, "io_uring_register": {unix.SYS_IO_URING_REGISTER},
+		"perf_event_open": {unix.SYS_PERF_EVENT_OPEN}, "userfaultfd": {unix.SYS_USERFAULTFD},
+		"keyctl": {unix.SYS_KEYCTL}, "add_key": {unix.SYS_ADD_KEY}, "request_key": {unix.SYS_REQUEST_KEY},
+		"init_module": {unix.SYS_INIT_MODULE}, "finit_module": {unix.SYS_FINIT_MODULE},
+		"delete_module": {unix.SYS_DELETE_MODULE}, "kexec_load": {unix.SYS_KEXEC_LOAD},
+		"ptrace": {unix.SYS_PTRACE, unix.PTRACE_ATTACH, 0}, "setns": {unix.SYS_SETNS}, "clone3": {unix.SYS_CLONE3},
+		"process_vm_readv": {unix.SYS_PROCESS_VM_READV}, "process_vm_writev": {unix.SYS_PROCESS_VM_WRITEV},
+		"open_by_handle_at": {unix.SYS_OPEN_BY_HANDLE_AT}, "reboot": {unix.SYS_REBOOT},
+		"swapon": {unix.SYS_SWAPON}, "acct": {unix.SYS_ACCT},
 	}
 	if level == KernelStrict {
-		for name, nr := range map[string]uintptr{
-			"unshare": unix.SYS_UNSHARE, "mount": unix.SYS_MOUNT, "umount2": unix.SYS_UMOUNT2,
-			"pivot_root": unix.SYS_PIVOT_ROOT, "chroot": unix.SYS_CHROOT, "fsopen": unix.SYS_FSOPEN,
-			"fsmount": unix.SYS_FSMOUNT, "fsconfig": unix.SYS_FSCONFIG, "fspick": unix.SYS_FSPICK,
-			"open_tree": unix.SYS_OPEN_TREE, "move_mount": unix.SYS_MOVE_MOUNT, "mount_setattr": unix.SYS_MOUNT_SETATTR,
+		for name, call := range map[string][]uintptr{
+			"unshare": {unix.SYS_UNSHARE}, "mount": {unix.SYS_MOUNT}, "umount2": {unix.SYS_UMOUNT2},
+			"pivot_root": {unix.SYS_PIVOT_ROOT}, "chroot": {unix.SYS_CHROOT}, "fsopen": {unix.SYS_FSOPEN},
+			"fsmount": {unix.SYS_FSMOUNT}, "fsconfig": {unix.SYS_FSCONFIG}, "fspick": {unix.SYS_FSPICK},
+			"open_tree": {unix.SYS_OPEN_TREE}, "move_mount": {unix.SYS_MOVE_MOUNT}, "mount_setattr": {unix.SYS_MOUNT_SETATTR},
 		} {
-			refused[name] = nr
+			refused[name] = call
 		}
 	}
-	for name, nr := range refused {
-		e.is(name, sc(nr), unix.ENOSYS)
+	for name, call := range refused {
+		e.is(name, sc(call[0], call[1:]...), unix.ENOSYS)
 	}
 	// With real arguments, as a program would call them.
 	e.is("unshare(CLONE_NEWUSER)", func() error {
@@ -2393,11 +2464,13 @@ func mySid() int {
 // passed.
 func escTry(t *testing.T, spec Spec, check string, args ...string) bool {
 	t.Helper()
-	c, _, _ := escCmd(t.Context(), t, spec, "esc", append([]string{check}, args...)...)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	c, stdout, stderr := escCmd(ctx, t, spec, "esc", append([]string{check}, args...)...)
 	if err := c.Start(); err != nil {
 		t.Fatalf("%s: start: %v", check, err)
 	}
-	return c.Wait() == nil
+	return escWait(t, c, cancel, stdout, stderr, escName(spec, check, args)) == nil
 }
 
 // The checks above are only worth their passes if they fail when an escape
