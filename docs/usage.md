@@ -162,7 +162,7 @@ Container detection is best effort: `/.dockerenv`, `/run/.containerenv`, `KUBERN
 
 `AppArmorProfile(path)` returns the profile that `Probe` prints, and the name to save it under in `/etc/apparmor.d`. `Probe` prints it only while the sandbox fails, so an install script or a test gets it from `AppArmorProfile`. The path is the binary's absolute path with symbolic links resolved, since AppArmor attaches a profile by the path the kernel execs. A profile for one path doesn't cover a copy of the binary somewhere else. A path that is relative, or holds anything but ASCII letters, digits and `/._+-`, gets an error, since the path goes into the profile unquoted.
 
-A program's own tests need the profile for the test binary. Build the binary at a fixed path, have it write its profile, load that, and run it. A test like this one writes the profile when asked:
+A program's own tests need the profile for the test binary. Build the binary, install it at a path only root can write, have it write its profile, load that, and run it. A test like this one writes the profile when asked:
 
 ```go
 // TestWriteAppArmorProfile writes the AppArmor profile for this test binary
@@ -193,27 +193,37 @@ Then, on Ubuntu, for one package:
 
 ```sh
 set -eu
-go test -c -o "$PWD/app.test" .
+dir=/usr/local/libexec/app-test
+bin=$dir/app.test
 out=$(mktemp -d)
 cleanup() {
+	set +e
 	for f in "$out"/*; do
 		[ -e "$f" ] || continue
-		sudo apparmor_parser -R "/etc/apparmor.d/$(basename "$f")" || true
+		sudo apparmor_parser -R "/etc/apparmor.d/$(basename "$f")"
 		sudo rm -f "/etc/apparmor.d/$(basename "$f")"
 	done
+	sudo rm -rf "$dir"
 	rm -rf "$out"
 }
 trap cleanup EXIT
 trap 'exit 1' HUP INT QUIT TERM
-APPARMOR_OUT=$out ./app.test -test.run '^TestWriteAppArmorProfile$'
+go test -c -o "$out/app.test" .
+sudo install -D -m 755 "$out/app.test" "$bin"
+rm "$out/app.test"
+APPARMOR_OUT=$out "$bin" -test.run '^TestWriteAppArmorProfile$'
 for f in "$out"/*; do
 	sudo install -m 644 "$f" "/etc/apparmor.d/$(basename "$f")"
 	sudo apparmor_parser -r "/etc/apparmor.d/$(basename "$f")"
 done
-./app.test
+"$bin"
 ```
 
-The profile allows everything to whatever binary is at that path and every process it starts. It stays loaded, and comes back at boot from `/etc/apparmor.d`, until it is removed. So a profile left on a path the account can write grants that to any binary put there later. The traps remove the profile and its file when the run ends, pass, fail or interrupted, a dropped terminal included, and `set -eu` stops the recipe at the first step that fails, so it never runs a stale binary or one with no profile. `scripts/apparmor.sh` does the same for this package's own test binary, and `scripts/linux-test.sh` always removes it after the tests.
+The profile allows everything to whatever binary is at that path and every process it starts. It stays loaded, and comes back at boot from `/etc/apparmor.d`, until it is removed. A profile left on a path the account can write would grant that to any binary put there later, so the recipe runs the test binary from a directory only root can write. A leftover profile then grants nothing to a binary that only root could put there.
+
+`set -eu` stops the recipe at the first step that fails, so it never runs a stale binary or one with no profile. The traps remove the profile, its file and the binary when the run ends, whether it passed, failed or was interrupted. Removal can still fail. After a dropped terminal, `sudo` may have no terminal to ask for a password on, and nothing runs after a `SIGKILL`. A failed removal leaves the profile loaded on that root-owned path. To remove it by hand, run `sudo apparmor_parser -R /etc/apparmor.d/sandbox-usr-local-libexec-app-test-app-test` and then `sudo rm -f` on that file.
+
+`scripts/apparmor.sh` loads and removes the profile for this package's own test binary. `scripts/linux-test.sh` removes it from its exit trap, on an interrupt as well. Its binary is in a directory under `/tmp` that the account owns, so a `SIGKILL` there can leave a profile on a path another local account could create. That's acceptable on a machine only the test account uses, as CI's runners and the VMs here are.
 
 ## Tools installed under covered paths
 

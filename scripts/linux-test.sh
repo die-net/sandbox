@@ -58,8 +58,19 @@ esac
 rdir=/tmp/sandbox-run-$$
 remote=$rdir/sandbox.test
 rsh "mkdir $rdir"
-cleanup() { rsh "rm -rf $rdir" || true; rm -rf "$out"; }
+# The AppArmor profile is removed here, once its load has started, so an
+# interrupt or a failed load doesn't leave it behind, loaded and in
+# /etc/apparmor.d, on a path another account could create under /tmp.
+loaded=
+cleanup() {
+	if [ -n "$loaded" ]; then
+		rsh "$rdir/apparmor.sh remove $remote" || true
+	fi
+	rsh "rm -rf $rdir" || true
+	rm -rf "$out"
+}
 trap cleanup EXIT
+trap 'exit 1' HUP INT QUIT TERM
 
 if [ -n "${SBX_LOCAL:-}" ]; then
 	CGO_ENABLED=$cgo go test -c -o "$out/sandbox.test" .
@@ -81,9 +92,10 @@ fi
 rc=0
 if [ -n "${SBX_APPARMOR:-}" ]; then
 	put scripts/apparmor.sh "$rdir/apparmor.sh"
-	rsh "chmod +x $remote $rdir/apparmor.sh && $rdir/apparmor.sh load $remote"
+	rsh "chmod +x $remote $rdir/apparmor.sh"
+	loaded=1
+	rsh "$rdir/apparmor.sh load $remote"
 	rsh "$remote$args" || rc=$?
-	rsh "$rdir/apparmor.sh remove $remote" || true
 else
 	rsh "chmod +x $remote && $remote$args" || rc=$?
 fi
