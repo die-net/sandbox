@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net"
 	"os"
@@ -844,31 +845,60 @@ func registerServeChecks() {
 // The connection here is this host dialing its own LAN address, since another
 // machine cannot be had: the Linux test host has no route to
 // this Mac (its connections to any port time out with no sandbox at all).
+// The test dials once, after the server says it listens, and requires that the
+// server accept that connection and no other, so a failure names its cause.
 func TestGapLoopbackBindsLANAddress(t *testing.T) {
 	t.Parallel()
 	lan := lanAddr(t)
 	c := escCmd(t.Context(), t, Spec{Loopback: 1}, "serve-addr")
-	port := strconv.Itoa(c.LoopbackPorts()[0])
-	c.spec.Command = []string{self(t), "esc", "serve-addr", net.JoinHostPort(lan, port), "8"}
-	var out syncBuffer
-	c.Stdout = &out
+	addr := net.JoinHostPort(lan, strconv.Itoa(c.LoopbackPorts()[0]))
+	c.spec.Command = []string{self(t), "esc", "serve-addr", addr, "8"}
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pr.Close()
+	c.Stdout = pw
+	var stderr syncBuffer
+	c.Stderr = &stderr
 	c.Env = []string{shellPath}
-	if err := c.Start(); err != nil {
+	err = c.Start()
+	_ = pw.Close()
+	if err != nil {
 		t.Fatal(err)
 	}
 	endAtCleanup(t, c)
-	var conn net.Conn
-	eventually(t, 10*time.Second, "the LAN address was refused: the gap closed, so change the docs", func() bool {
-		var err error
-		conn, err = dialTimeout("tcp", net.JoinHostPort(lan, port), time.Second)
-		return err == nil
-	})
-	_ = conn.Close()
-	if err := waitWithin(t, c, 20*time.Second); err != nil {
-		t.Errorf("the sandbox's server: %v", err)
+	out := bufio.NewReader(pr)
+	// ended ends the server and returns how it went, for a failure to show:
+	// its exit, the rest of what it printed, and its standard error.
+	ended := func() string {
+		c.stop()
+		werr := waitWithin(t, c, 10*time.Second)
+		_ = pr.SetReadDeadline(time.Now().Add(time.Second))
+		rest, _ := io.ReadAll(out)
+		return fmt.Sprintf("the server's exit: %v\nits stdout after: %q\nits stderr: %s", werr, rest, stderr.String())
 	}
-	if got := out.buf.String(); !strings.Contains(got, "accepted "+lan) {
-		t.Errorf("the sandbox did not accept on its LAN address: %q", got)
+	// The server says "bound" once it listens, or exits without a word. The
+	// deadline bounds a server that does neither.
+	if err := pr.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if line, err := out.ReadString('\n'); line != "bound "+addr+"\n" {
+		t.Fatalf("the sandbox did not bind %s (if the profile refused it, the gap closed, so change the docs): read %q, %v\n%s", addr, line, err, ended())
+	}
+	conn, err := dialTimeout("tcp", addr, time.Second)
+	if err != nil {
+		t.Fatalf("the LAN address was refused (if the server was still listening, which an exit by SIGKILL shows, the gap closed, so change the docs): %v\n%s", err, ended())
+	}
+	from := conn.LocalAddr().String()
+	_ = conn.Close()
+	if err := pr.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if line, err := out.ReadString('\n'); line != "accepted "+from+" on "+addr+"\n" {
+		t.Errorf("the sandbox did not accept this connection, from %s: read %q, %v\n%s", from, line, err, ended())
+	} else if err := waitWithin(t, c, 10*time.Second); err != nil {
+		t.Errorf("the sandbox's server: %v\nits stderr: %s", err, stderr.String())
 	}
 }
 
