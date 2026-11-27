@@ -468,7 +468,7 @@ func TestAPIStdio(t *testing.T) {
 			t.Fatalf("%v: %s", err, stderr)
 		}
 		if stdout.String() != in {
-			t.Errorf("echoed %d bytes, want %d", stdout.Len(), len(in))
+			t.Errorf("echoed %d bytes, want %d", len(stdout.String()), len(in))
 		}
 	})
 	t.Run("separate stdout and stderr", func(t *testing.T) {

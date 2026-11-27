@@ -146,7 +146,7 @@ func escBinary(t testing.TB) (exe, dir string) {
 
 // escCmd returns a Cmd, made by Command, that runs this binary in a sandbox
 // from spec as `mode args...`. An empty Home is a fresh directory.
-func escCmd(ctx context.Context, t *testing.T, spec Spec, mode string, args ...string) (*Cmd, *bytes.Buffer, *bytes.Buffer) {
+func escCmd(ctx context.Context, t *testing.T, spec Spec, mode string, args ...string) (*Cmd, *syncBuffer, *syncBuffer) {
 	t.Helper()
 	exe, dir := escBinary(t)
 	if spec.Home == "" {
@@ -158,9 +158,9 @@ func escCmd(ctx context.Context, t *testing.T, spec Spec, mode string, args ...s
 	if err != nil {
 		t.Fatal(err)
 	}
-	var stdout, stderr bytes.Buffer
-	c.Stdout, c.Stderr = &stdout, &stderr
-	return c, &stdout, &stderr
+	stdout, stderr := &syncBuffer{}, &syncBuffer{}
+	c.Stdout, c.Stderr = stdout, stderr
+	return c, stdout, stderr
 }
 
 // escRun runs the check in a sandbox from spec, fails the test if it does not
@@ -2136,7 +2136,7 @@ func TestEscapeNetwork(t *testing.T) {
 func TestEscapeLoopbackIsPrivate(t *testing.T) {
 	t.Parallel()
 	cmds := make([]*Cmd, 0, 2)
-	outs := make([]*bytes.Buffer, 0, 2)
+	outs := make([]*syncBuffer, 0, 2)
 	for range 2 {
 		c, stdout, _ := escCmd(t.Context(), t, Spec{Loopback: 1}, "esc", "bind-hold", "127.0.0.1:4444")
 		if err := c.Start(); err != nil {

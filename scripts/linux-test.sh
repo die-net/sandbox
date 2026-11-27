@@ -15,6 +15,9 @@
 # copies the sources to the target and builds there. The target needs go
 # (on PATH, /usr/local/go/bin, or /usr/local/bin) and gcc.
 #
+# RACE=1 builds with the race detector, which needs cgo on Linux, so it goes
+# with CGO=1.
+#
 # SBX_APPARMOR=1 loads the AppArmor profile for the test binary before the
 # tests and removes it after, with scripts/apparmor.sh. Ubuntu 24.04 and 26.04 need it.
 # Without it the tests fail there, which is the library's behavior.
@@ -26,6 +29,14 @@ trap 'rm -rf "$out"' EXIT
 cd "$root"
 
 cgo=${CGO:-0}
+race=
+if [ -n "${RACE:-}" ]; then
+	if [ "$cgo" != 1 ]; then
+		echo "RACE=1 needs CGO=1, since the race detector needs cgo on Linux" >&2
+		exit 1
+	fi
+	race=-race
+fi
 args=$(printf " %q" "$@")
 
 # rsh <cmd> runs a shell command on the target, in /tmp. put <file> <dest>
@@ -62,12 +73,12 @@ cleanup() { rsh "rm -rf $rdir" || true; rm -rf "$out"; }
 trap cleanup EXIT
 
 if [ -n "${SBX_LOCAL:-}" ]; then
-	CGO_ENABLED=$cgo go test -c -o "$out/sandbox.test" .
+	CGO_ENABLED=$cgo go test -c $race -o "$out/sandbox.test" .
 	put "$out/sandbox.test" "$remote"
 elif [ "$cgo" = 1 ]; then
 	tar --no-xattrs -c --exclude=.git --exclude=spikes . >"$out/src.tar"
 	put "$out/src.tar" "$rdir/src.tar"
-	rsh "mkdir $rdir/src && tar -x -C $rdir/src -f $rdir/src.tar && rm $rdir/src.tar && cd $rdir/src && PATH=\$PATH:/usr/local/go/bin:/usr/local/bin CGO_ENABLED=1 go test -c -o $remote ."
+	rsh "mkdir $rdir/src && tar -x -C $rdir/src -f $rdir/src.tar && rm $rdir/src.tar && cd $rdir/src && PATH=\$PATH:/usr/local/go/bin:/usr/local/bin CGO_ENABLED=1 go test -c $race -o $remote ."
 else
 	GOOS=linux GOARCH=$goarch CGO_ENABLED=0 go test -c -o "$out/sandbox.test" .
 	put "$out/sandbox.test" "$remote"
