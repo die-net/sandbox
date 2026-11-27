@@ -215,7 +215,8 @@ func apparmorInForce(f probeFacts) bool {
 // AppArmor attaches a profile by the path the kernel execs. A program loads the
 // profile at install time, and a test loads it for its own test binary before
 // running it. The error says why a path can't have a profile: it is empty or
-// relative, or holds a character the profile would need escaped. The profile is plain
+// relative, or holds a character other than an ASCII letter, a digit, or one
+// of / . _ + -. The profile is plain
 // text, so it is the same on every platform.
 //
 // The profile applies to that binary and to every process it starts,
@@ -243,8 +244,8 @@ func apparmorInForce(f probeFacts) bool {
 // 6.8). Loaded with apparmor_parser -r and exercised by the full test suite
 // on both systems.
 func AppArmorProfile(path string) (profile, name string, err error) {
-	if !strings.HasPrefix(path, "/") || strings.ContainsAny(path, "\"\\\n{}[]?*^,;@$ ") {
-		return "", "", fmt.Errorf("the path %q is empty, relative, or has a character a profile would need escaped", path)
+	if !strings.HasPrefix(path, "/") || strings.ContainsFunc(path, func(r rune) bool { return !profilePathRune(r) }) {
+		return "", "", fmt.Errorf("the path %q is empty, relative, or has a character other than a letter, a digit, or one of /._+-", path)
 	}
 	name = "sandbox-" + strings.Map(func(r rune) rune {
 		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' {
@@ -264,6 +265,15 @@ profile %[1]s %[2]s flags=(attach_disconnected,mediate_deleted) {
   allow unix,
 }
 `, name, path), name, nil
+}
+
+// profilePathRune reports whether r may appear in a path that AppArmorProfile
+// writes into a profile unquoted. It is an allow list, since AppArmor's lexer
+// ends a token at whitespace and at characters such as ! and , (ID_CHARS in
+// parser/parser_lex.l), and treats others as glob characters, so a deny list
+// that missed one would give a profile that attaches to another path.
+func profilePathRune(r rune) bool {
+	return r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || strings.ContainsRune("/._+-", r)
 }
 
 // profileGrant says what AppArmorProfile's profile grants, for the fix.

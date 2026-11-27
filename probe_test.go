@@ -245,7 +245,7 @@ func TestAppArmorProfile(t *testing.T) {
 	if strings.Count(p, "\nprofile ") != 1 || strings.Contains(p, "bwrap") || strings.Contains(p, "unconfined") {
 		t.Errorf("want one profile, for this binary, in enforce mode:\n%s", p)
 	}
-	for _, bad := range []string{"", "relative", "/opt/my app/x", "/bad\"path", "/bad\nname"} {
+	for _, bad := range []string{"", "relative", "/opt/my app/x", "/bad\"path", "/bad\nname", "/a\tb", "/a\rb", "/a!b", "/a,b", "/a*b", "/caf\u00e9"} {
 		if _, _, err := AppArmorProfile(bad); err == nil {
 			t.Errorf("accepted %q", bad)
 		}
