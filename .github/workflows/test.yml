@@ -11,6 +11,15 @@ on:
 permissions:
   contents: read
 
+# Each job builds with different settings, and builds with cgo, with -race,
+# or for another GOOS or GOARCH share few compiled packages with one
+# another. So each job keeps its own cache, named by its runner image and
+# leg, rather than setup-go's, whose key is only the Go version and go.sum
+# and so is shared by every job. A key is saved once and never updated, so
+# it changes with go.mod, whose toolchain line picks the Go that builds
+# everything. The cgo=1 legs' key holds the race-built standard library.
+# macOS keeps the build cache in ~/Library/Caches/go-build.
+
 jobs:
   # One job vets every target the library builds for. Each vet takes a few
   # seconds, and a job of its own spent most of its time setting up Go. A
@@ -20,9 +29,17 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+      - id: go
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: go.mod
+          cache: false
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ steps.go.outputs.go-version }}-vet-${{ hashFiles('go.mod') }}
       - run: |
           status=0
           for target in linux/amd64 linux/arm64 linux/arm darwin/arm64 darwin/amd64 windows/amd64; do
@@ -50,9 +67,17 @@ jobs:
         cgo: ["0", "1"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+      - id: go
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: go.mod
+          cache: false
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ steps.go.outputs.go-version }}-${{ matrix.os }}-cgo${{ matrix.cgo }}-${{ hashFiles('go.mod') }}
       - name: Install bubblewrap
         run: |
           sudo apt-get update
@@ -123,9 +148,17 @@ jobs:
       CGO_ENABLED: ${{ matrix.cgo }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+      - id: go
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: go.mod
+          cache: false
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/Library/Caches/go-build
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ steps.go.outputs.go-version }}-${{ matrix.os }}-cgo${{ matrix.cgo }}-${{ hashFiles('go.mod') }}
       - run: go build ./...
       - run: go vet ./...
       # The other architecture, which the runner cannot run but must build.
