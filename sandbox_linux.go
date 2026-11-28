@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"math"
 	"net"
 	"os"
 	"os/exec"
@@ -14,6 +15,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -243,6 +245,16 @@ func (c *Cmd) Start() error {
 	// shared its caller's group could signal and renice the caller and
 	// everything else in it, through kill(0, ...) and setpriority(PRIO_PGRP).
 	// The kernel allows both across a pid namespace, since the uid is the same.
+	//
+	// The group is also what ends bubblewrap during Start: its clone child
+	// can outlive the outer process, as one killed before it lets the child
+	// go on does, and that child holds the stages' descriptors, so the read
+	// of --info-fd below would wait on it for good. A failed Start kills the
+	// whole group, and so does bubblewrap's exit during Start, which a pidfd
+	// tells (watchExit), as when a canceled ctx kills the outer process. The
+	// ctx's own kill stays the default, through the process's pidfd: os/exec
+	// can call Cancel after Wait has reaped bubblewrap, when the group's
+	// number may be another's.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, UseCgroupFD: c.CgroupFD > 0, CgroupFD: max(c.CgroupFD, 0)}
 	// A background group is stopped when it reads the caller's terminal, so
 	// an interactive command gets the foreground until Wait gives it back.
@@ -267,9 +279,28 @@ func (c *Cmd) Start() error {
 	}
 	c.run.tty = tty
 	sent := l.send()
-	// From here the sandbox may be running, so a failure kills it.
+	// Bubblewrap gone during Start ends the sandbox: the kill ends its group,
+	// and the lifeline's close ends pid 1, which has left the group with
+	// OwnSession. pid 1's death signal can't stand in for the close: it is
+	// set in the first stage, and does nothing if bubblewrap died before
+	// then, and getppid can't tell pid 1 that it has, since bubblewrap is
+	// outside pid 1's pid namespace (getppid in kernel/sys.c gives 0 for a
+	// parent there).
+	stopWatch, watchErr := watchExit(cmd.Process.Pid, func() {
+		_ = killProcessGroup(cmd.Process.Pid)
+		_ = lifeW.Close()
+	})
+	if watchErr != nil {
+		stopWatch = func() {}
+	}
+	// From here the sandbox may be running, so a failure kills it. The
+	// watch ends first, so that its kill never comes after the reap below,
+	// when the group's number may be free. The lifeline closes before the
+	// wait, which waits on the streams pid 1 may hold.
 	fail := func(err error) error {
-		_ = cmd.Process.Kill()
+		stopWatch()
+		_ = killProcessGroup(cmd.Process.Pid)
+		_ = lifeW.Close()
 		waitErr := cmd.Wait()
 		c.run.giveBackTerminal(cmd.Process.Pid)
 		<-sent //nolint:errcheck // Start is already failing and returns its own error. This only waits for the settings writer to end.
@@ -278,6 +309,9 @@ func (c *Cmd) Start() error {
 			err = fmt.Errorf("%w (bubblewrap: %w)", err, ee)
 		}
 		return err
+	}
+	if watchErr != nil {
+		return fail(watchErr)
 	}
 	// bubblewrap writes its --info-fd once it has made pid 1.
 	var info struct {
@@ -290,6 +324,7 @@ func (c *Cmd) Start() error {
 	if err != nil {
 		return fail(err)
 	}
+	stopWatch()
 	// Nothing more on the control socket is read. Pid 1 closed its end
 	// before the command started, and the command never held it.
 	_ = ctlP.Close()
@@ -297,6 +332,93 @@ func (c *Cmd) Start() error {
 	c.run.cmd, c.run.pid, c.run.lifeline, c.run.sent, c.run.listeners = cmd, info.ChildPid, lifeW, sent, listeners
 	ok = true
 	return nil
+}
+
+// killProcessGroup ends bubblewrap's process group, which Start gives it,
+// with every process in it. The group's number is held until bubblewrap is
+// reaped, which only cmd.Wait does, and Start calls this only before then.
+func killProcessGroup(pid int) error {
+	if err := syscall.Kill(-pid, syscall.SIGKILL); err != nil {
+		if errors.Is(err, syscall.ESRCH) {
+			return os.ErrProcessDone
+		}
+		return err
+	}
+	return nil
+}
+
+// watchExit calls exited if the process pid, a child of this one that hasn't
+// been reaped, exits before the function it returns is called, and returns a
+// function that ends the watch and waits for it. The watch is a pidfd of its
+// own, which waits in the runtime's poller and so holds no thread. It is made
+// non-blocking with fcntl, not with pidfd_open's PIDFD_NONBLOCK, which only
+// Linux 5.10 takes: pidfd_open takes no flags in 5.3, and polls from then
+// (pidfd_poll in kernel/fork.c), and a pidfd has no check_flags to refuse
+// O_NONBLOCK (setfl in fs/fcntl.c). The pidfd os/exec holds for the child
+// shares no open file with it, so its blocking wait is unchanged. The watch
+// only keeps Start from hanging and enforces nothing, so where the host gives
+// no pidfds (pidfdUnsupported) there is no watch and Start goes on, as os
+// does without them. Any other failure, such as a descriptor limit, is an
+// error, which fails Start as such a limit would anywhere else in it.
+func watchExit(pid int, exited func()) (stop func(), err error) {
+	pidfd, err := unix.PidfdOpen(pid, 0)
+	if pidfdUnsupported(err) {
+		return func() {}, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("watch bubblewrap: %w", err)
+	}
+	if err := unix.SetNonblock(pidfd, true); err != nil {
+		_ = unix.Close(pidfd)
+		return nil, fmt.Errorf("watch bubblewrap: %w", err)
+	}
+	f := os.NewFile(uintptr(pidfd), "pidfd")
+	rc, err := f.SyscallConn()
+	if err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("watch bubblewrap: %w", err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if err := rc.Read(pidfdExited); err == nil {
+			exited()
+		}
+	}()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			_ = f.Close()
+			<-done
+		})
+	}, nil
+}
+
+// pidfdUnsupported reports whether err, from pidfd_open, says that the host
+// gives no pidfds: a kernel before 5.3, which has no such call (ENOSYS), or a
+// seccomp filter or a security module that refuses it (EPERM, EACCES). A
+// descriptor limit or a lack of memory says nothing of the kind.
+func pidfdUnsupported(err error) bool {
+	return errors.Is(err, unix.ENOSYS) || errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES)
+}
+
+// pidfdExited reports whether the process of the pidfd fd has exited, which
+// is when the pidfd is readable (pidfd_open(2)). It asks poll with no wait,
+// since RawRead clears the poller's readiness before its first call of this
+// (prepareRead in internal/poll/fd_unix.go), and an exit before then would
+// otherwise be missed for good: the poller is edge-triggered.
+func pidfdExited(fd uintptr) bool {
+	if fd > math.MaxInt32 {
+		return false
+	}
+	pfd := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
+	for {
+		n, err := unix.Poll(pfd, 0)
+		if errors.Is(err, unix.EINTR) {
+			continue
+		}
+		return err == nil && n > 0
+	}
 }
 
 // Wait waits for the sandbox to exit and returns what exec's Wait does for
