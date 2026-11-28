@@ -59,11 +59,9 @@ func Run(context.Context, Spec) (int, error) {
 	return 0, errors.ErrUnsupported
 }
 
-// Stage reports that this process is not a sandbox stage, since none run off
-// Linux yet.
-func Stage() (int, bool) {
-	if len(os.Args) > 1 && os.Args[1] == checkArg {
-		return checkStage(), true
-	}
-	return 0, false
-}
+// stageOptions is empty where there is no stage.
+type stageOptions struct{}
+
+// platformRole plays no part here, where no backend has a stage, and reports
+// false. The check child, which needs none, is played before it is called.
+func platformRole(string, stageOptions) (int, bool) { return 0, false }

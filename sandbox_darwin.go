@@ -119,9 +119,10 @@ func selfPath() string {
 }
 
 // SelfPath is the path under which a sandbox's command names this binary, for
-// a command that runs it again: Spec.Command = []string{SelfPath, "mode"}. The
-// binary must call Stage first in main, which handles the mode's marker or
-// returns false so main can. On macOS it is the binary's real path, found at
+// a command that runs it again: Spec.Command = []string{SelfPath, "mode"}. That
+// run is the program's own main, with the arguments the command names, since
+// the command's environment never holds roleVar. On macOS it is the binary's
+// real path, found at
 // start-up, which every profile lets the command read and run. It is empty if
 // the path cannot be found. Callers must not change it.
 var SelfPath = selfPath()
@@ -350,7 +351,7 @@ func (c *Cmd) Start() error {
 	if err != nil {
 		return err
 	}
-	settings := stageSettings{Profile: prof, Marker: mark, Files: len(spec.Files)}
+	settings := stageSettings{Command: toByteArgs(spec.Command), Profile: prof, Marker: mark, Files: len(spec.Files), Role: c.role}
 	for _, r := range spec.Rlimits {
 		lim, err := rlimitFor(r)
 		if err != nil {
@@ -414,10 +415,12 @@ func (c *Cmd) Start() error {
 		extra = append(extra, d)
 	}
 	releasePorts()
-	cmd := exec.CommandContext(c.ctx, self, append([]string{stageArg, "--"}, spec.Command...)...) //nolint:gosec // Running the configured command in the sandbox is its job, and the stage is this binary.
-	cmd.Args[0] = "sandbox-stage"
+	// The stage is found by roleStage in its environment, and its argv is a
+	// name alone: the command goes in the settings.
+	cmd := exec.CommandContext(c.ctx, self) //nolint:gosec // G204: the stage is this binary, run with no arguments.
+	cmd.Args[0] = stageName
 	cmd.Dir = spec.Dir
-	cmd.Env = commandEnv(c.Env, spec)
+	cmd.Env = withRole(commandEnv(c.Env, spec), roleStage)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = c.Stdin, c.Stdout, c.Stderr
 	cmd.WaitDelay = c.WaitDelay
 	cmd.ExtraFiles = extra

@@ -6,7 +6,6 @@ import (
 	"io/fs"
 	"maps"
 	"os"
-	"path/filepath"
 	"slices"
 	"strings"
 	"syscall"
@@ -115,8 +114,8 @@ func TestMountPointAndSnapshots(t *testing.T) {
 }
 
 // TestCheckVM runs Check(ctx, nil, ...) on the plain VM, where nothing
-// isolates the test binary. It goes through the check marker, which this
-// package's init dispatches until Stage does.
+// isolates the test binary. Its child is this binary, which the package's init
+// finds by roleCheck in its environment.
 func TestCheckVM(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -335,38 +334,6 @@ func startTrueSandbox(t *testing.T) error {
 		return fmt.Errorf("%w: %s", err, stderr.String())
 	}
 	return nil
-}
-
-// TestProbeWithoutStage plays a program that never called Stage. Probe must
-// say so, and start no sandbox, since the sandbox's first stage would run
-// the program's own main. A bubblewrap of the test's own on PATH logs how
-// it was run, so a trial that started shows.
-func TestProbeWithoutStage(t *testing.T) {
-	dir := t.TempDir()
-	log := filepath.Join(dir, "log")
-	script := "#!/bin/sh\necho \"$1\" >>" + log + "\n[ \"$1\" = --version ] && echo 'bubblewrap 0.11.1'\nexit 0\n"
-	if err := os.WriteFile(filepath.Join(dir, "bwrap"), []byte(script), 0o700); err != nil { //nolint:gosec // G306: the file is a program the test runs, which needs its owner to execute it.
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", dir)
-	staged.Store(false)
-	t.Cleanup(func() { staged.Store(true) })
-
-	rep, err := Probe()
-	if err == nil || len(rep.Checks) == 0 {
-		t.Fatalf("Probe = %+v, %v", rep, err)
-	}
-	last := rep.Checks[len(rep.Checks)-1]
-	if last.Name != "probe.stage" || last.Status != Fail || !strings.Contains(last.Detail, "sandbox.Stage") {
-		t.Errorf("last check = %+v", last)
-	}
-	b, err := os.ReadFile(log) //nolint:gosec // G304: the test reads a path it made, or one a sandbox must not let it read.
-	if err != nil {
-		t.Fatal(err)
-	}
-	if runs := strings.Fields(string(b)); !slices.Equal(runs, []string{"--version"}) {
-		t.Errorf("bubblewrap ran with %q, want only --version", runs)
-	}
 }
 
 func TestProbeNoBubblewrap(t *testing.T) {

@@ -17,10 +17,7 @@ import (
 
 // Probe tries the Linux backend for real: bubblewrap, its version, the
 // seccomp filters this architecture has, and a trial sandbox that it starts
-// as Start does. So, like Command, it refuses root, and it needs Stage first
-// in main: in a program that never called Stage it starts no sandbox, since
-// the sandbox's first stage would run the program's own main, and its
-// probe.stage check fails. An error means no sandbox can start, and
+// as Start does. So, like Command, it refuses root. An error means no sandbox can start, and
 // Report.Checks says why and how to fix it. The Report is filled in either
 // way.
 func Probe() (Report, error) {
@@ -31,7 +28,7 @@ func Probe() (Report, error) {
 		PrivateLoopback: true,
 		Ignored:         []string{"Services", "BroadLoopback"},
 	}
-	f := probeFacts{Kernels: rep.Kernel, Root: os.Geteuid() == 0, Staged: staged.Load()}
+	f := probeFacts{Kernels: rep.Kernel, Root: os.Geteuid() == 0}
 	for _, k := range []Kernel{KernelStrict, KernelNested, KernelOpen} {
 		if _, err := filterProgram(k); err == nil {
 			rep.Kernel[k] = k
@@ -50,9 +47,8 @@ func Probe() (Report, error) {
 	rep.Container = gatherContainer()
 	f.Container = rep.Container
 	// The trial needs a working bubblewrap, and is skipped when diagnose
-	// would stop earlier anyway. Without Stage, the trial's first stage
-	// would run this program's own main, so it never starts then.
-	if f.Bwrap != "" && !f.Setuid && len(f.Kernels) > 0 && !f.Root && f.Staged {
+	// would stop earlier anyway.
+	if f.Bwrap != "" && !f.Setuid && len(f.Kernels) > 0 && !f.Root {
 		f.TryErr, f.TrialErr = trySandbox(f.Kernels)
 	}
 	if f.TryErr != "" {
@@ -118,7 +114,7 @@ func trySandbox(kernels map[Kernel]Kernel) (failed, built string) {
 	// directory just now, so its real path names the same one.
 	resolved, err := filepath.EvalSymlinks(home)
 	if err == nil {
-		failed, built = runTrial(Spec{Command: []string{SelfPath, checkArg, modeNoop}, Home: resolved, Kernel: level})
+		failed, built = runTrial(Spec{Command: []string{SelfPath}, Home: resolved, Kernel: level})
 	} else {
 		built = fmt.Sprintf("resolve its home: %v", err)
 	}
@@ -129,14 +125,22 @@ func trySandbox(kernels map[Kernel]Kernel) (failed, built string) {
 }
 
 // runTrial runs the trial sandbox, and returns why it failed or why it
-// could not be built, as trySandbox does.
+// could not be built, as trySandbox does. The command is this binary, as the
+// check child's grandchild in its no-op mode.
 func runTrial(spec Spec) (failed, built string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
+	mode, err := modePipe([]string{modeNoop})
+	if err != nil {
+		return "", err.Error()
+	}
+	defer mode.Close()
+	spec.Files = append([]*os.File{mode}, spec.Files...)
 	cmd, err := Command(ctx, spec)
 	if err != nil {
 		return "", err.Error()
 	}
+	cmd.role = roleCheckNS
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	err = cmd.Start()

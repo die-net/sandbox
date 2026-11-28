@@ -76,6 +76,10 @@ const stageNoCloseRangeEnv = "SANDBOX_TEST_STAGE_NO_CLOSE_RANGE"
 // listing fail.
 const stageFdDirEnv = "SANDBOX_TEST_STAGE_FD_DIR"
 
+// stageStallAfterStartEnv, in the same place, makes the reaper wait for good
+// once the command has started and before it says so, until the sandbox ends.
+const stageStallAfterStartEnv = "SANDBOX_TEST_STAGE_STALL_AFTER_START"
+
 // listenTCP listens on a TCP address, with a context that is never canceled,
 // for the processes the tests run inside a sandbox, which have none of their
 // own to give.
@@ -84,8 +88,23 @@ func listenTCP(addr string) (net.Listener, error) {
 	return lc.Listen(context.Background(), "tcp", addr)
 }
 
+// The stage's test options, from the variables above in its environment. A
+// stage runs from the package's init and never reaches TestMain, so these are
+// set by a package-level initializer, which Go runs before any init.
+var _ = func() bool {
+	stageOpts = stageOptions{
+		noCloseRange: os.Getenv(stageNoCloseRangeEnv) != "",
+		fdDir:        os.Getenv(stageFdDirEnv),
+	}
+	if os.Getenv(stageStallAfterStartEnv) != "" {
+		stageOpts.afterStart = func() { select {} }
+	}
+	return true
+}()
+
 // TestMain lets the test binary be each part of a sandbox: the process that
-// starts it, its stages, and the command inside it.
+// starts it, its stages, and the command inside it. The package's init plays
+// the stages before TestMain runs.
 func TestMain(m *testing.M) {
 	registerAPIModes()
 	registerAPIAllocCheck()
@@ -95,13 +114,6 @@ func TestMain(m *testing.M) {
 	registerOwnSession()
 	registerFdsListed()
 	registerProbeLabels()
-	opts := stageOptions{
-		noCloseRange: os.Getenv(stageNoCloseRangeEnv) != "",
-		fdDir:        os.Getenv(stageFdDirEnv),
-	}
-	if code, ok := runStage(opts); ok {
-		os.Exit(code)
-	}
 	if body, ok := os.LookupEnv(testSpecVar); ok {
 		os.Exit(runFromEnv(body))
 	}

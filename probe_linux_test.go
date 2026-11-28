@@ -149,7 +149,7 @@ func hostLabels(t *testing.T, bwrap string) probeFacts {
 // that isn't there.
 func TestProbeTrialNotBuilt(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "missing")
-	if failed, built := runTrial(Spec{Command: []string{SelfPath, checkArg, modeNoop}, Home: missing}); failed != "" || !strings.Contains(built, "does not exist") {
+	if failed, built := runTrial(Spec{Command: []string{SelfPath}, Home: missing}); failed != "" || !strings.Contains(built, "does not exist") {
 		t.Errorf("a home that isn't there: failed %q, built %q, want only built", failed, built)
 	}
 	t.Setenv("TMPDIR", missing)

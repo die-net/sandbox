@@ -82,8 +82,66 @@ const noRaceExitSleep = "GORACE=atexit_sleep_ms=0"
 // fail.
 const stageFdDirEnv = "SANDBOX_TEST_STAGE_FD_DIR"
 
+// The stage's test options, from the variables above in its environment. A
+// stage runs from the package's init and never reaches TestMain, so these are
+// set by a package-level initializer, which Go runs before any init.
+var _ = setStageOptions()
+
+// setStageOptions sets stageOpts and giveUpAfter for a run of the test binary
+// as a stage. It returns nothing of use, since it exists for its effects.
+func setStageOptions() bool {
+	var hooks []func(*prober)
+	if v := os.Getenv(stageOrphanZombieEnv); v != "" {
+		zombie, err := strconv.Atoi(v)
+		if err != nil {
+			// A test set it wrong. Nothing can return the error from here.
+			panic(fmt.Sprintf("%s = %q: %v", stageOrphanZombieEnv, v, err))
+		}
+		hooks = append(hooks, func(p *prober) {
+			stat := p.stat
+			p.stat = func(pid int) (procStat, error) {
+				st, err := stat(pid)
+				if pid == zombie && (st.Zombie || st.Exiting) {
+					st.PPid = 1
+				}
+				return st, err
+			}
+		})
+	}
+	if os.Getenv(stageNoKillEnv) != "" {
+		hooks = append(hooks, func(p *prober) { p.kill = func(int) {} })
+		giveUpAfter = stageNoKillGiveUp
+	}
+	if os.Getenv(stageUnprovableEnv) != "" {
+		stageOpts.budget = 200 * time.Millisecond
+		hooks = append(hooks, func(p *prober) {
+			list := p.list
+			p.list = func() ([]int, error) {
+				pids, err := list()
+				return append(pids, math.MaxInt32), err
+			}
+		})
+	}
+	if os.Getenv(stageKillBeforeReplyEnv) != "" {
+		stageOpts.beforeReply = func() {
+			time.Sleep(300 * time.Millisecond)
+			_ = syscall.Kill(os.Getpid(), syscall.SIGKILL)
+		}
+	}
+	stageOpts.fdDir = os.Getenv(stageFdDirEnv)
+	if len(hooks) > 0 {
+		stageOpts.proberHook = func(p *prober) {
+			for _, h := range hooks {
+				h(p)
+			}
+		}
+	}
+	return true
+}
+
 // TestMain lets the test binary be each part of a sandbox: the process that
-// starts it, its stage, and the command inside it.
+// starts it, its stage, and the command inside it. The package's init plays
+// the stage before TestMain runs.
 func TestMain(m *testing.M) {
 	registerAPIModes()
 	registerAPIResourceChecks()
@@ -105,56 +163,6 @@ func TestMain(m *testing.M) {
 	registerEscMode()
 	registerOwnSession()
 	registerFdsListed()
-	var opts stageOptions
-	var hooks []func(*prober)
-	if v := os.Getenv(stageOrphanZombieEnv); v != "" {
-		zombie, err := strconv.Atoi(v)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "%s = %q: %v\n", stageOrphanZombieEnv, v, err)
-			os.Exit(2)
-		}
-		hooks = append(hooks, func(p *prober) {
-			stat := p.stat
-			p.stat = func(pid int) (procStat, error) {
-				st, err := stat(pid)
-				if pid == zombie && (st.Zombie || st.Exiting) {
-					st.PPid = 1
-				}
-				return st, err
-			}
-		})
-	}
-	if os.Getenv(stageNoKillEnv) != "" {
-		hooks = append(hooks, func(p *prober) { p.kill = func(int) {} })
-		giveUpAfter = stageNoKillGiveUp
-	}
-	if os.Getenv(stageUnprovableEnv) != "" {
-		opts.budget = 200 * time.Millisecond
-		hooks = append(hooks, func(p *prober) {
-			list := p.list
-			p.list = func() ([]int, error) {
-				pids, err := list()
-				return append(pids, math.MaxInt32), err
-			}
-		})
-	}
-	if os.Getenv(stageKillBeforeReplyEnv) != "" {
-		opts.beforeReply = func() {
-			time.Sleep(300 * time.Millisecond)
-			_ = syscall.Kill(os.Getpid(), syscall.SIGKILL)
-		}
-	}
-	opts.fdDir = os.Getenv(stageFdDirEnv)
-	if len(hooks) > 0 {
-		opts.proberHook = func(p *prober) {
-			for _, h := range hooks {
-				h(p)
-			}
-		}
-	}
-	if code, ok := runStage(opts); ok {
-		os.Exit(code)
-	}
 	if len(os.Args) >= 2 {
 		if mode, ok := childModes[os.Args[1]]; ok {
 			os.Exit(mode(os.Args[2:]))

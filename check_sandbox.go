@@ -10,14 +10,15 @@ import (
 // and returns a function that waits for it. The child gets the results
 // descriptor and the payload descriptor as 3 and 4, then spec's own Files.
 // Its command is SelfPath, so the view needs no path to this binary on
-// Linux.
+// Linux, and the stage gives it roleCheck.
 func startInSandbox(ctx context.Context, spec Spec, out, payload *os.File, stderr io.Writer) (func() error, error) {
-	spec.Command = []string{SelfPath, checkArg}
+	spec.Command = []string{SelfPath}
 	spec.Files = append([]*os.File{out, payload}, spec.Files...)
 	cmd, err := Command(ctx, spec)
 	if err != nil {
 		return nil, err
 	}
+	cmd.role = roleCheck
 	cmd.Stdout = io.Discard
 	cmd.Stderr = stderr
 	cmd.Env = nil // Start sets HOME, TMPDIR and the rest

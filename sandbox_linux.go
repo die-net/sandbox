@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"math"
 	"net"
 	"os"
 	"os/exec"
@@ -14,6 +15,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -138,9 +140,9 @@ func (c *Cmd) Pid() int {
 }
 
 // Start resolves the spec's paths, opens what bubblewrap binds, and starts
-// bubblewrap. It returns once pid 1 has set the sandbox up and handed over
-// its listeners, and before the command's own start, so a command that
-// fails to run shows in Wait's status.
+// bubblewrap. It returns once pid 1 has set the sandbox up, started the
+// command and handed over its listeners, so a command that can't be started,
+// such as one with an argument too long for execve, fails Start.
 func (c *Cmd) Start() error {
 	if c.run.started {
 		return errors.New("sandbox: already started")
@@ -159,7 +161,7 @@ func (c *Cmd) Start() error {
 	if err != nil {
 		return err
 	}
-	settings := stageSettings{Kernel: spec.Kernel, Listen: spec.Listen, Files: len(spec.Files)}
+	settings := stageSettings{Command: toByteArgs(spec.Command), Kernel: spec.Kernel, Listen: spec.Listen, Files: len(spec.Files), Role: c.role}
 	for _, r := range spec.Rlimits {
 		settings.Rlimits = append(settings.Rlimits, stageLimit{resources[r.Resource], r.Soft, r.Hard})
 	}
@@ -218,19 +220,15 @@ func (c *Cmd) Start() error {
 		return err
 	}
 	defer l.close()
-	// The message waits in the socket's buffer until pid 1 reads it.
-	if _, err := ctlP.Write(body); err != nil {
-		return fmt.Errorf("send the settings: %w", err)
-	}
 
 	// The options go on a descriptor so that pid 1's command line, which
 	// any process inside can read, does not list them. bubblewrap takes the
-	// command only from its own arguments, and the command is the first
-	// stage, with the real one after it.
-	args := append([]string{"--args", strconv.Itoa(fdArgs), "--", stagePath, stageArg, "--"}, spec.Command...)
-	cmd := exec.CommandContext(c.ctx, bwrap, args...) //nolint:gosec // Running the configured command in the sandbox is its job, and bubblewrap is not a shell.
+	// command only from its own arguments, and that command is the first
+	// stage, named by roleStage in its environment, with nothing after it:
+	// the real command goes in the settings.
+	cmd := exec.CommandContext(c.ctx, bwrap, "--args", strconv.Itoa(fdArgs), "--", stagePath) //nolint:gosec // bubblewrap is not a shell, and its one argument is a constant.
 	cmd.Args[0] = "bwrap"
-	cmd.Env = commandEnv(c.Env, spec)
+	cmd.Env = withRole(commandEnv(c.Env, spec), roleStage)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = c.Stdin, c.Stdout, c.Stderr
 	cmd.WaitDelay = c.WaitDelay
 	cmd.ExtraFiles = l.inherit
@@ -243,6 +241,16 @@ func (c *Cmd) Start() error {
 	// shared its caller's group could signal and renice the caller and
 	// everything else in it, through kill(0, ...) and setpriority(PRIO_PGRP).
 	// The kernel allows both across a pid namespace, since the uid is the same.
+	//
+	// The group is also what ends bubblewrap during Start: its clone child
+	// can outlive the outer process, as one killed before it lets the child
+	// go on does, and that child holds the stages' descriptors, so the reads
+	// and writes below would wait on it for good. A failed Start kills the
+	// whole group, and so does bubblewrap's exit during Start, which a pidfd
+	// tells (watchExit), as when a canceled ctx kills the outer process. The
+	// ctx's own kill stays the default, through the process's pidfd: os/exec
+	// can call Cancel after Wait has reaped bubblewrap, when the group's
+	// number may be another's.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, UseCgroupFD: c.CgroupFD > 0, CgroupFD: max(c.CgroupFD, 0)}
 	// A background group is stopped when it reads the caller's terminal, so
 	// an interactive command gets the foreground until Wait gives it back.
@@ -267,17 +275,47 @@ func (c *Cmd) Start() error {
 	}
 	c.run.tty = tty
 	sent := l.send()
-	// From here the sandbox may be running, so a failure kills it.
+	// Bubblewrap gone during Start ends the sandbox: the kill ends its group,
+	// and the lifeline's close ends pid 1, which has left the group with
+	// OwnSession. pid 1's death signal can't stand in for the close: it is
+	// set in the first stage, and does nothing if bubblewrap died before
+	// then, and getppid can't tell pid 1 that it has, since bubblewrap is
+	// outside pid 1's pid namespace (getppid in kernel/sys.c gives 0 for a
+	// parent there).
+	stopWatch, watchErr := watchExit(cmd.Process.Pid, func() {
+		_ = killProcessGroup(cmd.Process.Pid)
+		_ = lifeW.Close()
+	})
+	if watchErr != nil {
+		stopWatch = func() {}
+	}
+	// The settings go from a goroutine, since those that don't fit in the
+	// socket's buffer wait for the reaper to read them, and a bubblewrap that
+	// fails may never let one read them. The reads below go on meanwhile,
+	// and a failure ends every process that holds the socket's other end, so
+	// the write ends too.
+	writer := writeSettings(ctlP, body, sendSettings)
+	// From here the sandbox may be running, so a failure kills it. The
+	// watch ends first, so that its kill never comes after the reap below,
+	// when the group's number may be free. The lifeline closes before the
+	// wait, which waits on the streams pid 1 may hold.
 	fail := func(err error) error {
-		_ = cmd.Process.Kill()
+		err = writer.cause(err)
+		stopWatch()
+		_ = killProcessGroup(cmd.Process.Pid)
+		_ = lifeW.Close()
 		waitErr := cmd.Wait()
 		c.run.giveBackTerminal(cmd.Process.Pid)
-		<-sent //nolint:errcheck // Start is already failing and returns its own error. This only waits for the settings writer to end.
+		<-sent            //nolint:errcheck // Start is already failing and returns its own error. This only waits for the writer of bubblewrap's options to end.
+		_ = writer.wait() // The settings' writer must end too, before the deferred close of the socket. Its error adds nothing here.
 		var ee *exec.ExitError
 		if errors.As(waitErr, &ee) {
 			err = fmt.Errorf("%w (bubblewrap: %w)", err, ee)
 		}
 		return err
+	}
+	if watchErr != nil {
+		return fail(watchErr)
 	}
 	// bubblewrap writes its --info-fd once it has made pid 1.
 	var info struct {
@@ -290,13 +328,161 @@ func (c *Cmd) Start() error {
 	if err != nil {
 		return fail(err)
 	}
-	// Nothing more on the control socket is read. Pid 1 closed its end
-	// before the command started, and the command never held it.
+	// The reaper has read the settings by the time it replies, so the write
+	// has ended.
+	err = receiveStarted(ctlP)
+	if sendErr := writer.wait(); err == nil && sendErr != nil {
+		err = fmt.Errorf("send the settings: %w", sendErr)
+	}
+	if err != nil {
+		for _, ln := range listeners {
+			_ = ln.Close()
+		}
+		return fail(err)
+	}
+	stopWatch()
+	// Nothing more on the control socket is read. Pid 1 closes its end once
+	// it has sent this, and the command never held it.
 	_ = ctlP.Close()
 	_ = infoR.Close()
 	c.run.cmd, c.run.pid, c.run.lifeline, c.run.sent, c.run.listeners = cmd, info.ChildPid, lifeW, sent, listeners
 	ok = true
 	return nil
+}
+
+// settingsWriter writes the settings to the control socket from a goroutine,
+// since those that don't fit in its buffer wait for the reaper to read them,
+// and a bubblewrap that fails may never let one read them. Start reads the
+// info and the replies meanwhile.
+type settingsWriter struct {
+	done   chan struct{}
+	failed chan struct{}
+	err    error
+}
+
+// writeSettings starts the write of body to ctl with send. A write that fails
+// ends the socket both ways, since nothing else would wake the reads: the
+// reaper waits for the rest of the settings, and Start for its reply.
+func writeSettings(ctl *os.File, body []byte, send func(*os.File, []byte) error) *settingsWriter {
+	w := &settingsWriter{done: make(chan struct{}), failed: make(chan struct{})}
+	go func() {
+		defer close(w.done)
+		if w.err = send(ctl, body); w.err != nil {
+			// A write that ends because the other end went, as when
+			// bubblewrap dies, says nothing the reads don't, and the
+			// reads' error is the one that says why.
+			if !errors.Is(w.err, unix.EPIPE) && !errors.Is(w.err, unix.ECONNRESET) {
+				close(w.failed)
+			}
+			_ = unix.Shutdown(int(ctl.Fd()), unix.SHUT_RDWR)
+		}
+	}()
+	return w
+}
+
+// wait waits for the write to end, and returns its error.
+func (w *settingsWriter) wait() error {
+	<-w.done
+	return w.err
+}
+
+// cause returns err, the error a read in Start met, or the write's error in
+// its place if the write failed on its own, which is then what ended the
+// socket. A write that failed because the other end went doesn't count.
+func (w *settingsWriter) cause(err error) error {
+	select {
+	case <-w.failed:
+		return fmt.Errorf("send the settings: %w", w.wait())
+	default:
+		return err
+	}
+}
+
+// killProcessGroup ends bubblewrap's process group, which Start gives it,
+// with every process in it. The group's number is held until bubblewrap is
+// reaped, which only cmd.Wait does, and Start calls this only before then.
+func killProcessGroup(pid int) error {
+	if err := syscall.Kill(-pid, syscall.SIGKILL); err != nil {
+		if errors.Is(err, syscall.ESRCH) {
+			return os.ErrProcessDone
+		}
+		return err
+	}
+	return nil
+}
+
+// watchExit calls exited if the process pid, a child of this one that hasn't
+// been reaped, exits before the function it returns is called, and returns a
+// function that ends the watch and waits for it. The watch is a pidfd of its
+// own, which waits in the runtime's poller and so holds no thread. It is made
+// non-blocking with fcntl, not with pidfd_open's PIDFD_NONBLOCK, which only
+// Linux 5.10 takes: pidfd_open takes no flags in 5.3, and polls from then
+// (pidfd_poll in kernel/fork.c), and a pidfd has no check_flags to refuse
+// O_NONBLOCK (setfl in fs/fcntl.c). The pidfd os/exec holds for the child
+// shares no open file with it, so its blocking wait is unchanged. The watch
+// only keeps Start from hanging and enforces nothing, so where the host gives
+// no pidfds (pidfdUnsupported) there is no watch and Start goes on, as os
+// does without them. Any other failure, such as a descriptor limit, is an
+// error, which fails Start as such a limit would anywhere else in it.
+func watchExit(pid int, exited func()) (stop func(), err error) {
+	pidfd, err := unix.PidfdOpen(pid, 0)
+	if pidfdUnsupported(err) {
+		return func() {}, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("watch bubblewrap: %w", err)
+	}
+	if err := unix.SetNonblock(pidfd, true); err != nil {
+		_ = unix.Close(pidfd)
+		return nil, fmt.Errorf("watch bubblewrap: %w", err)
+	}
+	f := os.NewFile(uintptr(pidfd), "pidfd")
+	rc, err := f.SyscallConn()
+	if err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("watch bubblewrap: %w", err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if err := rc.Read(pidfdExited); err == nil {
+			exited()
+		}
+	}()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			_ = f.Close()
+			<-done
+		})
+	}, nil
+}
+
+// pidfdUnsupported reports whether err, from pidfd_open, says that the host
+// gives no pidfds: a kernel before 5.3, which has no such call (ENOSYS), or a
+// seccomp filter or a security module that refuses it (EPERM, EACCES). A
+// descriptor limit or a lack of memory says nothing of the kind.
+func pidfdUnsupported(err error) bool {
+	return errors.Is(err, unix.ENOSYS) || errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES)
+}
+
+// pidfdExited reports whether the process of the pidfd fd has exited, which
+// is when the pidfd is readable (pidfd_open(2)). It asks poll with no wait,
+// since RawRead clears the poller's readiness before its first call of this
+// (prepareRead in internal/poll/fd_unix.go), and an exit before then would
+// otherwise be missed for good: the poller is edge-triggered.
+func pidfdExited(fd uintptr) bool {
+	if fd > math.MaxInt32 {
+		return false
+	}
+	pfd := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
+	for {
+		n, err := unix.Poll(pfd, 0)
+		if errors.Is(err, unix.EINTR) {
+			continue
+		}
+		return err == nil && n > 0
+	}
 }
 
 // Wait waits for the sandbox to exit and returns what exec's Wait does for
@@ -320,7 +506,7 @@ func (c *Cmd) Wait() error {
 	return err
 }
 
-// receiveReply reads the stage's one message from the control socket: its
+// receiveReply reads the stage's first message from the control socket: its
 // setup error, or the n listeners it bound.
 func receiveReply(ctl *os.File, n int) ([]net.Listener, error) {
 	buf := make([]byte, maxMessage)
@@ -393,6 +579,38 @@ func receiveReply(ctl *os.File, n int) ([]net.Listener, error) {
 		listeners = append(listeners, ln)
 	}
 	return listeners, nil
+}
+
+// receiveStarted reads the stage's second message from the control socket,
+// which says whether the command started. The end of the socket in its place
+// counts as started: pid 1 sends that message only after the command's start,
+// so the sandbox ended after it, as a command that ends it at once does, and
+// Wait reports how.
+func receiveStarted(ctl *os.File) error {
+	buf := make([]byte, maxMessage)
+	for {
+		n, _, flags, _, err := unix.Recvmsg(int(ctl.Fd()), buf, nil, 0)
+		if errors.Is(err, unix.EINTR) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("read the command's start: %w", err)
+		}
+		if n == 0 {
+			return nil
+		}
+		var reply stageReply
+		if flags&unix.MSG_TRUNC != 0 || json.Unmarshal(buf[:n], &reply) != nil {
+			return errors.New("the sandbox sent a malformed reply")
+		}
+		if reply.Error != "" {
+			return errors.New(reply.Error)
+		}
+		if !reply.Started {
+			return errors.New("the sandbox's second reply says nothing")
+		}
+		return nil
+	}
 }
 
 // socketpair makes the control socket: a connected pair, close-on-exec,
@@ -499,9 +717,10 @@ type mountOp struct {
 }
 
 // SelfPath is the path under which a sandbox's command names this binary,
-// for a command that runs it again: Spec.Command = []string{SelfPath, "mode"}. The
-// binary must call Stage first in main, which handles the mode's marker or
-// returns false so main can. On Linux it is a constant, the copy Command
+// for a command that runs it again: Spec.Command = []string{SelfPath, "mode"}.
+// That run is the program's own main, with the arguments the command names,
+// since the command's environment never holds roleVar. On Linux it is a
+// constant, the copy Command
 // binds in at /dev/sandbox-stage, so it holds on any host. Elsewhere it is
 // a variable set at start-up, since the path is the executable's real one.
 const SelfPath = stagePath

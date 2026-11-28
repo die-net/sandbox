@@ -1,15 +1,18 @@
+//go:build linux || darwin
+
 package sandbox
 
 import (
 	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"testing"
 	"time"
 )
 
-// TestOverheadTrue measures what a sandbox costs on macOS: Command, Start and
-// Wait for /usr/bin/true. It is skipped unless SANDBOX_OVERHEAD names the
+// TestOverheadTrue measures what a sandbox costs: Command, Start and Wait for
+// /usr/bin/true. It is skipped unless SANDBOX_OVERHEAD names the
 // number of runs, since it is a measurement and not a check. It prints the
 // median and the 90th percentile after three warm-up runs.
 //
@@ -19,7 +22,10 @@ func TestOverheadTrue(t *testing.T) {
 	if n <= 0 {
 		t.Skip("set SANDBOX_OVERHEAD to a number of runs to measure")
 	}
-	home := realTemp(t)
+	home, err := filepath.EvalSymlinks(t.TempDir()) // Home may not contain a link.
+	if err != nil {
+		t.Fatal(err)
+	}
 	var times []time.Duration
 	for i := range n + 3 {
 		start := time.Now()

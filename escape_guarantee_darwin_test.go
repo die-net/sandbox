@@ -1892,7 +1892,8 @@ func TestGapSetsidConnect(t *testing.T) {
 
 // Row: "Options on a descriptor, not in pid 1's argv": the profile goes to
 // sandbox-exec on a pipe, so no command line names it, and the paths it covers
-// are not in any argv. The command holds the pipe's read end, which is at end
+// are not in any argv. The stage's argv is its name alone, since the command
+// goes in its settings. The command holds the pipe's read end, which is at end
 // of file and holds nothing.
 func TestEscapeProfileNotInArgv(t *testing.T) {
 	t.Parallel()
@@ -1914,6 +1915,9 @@ func TestEscapeProfileNotInArgv(t *testing.T) {
 	members := tree(t, c.Pid())
 	if len(members) < 2 {
 		t.Fatalf("the sandbox's processes are %v", members)
+	}
+	if got := args(t, []int{c.Pid()}); len(got) != 1 || got[0] != stageName {
+		t.Errorf("the stage's command line is %q, want %q alone", got, stageName)
 	}
 	args := strings.Join(args(t, members), "\n")
 	for _, s := range []string{"deny default", "(version 1)", "very-secret-cover-name-xyzzy", "sandbox-exec", "subpath", "(allow"} {

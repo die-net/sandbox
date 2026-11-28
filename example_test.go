@@ -11,11 +11,9 @@ import (
 )
 
 // Example is the program in README.md. It has no Output comment, so go test
-// compiles it and doesn't run it. A real program calls Stage first in main.
+// compiles it and doesn't run it. Importing the package is all a program does
+// to let it run its stages.
 func Example() {
-	if code, ok := sandbox.Stage(); ok {
-		os.Exit(code)
-	}
 	if err := runExample(); err != nil {
 		log.Fatal(err)
 	}

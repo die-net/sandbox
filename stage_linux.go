@@ -11,28 +11,17 @@ import (
 	"os/exec"
 	"os/signal"
 	"runtime"
-	"slices"
 	"strconv"
-	"sync/atomic"
 	"syscall"
 
 	"golang.org/x/sys/unix"
 )
 
-// stageArg is the first argument of the run of this binary that bubblewrap
-// starts inside the sandbox ahead of the command, and reaperArg that of the
-// run the first stage execs. Each is followed by "--" and the command.
-// stagePath is where the binary is bound in. /dev is a tmpfs bubblewrap
-// makes, so the bind lands in no directory a sandbox writes.
-const (
-	stageArg  = "--sandbox-stage"
-	reaperArg = "--sandbox-reaper"
-	stagePath = "/dev/sandbox-stage"
-)
-
-// failed is the exit status of a sandbox whose stages could not set up, as
-// distinct from the command's own.
-const failed = 125
+// stagePath is where the binary is bound in, and the whole of the argv of
+// both of the stages: bubblewrap starts the first with roleStage, and it execs
+// the reaper with roleReaper. /dev is a tmpfs bubblewrap makes, so the bind
+// lands in no directory a sandbox writes.
+const stagePath = "/dev/sandbox-stage"
 
 // The descriptors bubblewrap hands the stages, which Start numbers by the
 // order of its ExtraFiles. fd 3 holds bubblewrap's options and goes no
@@ -56,14 +45,21 @@ const (
 	loopbackPort = 4444
 )
 
-// stageSettings is what the parent sends the stage on the control socket:
-// what the command line used to carry, less the command itself, which
-// bubblewrap must take from its own arguments.
+// stageSettings is what the parent sends the reaper on the control socket:
+// everything the stages need, the command included, so that no argv holds
+// any of it.
 type stageSettings struct {
+	// Command is the command's argv, which the reaper looks up on the
+	// command's PATH.
+	Command byteArgs     `json:"command"`
 	Kernel  Kernel       `json:"kernel"`
 	Listen  int          `json:"listen"`
 	Files   int          `json:"files"`
 	Rlimits []stageLimit `json:"rlimits,omitempty"`
+	// Role, if set, is the part of the sandbox the command plays, which
+	// the reaper gives it as roleVar: Check's child and Probe's trial are
+	// this binary. Empty, the command's environment holds no roleVar.
+	Role string `json:"role,omitempty"`
 }
 
 // stageLimit is a Linux resource limit.
@@ -73,32 +69,31 @@ type stageLimit struct {
 	Hard     uint64 `json:"hard"`
 }
 
-// stageReply is the stage's one message back: the setup error if there was
-// one, and otherwise, with the Listen listeners as descriptors, that setup is
-// done.
+// stageReply is one of the stage's two messages back. The first is the setup
+// error if there was one, and otherwise, with the Listen listeners as
+// descriptors, that setup is done. The second, after the command's start, is
+// the start's error or Started.
 type stageReply struct {
 	Error string `json:"error,omitempty"`
+	// Started is set in the second message, which says the command started.
+	Started bool `json:"started,omitempty"`
 }
 
-// maxMessage is the most the control socket's messages hold.
+// maxMessage is the most one of the control socket's messages holds. The
+// settings take as many as they need, since the command's argv can be far
+// longer than the socket's buffer lets one message be (unix_dgram_sendmsg in
+// net/unix/af_unix.c refuses one longer than its send buffer).
 const maxMessage = 1 << 16
 
-// staged records that this process called Stage. Start runs this binary
-// again inside the sandbox, so without Stage in main that run would be the
-// program's own main. Probe checks it before it starts its trial sandbox.
-var staged atomic.Bool
+// The first byte of each message of the settings says whether more follow.
+// A message can't be empty, since a read of none is the end of the socket.
+const (
+	settingsMore = 1
+	settingsLast = 0
+)
 
-// Stage runs one of the sandbox's stages if this process was started as it,
-// and reports false otherwise. A program that uses this package calls it
-// first in main, before it reads its arguments.
-func Stage() (int, bool) {
-	return runStage(stageOptions{})
-}
-
-// stageOptions changes what a stage does, for a test binary. A test binary is
-// its own stage, so only its TestMain can configure the stage, and it calls
-// runStage with the options. Stage passes the zero value, which is what a
-// program runs, and nothing a caller sends the stage can set these.
+// stageOptions changes what a stage does, for a test binary, which sets
+// stageOpts. A program runs the zero value.
 type stageOptions struct {
 	// noCloseRange, if set, makes markCloseOnExec skip close_range, as on a
 	// kernel before 5.11, so that a test reaches the listing it falls back to.
@@ -107,25 +102,27 @@ type stageOptions struct {
 	// descriptors from in place of /proc/self/fd, so that a test can make the
 	// listing fail.
 	fdDir string
+	// afterStart, if set, is called once the command has started and before
+	// the reaper says so, so that a test can hold it there while the command
+	// ends the sandbox.
+	afterStart func()
 }
 
-// runStage is Stage with options.
-func runStage(opts stageOptions) (int, bool) {
-	staged.Store(true)
-	// The check child is started with checkArg, and runs the checks and
-	// nothing else.
-	if len(os.Args) > 1 && os.Args[1] == checkArg {
-		return checkStage(), true
-	}
-	if len(os.Args) < 4 || (os.Args[1] != stageArg && os.Args[1] != reaperArg) || os.Args[2] != "--" {
-		return 0, false
-	}
+// platformRole plays the Linux parts of the sandbox: the two stages, and the
+// check child's namespace attempts. It reports false for a role that isn't
+// one of them.
+func platformRole(role string, opts stageOptions) (int, bool) {
 	var err error
 	code := failed
-	if os.Args[1] == stageArg {
+	switch role {
+	case roleStage:
 		err = firstStage()
-	} else {
-		code, err = reaperStage(os.Args[3:], opts)
+	case roleReaper:
+		code, err = reaperStage(opts)
+	case roleCheckNS:
+		return grandchild(), true
+	default:
+		return 0, false
 	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "sandbox: %v\n", err)
@@ -144,7 +141,8 @@ func runStage(opts stageOptions) (int, bool) {
 // into a mount namespace of its own and makes every mount in it private.
 // unshare moves only the calling thread, so it then execs this binary again
 // as the reaper, which leaves the whole of pid 1 in the new namespace and
-// none in bubblewrap's.
+// none in bubblewrap's. The reaper is found by roleReaper in its
+// environment, which the init of this run removed roleStage from.
 //
 // It also joins a new, empty session keyring, since the caller's would
 // otherwise be inherited, and a key in it is readable by the same uid. And it
@@ -157,7 +155,6 @@ func runStage(opts stageOptions) (int, bool) {
 // empty sets into the new image, which starts with that one thread, so every
 // thread of the reaper, and the command, starts with none.
 func firstStage() error {
-	runtime.LockOSThread()
 	if err := unix.Unshare(unix.CLONE_NEWNS); err != nil {
 		return fmt.Errorf("copy the view into a mount namespace of its own: %w", err)
 	}
@@ -183,23 +180,26 @@ func firstStage() error {
 	if err := unix.Prctl(unix.PR_SET_PDEATHSIG, uintptr(unix.SIGKILL), 0, 0, 0); err != nil {
 		return fmt.Errorf("die with bubblewrap: %w", err)
 	}
-	args := slices.Concat([]string{os.Args[0], reaperArg}, os.Args[2:])
-	return syscall.Exec("/proc/self/exe", args, os.Environ()) //nolint:gosec // This is the sandbox's own binary, not a shell.
+	return syscall.Exec("/proc/self/exe", []string{stagePath}, withRole(os.Environ(), roleReaper)) //nolint:gosec // This is the sandbox's own binary, not a shell.
 }
 
 // reaperStage runs as pid 1 in the sandbox's own mount namespace, with no
 // capabilities and no_new_privs set, which the first stage left it. It makes
 // itself undumpable, so the command cannot read its memory or descriptors
-// through /proc, and takes its settings from the control socket. It then
+// through /proc, and takes its settings, the command among them, from the
+// control socket. It then
 // binds the listeners, sets the limits, installs the filter on all its
-// threads, sends the parent the listeners or the error, closes the control
-// socket, and starts the command, which holds no descriptor but its own.
+// threads, sends the parent the listeners or the setup error, and starts the
+// command, which holds no descriptor but its own. Then it sends the start's
+// error or that the command started, and closes the control socket, so that
+// Start fails for a command that can't be started, as on macOS, and nothing
+// the command does can fail it.
 // Then it relays signals to the command, reaps every orphan in the
 // namespace, and exits with the command's status, which also kills whatever
 // is left. It exits as well when the lifeline reaches EOF, which is when
 // the parent has gone, however it went. The filter goes on here rather than
 // through bubblewrap, since it refuses the calls the first stage makes.
-func reaperStage(command []string, opts stageOptions) (int, error) {
+func reaperStage(opts stageOptions) (int, error) {
 	// Undumpable belongs to the process, and execve resets it, so it is
 	// set here rather than in the first stage.
 	if err := unix.Prctl(unix.PR_SET_DUMPABLE, 0, 0, 0, 0); err != nil {
@@ -214,43 +214,63 @@ func reaperStage(command []string, opts stageOptions) (int, error) {
 	// leaves no command running, even briefly. Its write end closing is
 	// EOF whenever this first reads it.
 	go watchLifeline()
-	settings, err := receiveSettings()
+	settings, err := receiveSettings(fdControl)
 	if err != nil {
 		return 0, err
 	}
-	path, listeners, err := setup(settings, command, opts)
+	path, listeners, err := setup(settings, opts)
 	if err != nil {
-		// The parent is waiting for the control socket's one message.
+		// The parent is waiting for the first message.
 		_ = send(stageReply{Error: err.Error()}, nil)
 		return 0, err
 	}
+	// The first message: setup is done, with the listeners. It goes before
+	// the command starts, so that nothing the command does, such as ending
+	// the sandbox at once, can stand between the parent and it.
 	if err := send(stageReply{}, listeners); err != nil {
 		return 0, fmt.Errorf("send the listeners: %w", err)
 	}
 	for _, l := range listeners {
 		_ = l.Close()
 	}
-	// Setup is over, and nothing untrusted has run. The command never
-	// holds this socket: the parent trusts nothing it says.
-	if err := os.NewFile(fdControl, "control").Close(); err != nil {
-		return 0, fmt.Errorf("close the control socket: %w", err)
-	}
 	files := []*os.File{os.Stdin, os.Stdout, os.Stderr}
 	for i := range settings.Files {
 		files = append(files, os.NewFile(uintptr(fdFiles+i), "file"))
 	}
-	child, err := os.StartProcess(path, command, &os.ProcAttr{ //nolint:gosec // Running the configured command is the sandbox's job, and it is not a shell.
-		Env:   os.Environ(),
+	// The command doesn't inherit the control socket or the listeners,
+	// which setup marked close-on-exec, and it can't reach pid 1's
+	// descriptors, so it can't touch the second reply.
+	child, err := os.StartProcess(path, settings.Command.strings(), &os.ProcAttr{
+		Env:   withRole(os.Environ(), settings.Role),
 		Files: files,
 	})
-	if err != nil {
-		return 0, fmt.Errorf("start command: %w", err)
-	}
 	// Held until here, so that nothing closes one of them while it is
 	// being passed on.
 	runtime.KeepAlive(files)
+	if err != nil {
+		// The second message: the start's error, which fails Start.
+		err = fmt.Errorf("start command: %w", err)
+		_ = send(stageReply{Error: err.Error()}, nil)
+		return 0, err
+	}
+	// Relayed from the command's start, so that a SIGTERM or SIGHUP from
+	// then on reaches it, and doesn't end pid 1 by Go's default.
 	stop := relaySignals(child)
 	defer stop()
+	if opts.afterStart != nil {
+		opts.afterStart()
+	}
+	// The second message: the command started. A parent that reads the end
+	// of the socket here instead, as when the command ended the sandbox
+	// first, takes it as started too, and Wait has the status. A parent
+	// that can't be told has gone, and pid 1's exit ends the command.
+	if err := send(stageReply{Started: true}, nil); err != nil {
+		return 0, fmt.Errorf("say the command started: %w", err)
+	}
+	// The parent trusts nothing the socket says from here.
+	if err := os.NewFile(fdControl, "control").Close(); err != nil {
+		return 0, fmt.Errorf("close the control socket: %w", err)
+	}
 	for {
 		var ws unix.WaitStatus
 		pid, err := unix.Wait4(-1, &ws, 0, nil)
@@ -270,19 +290,22 @@ func reaperStage(command []string, opts stageOptions) (int, error) {
 	}
 }
 
-// receiveSettings reads the settings from the control socket.
-func receiveSettings() (stageSettings, error) {
+// receiveSettings reads the settings from the control socket, fd, in as many
+// messages as sendSettings made of them, and refuses settings with no
+// command.
+func receiveSettings(fd int) (stageSettings, error) {
 	var settings stageSettings
-	typ, err := unix.GetsockoptInt(fdControl, unix.SOL_SOCKET, unix.SO_TYPE)
+	typ, err := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_TYPE)
 	if err != nil {
-		return settings, fmt.Errorf("descriptor %d is not the control socket: %w", fdControl, err)
+		return settings, fmt.Errorf("descriptor %d is not the control socket: %w", fd, err)
 	}
 	if typ != unix.SOCK_SEQPACKET {
-		return settings, fmt.Errorf("descriptor %d is not the control socket: its type is %d", fdControl, typ)
+		return settings, fmt.Errorf("descriptor %d is not the control socket: its type is %d", fd, typ)
 	}
+	var body []byte
 	buf := make([]byte, maxMessage)
 	for {
-		n, _, flags, _, err := unix.Recvmsg(fdControl, buf, nil, 0)
+		n, _, flags, _, err := unix.Recvmsg(fd, buf, nil, 0)
 		if errors.Is(err, unix.EINTR) {
 			continue
 		}
@@ -290,24 +313,66 @@ func receiveSettings() (stageSettings, error) {
 			return settings, fmt.Errorf("read the settings: %w", err)
 		}
 		if flags&unix.MSG_TRUNC != 0 || n == 0 {
-			return settings, errors.New("read the settings: the message is empty or too long")
+			return settings, errors.New("read the settings: a message is empty or too long")
 		}
-		if err := json.Unmarshal(buf[:n], &settings); err != nil {
-			return settings, fmt.Errorf("read the settings: %w", err)
+		body = append(body, buf[1:n]...)
+		if buf[0] == settingsLast {
+			break
 		}
-		return settings, nil
+		if buf[0] != settingsMore {
+			return settings, fmt.Errorf("read the settings: a message starts with %d", buf[0])
+		}
+	}
+	if err := json.Unmarshal(body, &settings); err != nil {
+		return settings, fmt.Errorf("read the settings: %w", err)
+	}
+	if len(settings.Command) == 0 || len(settings.Command[0]) == 0 {
+		return settings, errors.New("read the settings: they carry no command")
+	}
+	return settings, nil
+}
+
+// sendSettings writes body to the control socket in messages of at most
+// maxMessage bytes, each led by a byte that says whether more follow. Those
+// that don't fit in the socket's buffer wait for the reaper to read the ones
+// before, so it is called once bubblewrap has started. A message is also no
+// longer than the send buffer takes, less the 32 bytes unix_dgram_sendmsg
+// keeps back, for a host whose buffer is smaller than maxMessage.
+func sendSettings(ctl *os.File, body []byte) error {
+	size := maxMessage
+	if buf, err := unix.GetsockoptInt(int(ctl.Fd()), unix.SOL_SOCKET, unix.SO_SNDBUF); err == nil && buf-32 < size {
+		size = buf - 32
+	}
+	if size < 2 {
+		return fmt.Errorf("the control socket's send buffer holds only %d bytes", size)
+	}
+	msg := make([]byte, 0, size)
+	for {
+		n := min(len(body), size-1)
+		more := byte(settingsLast)
+		if n < len(body) {
+			more = settingsMore
+		}
+		msg = append(append(msg[:0], more), body[:n]...)
+		if _, err := ctl.Write(msg); err != nil {
+			return err
+		}
+		body = body[n:]
+		if more == settingsLast {
+			return nil
+		}
 	}
 }
 
 // setup does everything the command needs of pid 1 before it starts, and
 // returns the path to start and the listeners it bound.
-func setup(s stageSettings, command []string, opts stageOptions) (string, []*net.TCPListener, error) {
+func setup(s stageSettings, opts stageOptions) (string, []*net.TCPListener, error) {
 	if err := s.Kernel.Set(string(s.Kernel)); err != nil {
 		return "", nil, err
 	}
 	// bubblewrap gave the stages the command's environment, so its PATH is
 	// the one to look the command up on.
-	path, err := exec.LookPath(command[0])
+	path, err := exec.LookPath(string(s.Command[0]))
 	if err != nil {
 		return "", nil, err
 	}
@@ -368,8 +433,8 @@ func (o stageOptions) markCloseOnExec() error {
 	return markListedCloseOnExec(dir)
 }
 
-// send sends the parent the one message the control socket carries back,
-// with listeners' descriptors.
+// send sends the parent one of the control socket's two messages back, with
+// listeners' descriptors.
 func send(reply stageReply, listeners []*net.TCPListener) error {
 	body, err := json.Marshal(reply)
 	if err != nil {

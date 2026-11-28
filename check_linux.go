@@ -158,8 +158,11 @@ func initialUserNS() bool {
 	return parseUIDMap(f)
 }
 
-// Modes of the grandchild: this binary, started with a namespace of its own.
+// Modes of the grandchild: this binary, started with a namespace of its own
+// and roleCheckNS. It reads its mode, and the path the mode needs, from
+// nsArgsFD, so no argv or environment holds the path.
 const (
+	nsArgsFD    = 3
 	modeNoop    = "noop"
 	modeMount   = "mount"
 	modeUmount  = "umount"
@@ -167,9 +170,16 @@ const (
 )
 
 // grandchild runs a namespace attempt in the process the check child made
-// for it, so no namespace or mount touches the check child or the caller.
-func grandchild(args []string) (int, bool) {
-	var err error
+// for it, so no namespace or mount touches the check child or the caller. It
+// returns the exit status. Its mode and the mode's path come on nsArgsFD,
+// separated by a NUL, and a run without that descriptor tries nothing.
+func grandchild() int {
+	b, err := io.ReadAll(os.NewFile(nsArgsFD, "mode"))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "sandbox check: read the mode: %v\n", err)
+		return checkFailed
+	}
+	args := strings.Split(string(b), "\x00")
 	switch args[0] {
 	case modeNoop:
 	case modeMount:
@@ -180,7 +190,8 @@ func grandchild(args []string) (int, bool) {
 		}
 	case modeUmount, modeRemount:
 		if len(args) != 2 {
-			return checkFailed, true
+			fmt.Fprintf(os.Stderr, "sandbox check: mode %q takes one path\n", args[0])
+			return checkFailed
 		}
 		if err = unix.Mount("", "/", "", unix.MS_REC|unix.MS_PRIVATE, ""); err == nil {
 			if args[0] == modeUmount {
@@ -190,13 +201,14 @@ func grandchild(args []string) (int, bool) {
 			}
 		}
 	default:
-		return 0, false
+		fmt.Fprintf(os.Stderr, "sandbox check: no mode %q\n", args[0])
+		return checkFailed
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
-		return 1, true
+		return 1
 	}
-	return 0, true
+	return 0
 }
 
 // spawnNS starts this binary as a grandchild in new namespaces and waits.
@@ -206,7 +218,15 @@ func grandchild(args []string) (int, bool) {
 func spawnNS(flags uintptr, mode ...string) (started bool, detail string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 4*netTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "/proc/self/exe", append([]string{checkArg}, mode...)...) //nolint:gosec // G204: this binary, run with the check's own fixed modes.
+	args, err := modePipe(mode)
+	if err != nil {
+		return false, err.Error()
+	}
+	defer args.Close()
+	cmd := exec.CommandContext(ctx, "/proc/self/exe")
+	cmd.Args[0] = checkName
+	cmd.Env = withRole(os.Environ(), roleCheckNS)
+	cmd.ExtraFiles = []*os.File{args}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Cloneflags: flags}
 	if flags&syscall.CLONE_NEWUSER != 0 {
 		// Map our uid to root, as bubblewrap does. Without a mapping the
@@ -216,7 +236,7 @@ func spawnNS(flags uintptr, mode ...string) (started bool, detail string) {
 	}
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
-	err := cmd.Run()
+	err = cmd.Run()
 	if err == nil {
 		return true, ""
 	}
@@ -225,6 +245,23 @@ func spawnNS(flags uintptr, mode ...string) (started bool, detail string) {
 		return true, strings.TrimSpace(stderr.String())
 	}
 	return false, err.Error()
+}
+
+// modePipe returns the read end of a pipe that holds mode, its words joined
+// by a NUL, for a grandchild's nsArgsFD. The write end is closed, so the
+// grandchild reads to its end.
+func modePipe(mode []string) (*os.File, error) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		return nil, fmt.Errorf("make the mode pipe: %w", err)
+	}
+	// A mode and a path are far shorter than a pipe holds.
+	_, err = w.WriteString(strings.Join(mode, "\x00"))
+	if err = errors.Join(err, w.Close()); err != nil {
+		_ = r.Close()
+		return nil, fmt.Errorf("write the mode pipe: %w", err)
+	}
+	return r, nil
 }
 
 func checkUserns(*checkEnv) []Result {

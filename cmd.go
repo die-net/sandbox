@@ -81,6 +81,12 @@ type Cmd struct {
 	// Cmd that was not made by Command still has none.
 	CgroupFD int
 
+	// role, if set, is the part of the sandbox the command plays, as roleVar
+	// names it, for Check's child and Probe's trial, which run this binary
+	// as the command. The stage sets it in the command's environment, which
+	// otherwise never holds roleVar, whatever Env holds.
+	role string
+
 	// backend is what the platform's implementation holds in a Cmd, which is
 	// nothing where there is no backend.
 	backend
