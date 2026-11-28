@@ -16,16 +16,12 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// stageArg is the first argument of the run of this binary that Start makes
-// ahead of the command, followed by "--" and the command. The stage runs
-// outside the profile, as the caller, and supervises: it sets the limits,
-// starts /usr/bin/sandbox-exec with the profile on a pipe, and ends every
-// process under the profile when the command or the caller does.
-const stageArg = "--sandbox-stage"
-
-// failed is the exit status of a stage that could not set up, as distinct from
-// the command's own.
-const failed = 125
+// stageName is the whole of the argv of the run of this binary that Start
+// makes ahead of the command, which roleStage in its environment finds. The
+// stage runs outside the profile, as the caller, and supervises: it sets the
+// limits, starts /usr/bin/sandbox-exec with the profile on a pipe, and ends
+// every process under the profile when the command or the caller does.
+const stageName = "sandbox-stage"
 
 // sandboxExec is the one program that applies a profile without cgo. It is
 // named by its path and never found on PATH, so nothing the caller's
@@ -43,12 +39,19 @@ const (
 
 // stageSettings is what the caller sends the stage on its settings pipe.
 type stageSettings struct {
-	Profile string `json:"profile"`
+	// Command is the command's argv, which the stage looks up on the
+	// command's PATH.
+	Command byteArgs `json:"command"`
+	Profile string   `json:"profile"`
 	// Marker is the pair of names the profile carries, by which the stage finds
 	// every process under it, wherever it has gone.
 	Marker  marker       `json:"marker"`
 	Files   int          `json:"files"`
 	Rlimits []stageLimit `json:"rlimits,omitempty"`
+	// Role, if set, is the part of the sandbox the command plays, which the
+	// stage gives it as roleVar: Check's child is this binary. Empty, the
+	// command's environment holds no roleVar.
+	Role string `json:"role,omitempty"`
 }
 
 // stageLimit is a macOS resource limit.
@@ -121,17 +124,8 @@ type stageDone struct {
 	Scans   int    `json:"scans,omitempty"`
 }
 
-// Stage runs the sandbox's stage if this process was started as it, and
-// reports false otherwise. A program that uses this package calls it first in
-// main, before it reads its arguments.
-func Stage() (int, bool) {
-	return runStage(stageOptions{})
-}
-
-// stageOptions changes what a stage does, for a test binary. A test binary is
-// its own stage, so only its TestMain can configure the stage, and it calls
-// runStage with the options. Stage passes the zero value, which is what a
-// program runs, and nothing a caller sends the stage can set these.
+// stageOptions changes what a stage does, for a test binary, which sets
+// stageOpts. A program runs the zero value.
 type stageOptions struct {
 	// beforeReply, if set, is called once sandbox-exec has started and before the
 	// stage replies, so that a test can end the stage there.
@@ -166,17 +160,13 @@ func (o stageOptions) killAll(group int, m marker) (scans int, end endKind) {
 	return p.run(budget)
 }
 
-// runStage is Stage with options.
-func runStage(opts stageOptions) (int, bool) {
-	// The check child is started with checkArg, and runs the checks and
-	// nothing else.
-	if len(os.Args) > 1 && os.Args[1] == checkArg {
-		return checkStage(), true
-	}
-	if len(os.Args) < 4 || os.Args[1] != stageArg || os.Args[2] != "--" {
+// platformRole plays the stage, the one macOS part of the sandbox. It reports
+// false for any other role.
+func platformRole(role string, opts stageOptions) (int, bool) {
+	if role != roleStage {
 		return 0, false
 	}
-	code, err := supervise(os.Args[3:], opts)
+	code, err := supervise(opts)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "sandbox: %v\n", err)
 		return failed, true
@@ -195,7 +185,15 @@ func runStage(opts stageOptions) (int, bool) {
 // went. Those are found by the profile's marker (member_darwin.go), until a
 // scan proves none is left (scan_darwin.go). It then tells the caller whether
 // it did (stageDone), and exits with the command's status.
-func supervise(command []string, opts stageOptions) (int, error) {
+func supervise(opts stageOptions) (int, error) {
+	// Without the lifeline the watcher's first read would fail and end the
+	// process with no word of why, so a run of the stage without its
+	// descriptors fails here first, with the error. Nothing has started yet.
+	for _, fd := range []int{fdLifeline, fdSettings, fdStatus} {
+		if _, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0); err != nil {
+			return 0, fmt.Errorf("descriptor %d is not open: %w", fd, err)
+		}
+	}
 	var st stageState
 	// Watch from the first moment, so a caller that died during setup leaves
 	// no command running. The lock is held from before the command starts
@@ -212,13 +210,6 @@ func supervise(command []string, opts stageOptions) (int, error) {
 			os.Exit(128 + int(unix.SIGKILL)) //nolint:revive // deep-exit: the stage must end from this goroutine once the lifeline closes, and nothing above it could take an exit status.
 		}
 	}()
-	// Without the lifeline the watcher's first read fails and ends the
-	// process, racing the clean error below. Fail here instead.
-	for _, fd := range []int{fdLifeline, fdSettings, fdStatus} {
-		if _, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0); err != nil {
-			return 0, fmt.Errorf("descriptor %d is not open: %w", fd, err)
-		}
-	}
 	var settings stageSettings
 	if err := json.NewDecoder(os.NewFile(fdSettings, "settings")).Decode(&settings); err != nil {
 		return 0, fmt.Errorf("read the settings: %w", err)
@@ -230,7 +221,7 @@ func supervise(command []string, opts stageOptions) (int, error) {
 		return 0, err
 	}
 	st.mark = settings.Marker
-	child, send, err := startCommand(settings, command, opts, &st.mu, &st.group)
+	child, send, err := startCommand(settings, opts, &st.mu, &st.group)
 	if err != nil {
 		_ = json.NewEncoder(st.status).Encode(stageReply{Kind: kindReply, Error: err.Error()})
 		_ = st.status.Close()
@@ -323,11 +314,14 @@ func (s *stageState) lifelineClosed(end func(group int, m marker) (int, endKind)
 	return true
 }
 
-// check refuses settings that would leave the stage unable to find the
-// sandbox's processes. A marker with no names matches nothing, so a teardown
-// would take every pid for a process outside the sandbox and report the
-// sandbox empty without looking.
+// check refuses settings with no command, and settings that would leave the
+// stage unable to find the sandbox's processes. A marker with no names matches
+// nothing, so a teardown would take every pid for a process outside the
+// sandbox and report the sandbox empty without looking.
 func (s stageSettings) check() error {
+	if len(s.Command) == 0 || len(s.Command[0]) == 0 {
+		return errors.New("the settings carry no command")
+	}
 	if s.Marker.In == "" || s.Marker.Out == "" {
 		return errors.New("the settings carry no marker, so the sandbox's processes could not be found")
 	}
@@ -348,14 +342,14 @@ func (s stageSettings) check() error {
 // stage killed after the fork and before the exec went on to apply it and run
 // the command, which the caller, with no reply, had no pid to look for
 // (docs/findings.md).
-func startCommand(s stageSettings, command []string, opts stageOptions, mu *sync.Mutex, group *int) (p *os.Process, send func(), err error) {
+func startCommand(s stageSettings, opts stageOptions, mu *sync.Mutex, group *int) (p *os.Process, send func(), err error) {
 	// The command is looked up on the PATH the stage was given, which is the
 	// command's, from the working directory the command starts in.
-	path, err := exec.LookPath(command[0])
+	path, err := exec.LookPath(string(s.Command[0]))
 	if err != nil {
 		return nil, nil, err
 	}
-	command = append([]string{path}, command[1:]...)
+	command := append([]string{path}, s.Command[1:].strings()...)
 	// The limits go before the command starts, and apply to the stage too,
 	// as they do to pid 1 on Linux. Go's syscall package is used because
 	// x/sys' Setrlimit leaves the original NOFILE limit that os/exec restores
@@ -388,7 +382,7 @@ func startCommand(s stageSettings, command []string, opts stageOptions, mu *sync
 	args = append(args, "sandbox-exec", "-f", "/dev/fd/"+strconv.Itoa(profFd), "--")
 	args = append(args, command...)
 	attr := &os.ProcAttr{
-		Env:   os.Environ(),
+		Env:   withRole(os.Environ(), s.Role),
 		Files: files,
 		Sys:   &syscall.SysProcAttr{Setpgid: true},
 	}
@@ -401,7 +395,7 @@ func startCommand(s stageSettings, command []string, opts stageOptions, mu *sync
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	p, err = os.StartProcess(sandboxExec, args, attr) //nolint:gosec // G702: sandboxExec is a constant path, and running the configured command under it is the library's job.
+	p, err = os.StartProcess(sandboxExec, args, attr)
 	runtime.KeepAlive(files)
 	if err != nil {
 		_ = profW.Close()

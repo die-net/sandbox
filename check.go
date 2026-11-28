@@ -83,9 +83,10 @@ type Expect struct {
 	Refused []string `json:"refused,omitempty"`
 }
 
-// checkArg is the first argument of the run of this binary that Check starts.
-// Stage hands such a run to checkStage.
-const checkArg = "--sandbox-check"
+// checkName is the whole of the argv of the check child that Check starts
+// outside a sandbox, which roleCheck in its environment finds. In a sandbox its
+// argv is SelfPath alone.
+const checkName = "sandbox-check"
 
 // checkFailed is the exit status of a check child that could not run its suite.
 const checkFailed = 125
@@ -130,8 +131,8 @@ type checkHints struct {
 // With nil it inherits this process's context as it is, which is what an
 // operator's container or unit gives.
 //
-// The child is started as the current binary with checkArg as its first
-// argument, so the program must call Stage first in main.
+// The child is this binary again, which the package's init finds by roleCheck
+// in its environment, so it runs the checks and none of the program's main.
 func Check(ctx context.Context, spec *Spec, want Expect) ([]Result, error) {
 	var in checkInput
 	if spec != nil {
@@ -175,7 +176,9 @@ func Check(ctx context.Context, spec *Spec, want Expect) ([]Result, error) {
 		if err != nil {
 			return nil, fmt.Errorf("check: find this binary: %w", err)
 		}
-		cmd := exec.CommandContext(ctx, exe, checkArg) //nolint:gosec // G204: the check child is this binary, run with a fixed argument.
+		cmd := exec.CommandContext(ctx, exe) //nolint:gosec // G204: the check child is this binary, run with no arguments.
+		cmd.Args[0] = checkName
+		cmd.Env = withRole(os.Environ(), roleCheck)
 		cmd.ExtraFiles = []*os.File{w, pr}
 		cmd.Stderr = &stderr
 		cmd.WaitDelay = netTimeout
@@ -220,7 +223,7 @@ func Check(ctx context.Context, spec *Spec, want Expect) ([]Result, error) {
 // the caller's side can see the host those come from. Command is empty, as
 // the child's own is set at the start.
 func checkSpec(spec Spec, h hostView) (Spec, error) {
-	spec.Command = []string{SelfPath, checkArg}
+	spec.Command = []string{SelfPath}
 	spec, err := prepare(spec, h)
 	if err != nil {
 		return Spec{}, err
@@ -229,14 +232,9 @@ func checkSpec(spec Spec, h hostView) (Spec, error) {
 	return spec, nil
 }
 
-// checkStage is the check child's entry point, which Stage calls when
-// os.Args[1] is checkArg. It returns the exit status.
+// checkStage is the check child's entry point, which the package's init calls
+// when roleVar is roleCheck. It returns the exit status.
 func checkStage() int {
-	if len(os.Args) >= 3 {
-		if code, ok := grandchild(os.Args[2:]); ok {
-			return code
-		}
-	}
 	var in checkInput
 	if err := json.NewDecoder(os.NewFile(payloadFD, "payload")).Decode(&in); err != nil {
 		fmt.Fprintf(os.Stderr, "sandbox check: %v\n", err)

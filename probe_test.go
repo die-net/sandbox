@@ -35,7 +35,6 @@ func goodFacts() probeFacts {
 		Bwrap:   "/usr/bin/bwrap",
 		Version: "bubblewrap 0.12.0\n",
 		Kernels: map[Kernel]Kernel{KernelStrict: KernelStrict},
-		Staged:  true,
 		Self:    "/opt/app/server",
 	}
 }
@@ -83,8 +82,6 @@ func TestDiagnose(t *testing.T) {
 		{"no version", mod(func(f *probeFacts) { f.Version = "" }), "probe.bubblewrap", "no version"},
 		{"no filter", mod(func(f *probeFacts) { f.Kernels = nil }), "probe.seccomp", "architecture"},
 		{"root", mod(func(f *probeFacts) { f.Root = true }), "probe.root", "switch to the sandbox's own uid"},
-		{"no stage", mod(func(f *probeFacts) { f.Staged = false }), "probe.stage", "call sandbox.Stage first in main"},
-		{"root before stage", mod(func(f *probeFacts) { f.Root, f.Staged = true, false }), "probe.root", ""},
 		{"apparmor", mod(func(f *probeFacts) { f.Sysctl["kernel.apparmor_restrict_unprivileged_userns"] = "1" }), "probe.apparmor-userns", "  allow all,"},
 		{"apparmor names this binary", mod(func(f *probeFacts) { f.Sysctl["kernel.apparmor_restrict_unprivileged_userns"] = "1" }), "probe.apparmor-userns", "profile sandbox-opt-app-server /opt/app/server flags=(attach_disconnected,mediate_deleted)"},
 		// Ubuntu 26.04: bubblewrap's profile, whatever the sysctl.

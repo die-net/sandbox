@@ -5,6 +5,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -88,7 +89,8 @@ func TestCheckSandbox(t *testing.T) {
 
 // TestCheckArgvHoldsNoSettings polls /proc while Check runs, with and
 // without a Spec, and requires that no command line holds the payload, and
-// that the check child's is only the binary and the marker, or for a namespace attempt a fixed mode.
+// that the command line of the check child and of its namespace attempts,
+// which roleVar in their environment finds, is one word, a name or SelfPath.
 func TestCheckArgvHoldsNoSettings(t *testing.T) {
 	t.Parallel()
 	for _, withSpec := range []bool{false, true} {
@@ -133,13 +135,15 @@ func TestCheckArgvHoldsNoSettings(t *testing.T) {
 						if bytes.Contains(b, []byte(marker)) {
 							leaks = append(leaks, line)
 						}
-						if len(args) >= 2 && string(args[1]) == checkArg {
+						// The environment a process started with, which
+						// keeps roleVar after its init unsets it.
+						env, _ := readFile(strings.TrimSuffix(f, "cmdline") + "environ")
+						isCheck := slices.ContainsFunc(bytes.Split(env, []byte{0}), func(v []byte) bool {
+							return string(v) == roleVar+"="+roleCheck || string(v) == roleVar+"="+roleCheckNS
+						})
+						if isCheck {
 							children++
-							// A check child's own namespace attempts are
-							// this binary with a fixed mode, which a
-							// sampler that is quick enough sees too.
-							grandchild := len(args) == 3 && (string(args[2]) == modeNoop || string(args[2]) == modeMount)
-							if len(args) != 2 && !grandchild {
+							if len(args) != 1 {
 								leaks = append(leaks, line)
 							}
 						}

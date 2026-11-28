@@ -32,13 +32,10 @@ It began as the sandbox in the legwork project.
 
 ## Example
 
-A program that starts sandboxes calls `Stage` first in `main`. Then `Command`, `Start` and `Wait`, as with `os/exec`:
+A program that starts sandboxes imports the package and calls `Command`, `Start` and `Wait`, as with `os/exec`. The package runs its own stages from its `init`, so `main` needs no call of its own:
 
 ```go
 func main() {
-	if code, ok := sandbox.Stage(); ok {
-		os.Exit(code)
-	}
 	if err := run(); err != nil {
 		log.Fatal(err)
 	}
@@ -112,7 +109,7 @@ Both backends are built and tested, on Linux (amd64 and arm64, Debian 12 and 13,
 
 ## Documentation
 
-- [docs/usage.md](docs/usage.md): adopting the library. `Stage`, egress, `Probe` and `Check`, tools under covered paths, limits, `ErrSurvivors`, and what a program meets under the sandbox.
+- [docs/usage.md](docs/usage.md): adopting the library. How the binary runs again as its own stage, egress, `Probe` and `Check`, tools under covered paths, limits, `ErrSurvivors`, and what a program meets under the sandbox.
 - [docs/security-model.md](docs/security-model.md): the threat model, every guarantee with its test, the limits and the open issues.
 - [docs/linux.md](docs/linux.md) and [docs/macos.md](docs/macos.md): how each backend works.
 - [docs/findings.md](docs/findings.md): every way past the sandbox that has been found. Read it before changing the sandbox.

@@ -592,9 +592,11 @@ func escProcs(e *escT, args []string) {
 	if os.Getpid() == 1 {
 		e.failf("the command is pid 1")
 	}
-	// Pid 1 is the reaper, which the command cannot open.
-	if cmdline, err := os.ReadFile("/proc/1/cmdline"); err != nil || !strings.Contains(string(cmdline), reaperArg) {
-		e.failf("pid 1 is not the reaper: %q, %v", cmdline, err)
+	// Pid 1 is the reaper, which the command cannot open: its argv is the
+	// stages' name alone, and the checks below find it undumpable, which the
+	// first stage isn't.
+	if cmdline, err := os.ReadFile("/proc/1/cmdline"); err != nil || string(cmdline) != stagePath+"\x00" {
+		e.failf("pid 1's command line is %q, %v, want %q alone", cmdline, err, stagePath)
 	}
 	_, err = os.ReadFile("/proc/1/environ")
 	e.is("read pid 1's environ", err, unix.EACCES)
@@ -2234,7 +2236,8 @@ func TestEscapeLoopbackIsPrivate(t *testing.T) {
 
 // Row: "Options on a descriptor, not in pid 1's argv": nothing the spec names
 // appears in the command line of pid 1 or of bubblewrap, which any process
-// can read.
+// can read. Both are fixed: the command goes in the settings, and the stages
+// are found by roleVar.
 func TestEscapeOptionsNotInArgv(t *testing.T) {
 	t.Parallel()
 	home, write, read, cover := t.TempDir(), t.TempDir(), t.TempDir(), "/srv/app-cover-marker"
@@ -2250,10 +2253,17 @@ func TestEscapeOptionsNotInArgv(t *testing.T) {
 	for _, p := range []struct {
 		name string
 		pid  int
-	}{{"bubblewrap", c.run.cmd.Process.Pid}, {"pid 1", c.Pid()}} {
+		want []string
+	}{
+		{"bubblewrap", c.run.cmd.Process.Pid, []string{"bwrap", "--args", strconv.Itoa(fdArgs), "--", stagePath}},
+		{"pid 1", c.Pid(), []string{stagePath}},
+	} {
 		argv := read1(p.pid, "cmdline")
 		if argv == "" {
 			t.Fatalf("%s: no command line", p.name)
+		}
+		if want := strings.Join(p.want, "\x00") + "\x00"; argv != want {
+			t.Errorf("%s's command line is %q, want %q", p.name, argv, want)
 		}
 		for _, secret := range []string{home, write, read, cover} {
 			if strings.Contains(argv, secret) {

@@ -869,22 +869,26 @@ func TestLifelineClosedAfterTheStageFinished(t *testing.T) {
 
 // A stage given settings with no marker refuses them and starts nothing, since
 // a teardown with no marker takes every pid for one outside the sandbox and
-// would call the sandbox empty without looking.
+// would call the sandbox empty without looking. So does one given no command.
 func TestStageRefusesSettingsWithoutAMarker(t *testing.T) {
 	t.Parallel()
+	both := marker{In: "in", Out: "out"}
 	for _, tc := range []struct {
-		name   string
-		marker marker
-		want   bool // whether the stage refuses
+		name    string
+		marker  marker
+		command []string
+		want    bool // whether the stage refuses
 	}{
-		{"no names", marker{}, true},
-		{"no name to look up", marker{Out: "out"}, true},
-		{"no name to refuse", marker{In: "in"}, true},
-		{"both names", marker{In: "in", Out: "out"}, false},
+		{"no names", marker{}, []string{"/usr/bin/true"}, true},
+		{"no name to look up", marker{Out: "out"}, []string{"/usr/bin/true"}, true},
+		{"no name to refuse", marker{In: "in"}, []string{"/usr/bin/true"}, true},
+		{"both names", both, []string{"/usr/bin/true"}, false},
+		{"no command", both, nil, true},
+		{"an empty command", both, []string{""}, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			if err := (stageSettings{Marker: tc.marker}).check(); (err != nil) != tc.want {
+			if err := (stageSettings{Marker: tc.marker, Command: toByteArgs(tc.command)}).check(); (err != nil) != tc.want {
 				t.Errorf("check = %v, want a refusal = %v", err, tc.want)
 			}
 		})
@@ -905,7 +909,7 @@ func TestStageRefusesSettingsWithoutAMarker(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = statR.Close() })
-	body, err := json.Marshal(stageSettings{Profile: "(version 1)(allow default)"})
+	body, err := json.Marshal(stageSettings{Command: toByteArgs([]string{"/usr/bin/true"}), Profile: "(version 1)(allow default)"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -913,7 +917,8 @@ func TestStageRefusesSettingsWithoutAMarker(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = setW.Close()
-	cmd := exec.CommandContext(t.Context(), selfPath(), stageArg, "--", "/usr/bin/true") //nolint:gosec // G204: the stage is this test binary, which TestMain runs as one.
+	cmd := exec.CommandContext(t.Context(), selfPath()) //nolint:gosec // G204: the stage is this test binary, which the package's init runs as one.
+	cmd.Env = withRole(nil, roleStage)
 	cmd.ExtraFiles = []*os.File{lifeR, setR, statW}
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)

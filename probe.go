@@ -46,7 +46,6 @@ type probeFacts struct {
 	Version string            // output of bwrap --version
 	Kernels map[Kernel]Kernel // levels the seccomp filter can be built for
 	Root    bool              // this process runs as root, which Command refuses
-	Staged  bool              // this process called Stage, so Start can run
 	TryErr  string            // why the trial sandbox failed, "" when it started
 	// TrialErr is why the trial sandbox could not be built at all, before
 	// bubblewrap ran, such as a home that can't be made or a descriptor
@@ -100,11 +99,6 @@ func diagnose(f probeFacts) []Result {
 	if f.Root {
 		return append(res, fail("probe.root", "this program runs as root, and the sandbox refuses root, since it opens paths and writes the sandbox's passwd in this process. Fix: switch to the sandbox's own uid before Probe and Command"))
 	}
-	if !f.Staged {
-		return append(res, fail("probe.stage", "this program did not call sandbox.Stage, so Probe started no sandbox. Start runs this binary again inside the sandbox, and without Stage that run would be the program's own main. "+
-			"Fix: call sandbox.Stage first in main, and exit with its code when it reports true"))
-	}
-	res = append(res, pass("probe.stage", "this program called Stage"))
 	if f.TrialErr != "" {
 		return append(res, fail("probe.trial", "the trial sandbox could not be built, so nothing was tried: %s", f.TrialErr))
 	}

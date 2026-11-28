@@ -34,9 +34,6 @@ func checkSnapshots([]string) []Result {
 // initialUserNS is true: there are no user namespaces to be in.
 func initialUserNS() bool { return true }
 
-// grandchild has no modes here.
-func grandchild([]string) (int, bool) { return 0, false }
-
 // platformSockets are the sockets of the container runtimes that run on macOS
 // in a VM, and which a program that reaches can start anything as the user:
 // Docker Desktop's, and Colima's, OrbStack's, and Podman's.

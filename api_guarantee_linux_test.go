@@ -671,6 +671,8 @@ func TestAPIWaitStatus(t *testing.T) {
 			t.Errorf("Wait = %v, want status 137", err)
 		}
 	})
+	// The reaper replies once the command has started, so Start fails for
+	// one that can't be, as the doc comment on Start says.
 	t.Run("a file that cannot be executed", func(t *testing.T) {
 		t.Parallel()
 		home := t.TempDir()
@@ -682,12 +684,11 @@ func TestAPIWaitStatus(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := c.Start(); err != nil {
-			t.Fatalf("Start = %v, want the failure in Wait, as documented", err)
-		}
-		var ee *exec.ExitError
-		if err := c.Wait(); !errors.As(err, &ee) || ee.ExitCode() != failed {
-			t.Errorf("Wait = %v, want status %d", err, failed)
+		if err := c.Start(); err == nil || !strings.Contains(err.Error(), "exec format error") {
+			t.Errorf("Start = %v, want the exec's error", err)
+			if err == nil {
+				_ = c.Wait()
+			}
 		}
 	})
 }
@@ -1018,31 +1019,6 @@ func TestAPIRun(t *testing.T) {
 			t.Errorf("processes %v outlived Run", left)
 		}
 	})
-}
-
-// Stage: false in an ordinary process, and a clean failure, not a hang, when
-// its marker arguments are run outside a sandbox.
-func TestAPIStage(t *testing.T) {
-	t.Parallel()
-	if code, ok := Stage(); ok || code != 0 {
-		t.Errorf("Stage() = %d, %v in an ordinary process", code, ok)
-	}
-	for _, args := range [][]string{
-		{stageArg, "--", "/bin/true"},
-		{reaperArg, "--", "/bin/true"},
-	} {
-		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
-		cmd := exec.CommandContext(ctx, "/proc/self/exe", args...) //nolint:gosec // G204: the test binary or a tool the test names, run as the test's own child.
-		out, err := cmd.CombinedOutput()
-		cancel()
-		var ee *exec.ExitError
-		if !errors.As(err, &ee) || ee.ExitCode() != failed {
-			t.Errorf("%v outside a sandbox: %v, want exit %d: %s", args, err, failed, out)
-		}
-		if !strings.Contains(string(out), "sandbox:") {
-			t.Errorf("%v: no message: %q", args, out)
-		}
-	}
 }
 
 // RegisterFlags: every flag sets its field, repeatable ones accumulate, the

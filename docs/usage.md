@@ -2,22 +2,16 @@
 
 How a program adopts the sandbox. The [README](../README.md) has a first example. [security-model.md](security-model.md) says what the sandbox guarantees, and the Go doc comments on `Spec` and `Cmd` are the field reference.
 
-## Stage and re-exec
+## The binary runs again as its own stage
 
-Both backends start this binary again to run the first stage, which sets the sandbox up before anything untrusted runs. So every program that starts sandboxes calls `sandbox.Stage` first in `main`, before flag parsing and before it starts anything else:
+Both backends start this binary again to run the first stage, which sets the sandbox up before anything untrusted runs. The package finds those runs itself: `Start` sets `DIE_NET_SANDBOX_ROLE` in the environment it gives the stage, and the package's `init` reads it, unsets it at once, plays the part it names and exits. `Check` finds its child the same way. A program needs no call of its own in `main`, and the package reads no argument, so the program's command line is all its own.
 
-```go
-if code, ok := sandbox.Stage(); ok {
-	os.Exit(code)
-}
-```
+**Breaking change.** Before v0.1.1 a program called `sandbox.Stage` first in `main`, and the stages were found by markers such as `--sandbox-stage` in `os.Args[1]`. `Stage` is gone: delete the call. A program whose first argument is one of the old markers now runs as itself.
 
-`Stage` returns `ok` when this run is a stage (or a `Check` child), and `code` is the exit status to use. Otherwise it returns at once.
-
-- **Linux.** bubblewrap runs the caller's binary, bound read-only at `/dev/sandbox-stage`, as pid 1 inside the sandbox. The stage runs the binary's package `init` code with `CAP_SYS_ADMIN` in a nested user namespace, so keep `init` functions out of the program and audit its dependencies ([open issues](security-model.md#open-issues)).
+- **Linux.** bubblewrap runs the caller's binary, bound read-only at `/dev/sandbox-stage`, as pid 1 inside the sandbox, with that path as its whole argv. The stage holds `CAP_SYS_ADMIN` in a nested user namespace from its start until it drops it, so whatever Go initializes before this package runs with it: the package's own imports, and maybe packages of the program that don't import it, as the Go spec orders package initialization. Keep `init` functions out of those and audit what they link ([open issues](security-model.md#open-issues)). The program's `main` package, and every package that imports this one, never run in a stage.
 - **macOS.** The stage runs outside the profile, as the caller, and supervises `sandbox-exec`.
-- **Test binaries.** A package's tests that start sandboxes need a `TestMain` that calls `Stage`.
-- **The command can be the same binary.** `Spec.Command = []string{sandbox.SelfPath, "child-mode", ...}` runs this binary again inside the sandbox. `SelfPath` is `/dev/sandbox-stage` on Linux and the binary's real path on macOS, and every profile lets the command read and run exactly that file. The program calls `Stage` first in `main` there too, then handles its own mode.
+- **Test binaries.** A package's tests that start sandboxes need nothing either: the test binary's `init` plays the stage before `TestMain` runs.
+- **The command can be the same binary.** `Spec.Command = []string{sandbox.SelfPath, "child-mode", ...}` runs this binary again inside the sandbox. `SelfPath` is `/dev/sandbox-stage` on Linux and the binary's real path on macOS, and every profile lets the command read and run exactly that file. The command's environment never holds `DIE_NET_SANDBOX_ROLE`, whatever `Cmd.Env` holds, so that run is the program's own `main` with the arguments the command names.
 
 ## Starting a sandbox
 
@@ -105,7 +99,7 @@ A program that sandboxes should tell its operator what the sandbox gives and wha
 
 An error means no sandbox can start, and `Report.Checks` says why. Refuse to run untrusted code only then. Log the report once, and print the first failed finding's `Detail`, which holds the fix.
 
-On Linux, `Probe` starts a real trial sandbox, as `Start` does, so it needs what `Command` needs. It refuses root, and it needs `Stage` first in `main`, since the trial's first stage runs this binary again. In a program that never called `Stage` it starts no sandbox, and its `probe.stage` check fails and says so.
+On Linux, `Probe` starts a real trial sandbox, as `Start` does, so it needs what `Command` needs, and it refuses root.
 
 On macOS, `Checks` also lists each gap as `NotEnforceable`.
 
@@ -115,7 +109,7 @@ On macOS, `Checks` also lists each gap as `NotEnforceable`.
 func Check(ctx context.Context, spec *Spec, want Expect) ([]Result, error)
 ```
 
-`Check` runs the escape attempts in a child of the program, so the program must call `Stage` first. A `Result` has a stable `Name` such as `userns.create`, a `Status` and a `Detail` that says what was tried and what happened.
+`Check` runs the escape attempts in a child of the program, which the package's `init` finds as it finds a stage. A `Result` has a stable `Name` such as `userns.create`, a `Status` and a `Detail` that says what was tried and what happened.
 
 | Status | Meaning |
 |---|---|
@@ -143,7 +137,6 @@ A pass means one attempt failed, not that every path is closed. The checks have 
 |---|---|---|
 | bubblewrap missing, setuid, or older than 0.8 | `PATH`, mode bits, `--version` | The distribution's package. |
 | Running as root (`probe.root`) | The effective uid is 0 | Switch to the sandbox's own uid first, as for `Command`. |
-| No `Stage` (`probe.stage`) | `Stage` never ran in this process | Call `sandbox.Stage` first in `main`. |
 | The trial couldn't be built (`probe.trial`) | An error before bubblewrap ran, such as no temporary directory or a descriptor limit | What the error names. |
 | bubblewrap under another AppArmor profile, as on Ubuntu 26.04 (`probe.apparmor-bwrap`) | bubblewrap gets the label of Ubuntu's `bwrap` profile, not this program's own, and the trial sandbox fails | The AppArmor profile for this binary's path, which `Probe` prints, plus the commands to load it. The sysctl below doesn't help here. |
 | Ubuntu's AppArmor restriction on user namespaces (`probe.apparmor-userns`) | `kernel.apparmor_restrict_unprivileged_userns=1`, and the trial sandbox fails | The same profile. It allows everything to this binary and every process it starts, which then stay in it, outside the sandbox too ([linux.md](linux.md#probe-and-check)). |

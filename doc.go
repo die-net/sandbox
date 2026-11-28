@@ -11,13 +11,15 @@
 // mounts private, installs this package's seccomp filter, starts the
 // command, and reaps. A control socket carries its settings in and its
 // listeners out, and a lifeline pipe ends the sandbox when the caller does.
-// A program that uses this package calls [Stage] first in main, so that the
-// first stage is found before anything else. [Command] makes a [Cmd] for a
+// The package's init finds a run of the binary that is part of the sandbox
+// by a variable in its environment, which Start sets, and plays it before the
+// program's main, so a program needs no call of its own and keeps its
+// arguments. [Command] makes a [Cmd] for a
 // server that starts sandboxes, and [Run] is the form for a process of its
 // own.
 //
 // On macOS, /usr/bin/sandbox-exec applies a deny-by-default Seatbelt profile
-// that this package generates from the Spec. The same Stage call finds a
+// that this package generates from the Spec. The same init finds a
 // supervisor that runs outside the profile: it sets the limits, starts the
 // command in a process group of its own, and ends every process that runs
 // under the profile, whatever its group or parent, when the command does or

@@ -156,3 +156,27 @@ func listedFds(d *os.File) ([]int, error) {
 	}
 	return fds, nil
 }
+
+// byteArgs is an argv as the bytes it holds, for the stage's settings.
+// encoding/json writes a []byte in base64, and writes U+FFFD for each byte of a
+// string that isn't UTF-8, so an argument that isn't, such as a Latin-1 file
+// name, would otherwise reach the command changed.
+type byteArgs [][]byte
+
+// toByteArgs returns args as byteArgs.
+func toByteArgs(args []string) byteArgs {
+	out := make(byteArgs, len(args))
+	for i, a := range args {
+		out[i] = []byte(a)
+	}
+	return out
+}
+
+// strings returns the argv as strings.
+func (b byteArgs) strings() []string {
+	out := make([]string, len(b))
+	for i, a := range b {
+		out[i] = string(a)
+	}
+	return out
+}

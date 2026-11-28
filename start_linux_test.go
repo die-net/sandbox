@@ -3,6 +3,8 @@ package sandbox
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -18,8 +20,9 @@ import (
 // A bubblewrap whose outer process leaves a child behind holding the stages'
 // descriptors, as a real one killed before it lets its clone child go on does,
 // doesn't hang Start, whether the caller's context is canceled or bubblewrap
-// exits, and the child is gone after. Start is blocked in its read of the
-// info, which the child keeps from ending.
+// exits, and the child is gone after. The command is longer than the control
+// socket's buffer, so Start is blocked in its write of the settings as well as
+// in its read of the info, which the child keeps from ending.
 //
 // The child is either in bubblewrap's process group, or in a session of its
 // own, as pid 1 is with OwnSession when bubblewrap dies before pid 1 has set
@@ -66,7 +69,8 @@ func TestStartEndsWhenBubblewrapLeavesAChild(t *testing.T) {
 			t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
-			c, err := Command(ctx, Spec{Command: []string{"/bin/true"}, Home: t.TempDir()})
+			long := strings.Repeat("x", 100_000)
+			c, err := Command(ctx, Spec{Command: []string{"/bin/true", long, long, long}, Home: t.TempDir()})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -151,6 +155,24 @@ func TestStartEndsWhenBubblewrapLeavesAChild(t *testing.T) {
 	}
 }
 
+// An argv that execve refuses fails Start, as it did when bubblewrap's own
+// argv carried it: one argument longer than MAX_ARG_STRLEN (32 pages,
+// include/uapi/linux/binfmts.h) gets E2BIG. TestStartRefusesAnArgvWithANul has
+// the other case.
+func TestStartRefusesAnArgvTooLong(t *testing.T) {
+	t.Parallel()
+	c, err := Command(t.Context(), Spec{Command: []string{"/bin/true", strings.Repeat("x", 32*4096+1)}, Home: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Start(); err == nil || !strings.Contains(err.Error(), "argument list too long") {
+		t.Errorf("Start = %v, want E2BIG", err)
+		if err == nil {
+			_ = c.Wait()
+		}
+	}
+}
+
 // watchExit tells an exit that came before the watch started, as well as one
 // that comes after. The first is a child that has exited and not been reaped
 // when the watch starts: the poller registers its pidfd already readable, and
@@ -204,6 +226,125 @@ func TestWatchExit(t *testing.T) {
 				stop()
 			}
 		})
+	}
+}
+
+// A command that ends its sandbox the moment it starts, here with kill(0),
+// which reaches bubblewrap in the sandbox's process group, doesn't fail Start:
+// the reaper said setup was done before the start, and the end of the socket
+// in place of its second message counts as started. The reaper is held after
+// the start until the sandbox ends, so the command always wins the race the
+// second message would otherwise run with it. Wait reports the kill.
+func TestStartSucceedsWhenTheCommandEndsTheSandboxAtOnce(t *testing.T) {
+	t.Parallel()
+	c, err := Command(t.Context(), Spec{Command: []string{"/bin/sh", "-c", "kill -TERM 0; sleep 1000"}, Home: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Env = []string{"PATH=/usr/bin:/bin", stageStallAfterStartEnv + "=1"}
+	started := make(chan error, 1)
+	go func() { started <- c.Start() }()
+	select {
+	case err := <-started:
+		if err != nil {
+			t.Fatalf("Start = %v, want nil: the command's own act is Wait's to report", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Start hung")
+	}
+	if err := c.Wait(); err == nil {
+		t.Error("Wait = nil, want the sandbox's end by the command's kill(0)")
+	}
+}
+
+// A write of the settings that fails while the reaper is waiting for them
+// wakes both readers, the reaper's read of the settings and Start's of the
+// reply, by ending the socket, and Start then reports the write's error. The
+// write fails here on a real socket: it is sent its last message first, with
+// its first lead byte, and then a message the socket can't hold.
+func TestSettingsWriteFailureEndsTheSocket(t *testing.T) {
+	t.Parallel()
+	parent, child, err := socketpair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parent.Close()
+	defer child.Close()
+	// The reaper's side: it has read one message that says more follow,
+	// and waits for the next.
+	reaper := make(chan error, 1)
+	go func() {
+		_, err := receiveSettings(int(child.Fd()))
+		reaper <- err
+	}()
+	body, err := json.Marshal(stageSettings{Command: toByteArgs([]string{"/bin/true"})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tooLong := func(ctl *os.File, body []byte) error {
+		if _, err := ctl.Write(append([]byte{settingsMore}, body[:1]...)); err != nil {
+			return err
+		}
+		// One byte more than the send buffer takes for one message.
+		buf, err := unix.GetsockoptInt(int(ctl.Fd()), unix.SOL_SOCKET, unix.SO_SNDBUF)
+		if err != nil {
+			return err
+		}
+		_, err = ctl.Write(make([]byte, buf))
+		return err
+	}
+	w := writeSettings(parent, body, tooLong)
+	select {
+	case err := <-reaper:
+		if err == nil {
+			t.Error("the reaper took settings that never came whole")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the reaper still waits for the settings after the write failed")
+	}
+	// Start's side: its read of the reply ends too.
+	var buf [16]byte
+	if n, _, _, _, err := unix.Recvmsg(int(parent.Fd()), buf[:], nil, 0); err != nil || n != 0 {
+		t.Errorf("Start's read = %d, %v, want the socket's end", n, err)
+	}
+	if err := w.wait(); !errors.Is(err, unix.EMSGSIZE) {
+		t.Errorf("the write's error is %v, want EMSGSIZE", err)
+	}
+	if err := w.cause(errors.New("the sandbox ended during setup")); !errors.Is(err, unix.EMSGSIZE) || !strings.HasPrefix(err.Error(), "send the settings: ") {
+		t.Errorf("cause = %v, want the write's error", err)
+	}
+}
+
+// A write of the settings that ends because the other end went away, as when
+// bubblewrap dies mid-write, isn't taken for the cause of Start's failure:
+// the read's error stands. The reaper's side here reads one message of
+// settings that take many, and goes.
+func TestSettingsWritePeerGone(t *testing.T) {
+	t.Parallel()
+	parent, child, err := socketpair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parent.Close()
+	long := strings.Repeat("x", 1<<20) // far more than the socket's buffer holds
+	body, err := json.Marshal(stageSettings{Command: toByteArgs([]string{"/bin/true", long})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := writeSettings(parent, body, sendSettings)
+	buf := make([]byte, maxMessage)
+	if _, _, _, _, err := unix.Recvmsg(int(child.Fd()), buf, nil, 0); err != nil {
+		t.Fatal(err)
+	}
+	_ = child.Close()
+	// EPIPE, or ECONNRESET when the other end went with messages unread
+	// (unix_release_sock in net/unix/af_unix.c).
+	if err := w.wait(); !errors.Is(err, unix.EPIPE) && !errors.Is(err, unix.ECONNRESET) {
+		t.Fatalf("the write's error is %v, want EPIPE or ECONNRESET, since the other end went", err)
+	}
+	read := errors.New("the sandbox did not start")
+	if err := w.cause(read); !errors.Is(err, read) || err.Error() != read.Error() {
+		t.Errorf("cause = %v, want the read's own error", err)
 	}
 }
 

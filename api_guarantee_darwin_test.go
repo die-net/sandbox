@@ -764,14 +764,6 @@ func TestAPIRun(t *testing.T) {
 	})
 }
 
-func TestAPIStage(t *testing.T) {
-	t.Parallel()
-	// The test binary's own arguments are not a stage's.
-	if code, ok := Stage(); ok {
-		t.Errorf("Stage() = %d, true in an ordinary process", code)
-	}
-}
-
 func TestAPIRlimits(t *testing.T) {
 	t.Parallel()
 	// CPU ends a spinning shell with SIGXCPU at the soft limit. A program that
