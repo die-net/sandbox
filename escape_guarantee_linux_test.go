@@ -1590,11 +1590,17 @@ func TestEscapeParentKilled(t *testing.T) {
 			rd := bufio.NewReader(out)
 			var ns string
 			var pid1 int
+			var lines []string
 			for {
 				line, err := rd.ReadString('\n')
 				if err != nil {
-					t.Fatalf("before ready: %v: %s", err, &stderr)
+					// The parent's stderr is whole, and no longer written,
+					// only once it has been waited for.
+					_ = parent.Process.Kill()
+					_ = parent.Wait()
+					t.Fatalf("before ready: %v, after the lines %q; stderr: %s", err, lines, &stderr)
 				}
+				lines = append(lines, line)
 				line = strings.TrimSpace(line)
 				if v, ok := strings.CutPrefix(line, "pid "); ok {
 					pid1, _ = strconv.Atoi(v)
